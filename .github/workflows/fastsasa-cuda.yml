@@ -52,30 +52,50 @@ jobs:
         run: cmake --build build-ci
       - name: Run CPU-safe validation in the CUDA build
         run: ctest --test-dir build-ci --output-on-failure -L cpu
-      # Distributable Linux CUDA build (newest toolkit only): SASS for every
-      # supported major architecture plus PTX, so one binary runs on Volta
-      # through Hopper without a JIT on first use.
-      - name: Build the distributable CUDA binary
+      # Distributable Linux build (newest toolkit only) with every backend
+      # compiled in, so the runtime fallback (Vulkan, then CUDA, then CPU)
+      # can pick whatever the user's machine has. CUDA SASS is built for
+      # every supported major architecture plus PTX (Volta through Hopper).
+      - name: Install Vulkan headers and glslc for the distributable build
+        if: matrix.image == 'nvidia/cuda:12.4.1-devel-ubuntu22.04'
+        run: DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libvulkan-dev glslc
+      - name: Build the distributable binary (CUDA + Vulkan + CPU)
         if: matrix.image == 'nvidia/cuda:12.4.1-devel-ubuntu22.04'
         run: |
           cmake -S . -B build-dist -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_HOST_COMPILER=${{ matrix.host }} \
             -DCMAKE_CUDA_ARCHITECTURES="70;75;80;86;89;90" \
+            -DFASTSASA_ENABLE_CUDA=ON \
+            -DFASTSASA_ENABLE_VULKAN=ON \
             -DFASTSASA_BUILD_NATIVE_TESTS=OFF
           cmake --build build-dist
           build-dist/fastsasa --version
+      - name: Confirm both GPU backends are compiled in
+        if: matrix.image == 'nvidia/cuda:12.4.1-devel-ubuntu22.04'
+        run: |
+          # No GPU or ICD in the container: each request must fall back to
+          # the CPU because the device is missing, never because the backend
+          # was left out of the build.
+          for backend in vulkan cuda; do
+            build-dist/fastsasa --backend $backend tests/data/1ubq.pdb 2> stderr.txt > /dev/null
+            cat stderr.txt
+            if grep -q "built without" stderr.txt; then
+              echo "::error::distributable build lacks the $backend backend"
+              exit 1
+            fi
+          done
       - name: Package the build
         if: matrix.image == 'nvidia/cuda:12.4.1-devel-ubuntu22.04'
         run: |
-          mkdir -p dist-cuda
-          cp build-dist/fastsasa build-dist/libfastsasa_native.* dist-cuda/
-          cp -r share integration python LICENSE NOTICE dist-cuda/
+          mkdir -p dist-linux
+          cp build-dist/fastsasa build-dist/libfastsasa_native.* dist-linux/
+          cp -r share integration python LICENSE NOTICE dist-linux/
       - uses: actions/upload-artifact@v4
         if: matrix.image == 'nvidia/cuda:12.4.1-devel-ubuntu22.04'
         with:
-          name: fastsasa-linux-x64-cuda
-          path: dist-cuda
+          name: fastsasa-linux-x64
+          path: dist-linux
 
   cuda-gpu-validation:
     name: CUDA GPU validation

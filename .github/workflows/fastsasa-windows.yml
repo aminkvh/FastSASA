@@ -64,7 +64,7 @@ jobs:
           path: dist-windows
 
   windows-cuda:
-    name: Windows build (MSVC + CUDA, compile only)
+    name: Windows build (MSVC + CUDA + Vulkan, compile only)
     # windows-latest ships Visual Studio 2026, which CUDA 12.x's cudafe++
     # cannot parse (it crashes even with -allow-unsupported-compiler).
     # Visual Studio 2022 on windows-2022 is the officially supported host.
@@ -79,26 +79,45 @@ jobs:
           sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
           use-github-cache: false
           use-local-cache: false
-      - name: Configure FastSASA (CUDA, no Vulkan)
+      - name: Install the Vulkan SDK (loader, headers, glslc)
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk --no-progress -y
+          $sdk = Get-ChildItem C:\VulkanSDK | Sort-Object Name -Descending | Select-Object -First 1
+          "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$($sdk.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      # This is the distributable Windows build: every backend compiled in,
+      # CUDA SASS for every supported major architecture (Volta to Hopper).
+      - name: Configure FastSASA (CUDA + Vulkan + CPU)
         # -allow-unsupported-compiler only matters if the image's MSVC point
         # release is newer than the toolkit's host_config.h list.
         run: >
           cmake -S . -B build-windows-cuda -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DFASTSASA_ENABLE_CUDA=ON
-          -DFASTSASA_ENABLE_VULKAN=OFF
-          -DCMAKE_CUDA_ARCHITECTURES=86
+          -DFASTSASA_ENABLE_VULKAN=ON
+          -DCMAKE_CUDA_ARCHITECTURES="70;75;80;86;89;90"
           -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler
       - name: Build FastSASA
         run: cmake --build build-windows-cuda -j2
-      - name: Smoke-test the CLI on the CPU backend
+      - name: Smoke-test the CLI and confirm both GPU backends are compiled in
         shell: pwsh
         run: |
           .\build-windows-cuda\fastsasa.exe --version
           .\build-windows-cuda\fastsasa.exe --backend cpu tests\data\1ubq.pdb | Select-Object -First 8
+          foreach ($backend in @("vulkan", "cuda")) {
+            $stderr = & .\build-windows-cuda\fastsasa.exe --backend $backend tests\data\1ubq.pdb 2>&1 1>$null | Out-String
+            Write-Host $stderr
+            if ($stderr -match "built without") { throw "distributable build lacks the $backend backend" }
+          }
+      - name: Package the Windows build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-windows | Out-Null
+          Copy-Item build-windows-cuda\fastsasa.exe, build-windows-cuda\fastsasa_native.dll dist-windows\
+          Copy-Item -Recurse share, integration, python dist-windows\
+          Copy-Item LICENSE, NOTICE dist-windows\
       - uses: actions/upload-artifact@v4
         with:
-          name: fastsasa-windows-x64-cuda
-          path: |
-            build-windows-cuda/fastsasa.exe
-            build-windows-cuda/fastsasa_native.dll
+          name: fastsasa-windows-x64
+          path: dist-windows
