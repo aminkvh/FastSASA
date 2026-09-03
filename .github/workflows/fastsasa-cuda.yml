@@ -52,6 +52,30 @@ jobs:
         run: cmake --build build-ci
       - name: Run CPU-safe validation in the CUDA build
         run: ctest --test-dir build-ci --output-on-failure -L cpu
+      # Distributable Linux CUDA build (newest toolkit only): SASS for every
+      # supported major architecture plus PTX, so one binary runs on Volta
+      # through Hopper without a JIT on first use.
+      - name: Build the distributable CUDA binary
+        if: matrix.image == 'nvidia/cuda:12.4.1-devel-ubuntu22.04'
+        run: |
+          cmake -S . -B build-dist -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_HOST_COMPILER=${{ matrix.host }} \
+            -DCMAKE_CUDA_ARCHITECTURES="70;75;80;86;89;90" \
+            -DFASTSASA_BUILD_NATIVE_TESTS=OFF
+          cmake --build build-dist
+          build-dist/fastsasa --version
+      - name: Package the build
+        if: matrix.image == 'nvidia/cuda:12.4.1-devel-ubuntu22.04'
+        run: |
+          mkdir -p dist-cuda
+          cp build-dist/fastsasa build-dist/libfastsasa_native.* dist-cuda/
+          cp -r share integration python LICENSE NOTICE dist-cuda/
+      - uses: actions/upload-artifact@v4
+        if: matrix.image == 'nvidia/cuda:12.4.1-devel-ubuntu22.04'
+        with:
+          name: fastsasa-linux-x64-cuda
+          path: dist-cuda
 
   cuda-gpu-validation:
     name: CUDA GPU validation
