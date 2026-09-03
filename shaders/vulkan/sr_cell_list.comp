@@ -1,0 +1,220 @@
+#version 450
+
+#ifdef FASTSASA_FP64
+#extension GL_ARB_gpu_shader_fp64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#define float double
+#define vec3 dvec3
+#define vec4 dvec4
+#endif
+
+/* SR_SUBGROUP_ATOMS: one atom per subgroup instead of one per workgroup.
+ * A 256-lane workgroup then carries 256/subgroupSize independent atoms that
+ * retire without waiting for each other, which matters on dense systems
+ * where buried atoms finish long before exposed ones (the same reason the
+ * CUDA backend switches to its warp-per-atom kernel at high density). */
+#ifdef SR_SUBGROUP_ATOMS
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#define SR_LOCAL_SIZE 256
+#define SR_MAX_SUBGROUPS 32
+#else
+#ifndef SR_LOCAL_SIZE
+#define SR_LOCAL_SIZE 64
+#endif
+#define SR_MAX_SUBGROUPS 1
+#endif
+
+layout(local_size_x = SR_LOCAL_SIZE) in;
+
+shared uint exposed_counts[SR_LOCAL_SIZE];
+/* Index ranges of the 27 neighbouring cells, resolved once per atom so each
+ * point test loops over ready-made ranges instead of recomputing cell
+ * indices and re-reading the offsets. Empty and out-of-grid cells get an
+ * empty range. */
+shared uint cell_first[27 * SR_MAX_SUBGROUPS];
+shared uint cell_last[27 * SR_MAX_SUBGROUPS];
+
+layout(set = 0, binding = 0, std430) readonly buffer Atoms {
+    vec4 values[];
+} atoms;
+layout(set = 0, binding = 1, std430) readonly buffer SpherePoints {
+    vec4 values[];
+} sphere_points;
+layout(set = 0, binding = 2, std430) readonly buffer CellOffsets {
+    int values[];
+} cell_offsets;
+layout(set = 0, binding = 3, std430) readonly buffer CellAtoms {
+    int values[];
+} cell_atoms;
+layout(set = 0, binding = 4, std430) readonly buffer Centers {
+    uint values[];
+} centers;
+layout(set = 0, binding = 5, std430) writeonly buffer Areas {
+    float values[];
+} areas;
+/* Single-precision, grid-local shadow of the atoms (xyz plus expanded
+ * radius squared). FP64 uses it for the hybrid prefilter (see the margin
+ * comments below); FP32 uses it as its only neighbour record, so each test
+ * is one 16-byte load with the radius already squared. */
+#ifdef FASTSASA_FP64
+layout(set = 0, binding = 8, std430) readonly buffer AtomsFSorted {
+    f32vec4 values[];
+} atoms_f_sorted;
+#else
+layout(set = 0, binding = 8, std430) readonly buffer AtomsFSorted {
+    vec4 values[];
+} atoms_f_sorted;
+#endif
+
+layout(push_constant) uniform Parameters {
+    uint atom_count;
+    uint point_count;
+    uint center_count;
+    uint base_index;
+    uint dim_x;
+    uint dim_y;
+    uint dim_z;
+    float probe_radius;
+    float cell_size;
+    float min_x;
+    float min_y;
+    float min_z;
+    float margin;
+} params;
+
+void main()
+{
+#ifdef SR_SUBGROUP_ATOMS
+    const uint lane = gl_SubgroupInvocationID;
+    const uint lanes = gl_SubgroupSize;
+    const uint range_base = gl_SubgroupID * 27u;
+    const uint output_index = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID +
+                              params.base_index;
+#else
+    const uint lane = gl_LocalInvocationID.x;
+    const uint lanes = gl_WorkGroupSize.x;
+    const uint range_base = 0u;
+    const uint output_index = gl_WorkGroupID.x + params.base_index;
+#endif
+    if (output_index >= params.center_count) return;
+
+    const uint atom_index = centers.values[output_index];
+    const vec4 atom = atoms.values[atom_index];
+    const float expanded_radius = atom.w + params.probe_radius;
+    const vec3 relative = (atom.xyz - vec3(params.min_x, params.min_y, params.min_z)) /
+                          params.cell_size;
+    const ivec3 atom_cell = clamp(ivec3(floor(relative)), ivec3(0),
+                                  ivec3(int(params.dim_x) - 1,
+                                        int(params.dim_y) - 1,
+                                        int(params.dim_z) - 1));
+
+    if (lane < 27u) {
+        // Slot 0 is the centre cell so the closest neighbours are tested
+        // first and buried points exit early.
+        const uint ordinal = lane == 0u ? 13u : (lane <= 13u ? lane - 1u : lane);
+        const int cz = atom_cell.z + int(ordinal / 9u) - 1;
+        const int cy = atom_cell.y + int((ordinal / 3u) % 3u) - 1;
+        const int cx = atom_cell.x + int(ordinal % 3u) - 1;
+        uint first = 0u;
+        uint last = 0u;
+        if (cz >= 0 && cz < int(params.dim_z) && cy >= 0 && cy < int(params.dim_y) &&
+            cx >= 0 && cx < int(params.dim_x)) {
+            const uint cell_index = uint(cx) + params.dim_x *
+                                    (uint(cy) + params.dim_y * uint(cz));
+            first = uint(cell_offsets.values[cell_index]);
+            last = uint(cell_offsets.values[cell_index + 1u]);
+        }
+        cell_first[range_base + lane] = first;
+        cell_last[range_base + lane] = last;
+    }
+#ifdef SR_SUBGROUP_ATOMS
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+#else
+    barrier();
+#endif
+
+    uint exposed = 0u;
+#ifdef FASTSASA_FP64
+    /* On consumer GPUs FP64 runs at a small fraction of the FP32 rate, so
+     * each point/neighbor test first runs in FP32 against a conservative
+     * uncertainty margin; only margin-ambiguous tests re-run the exact FP64
+     * expression, keeping exposure counts bit-identical to pure FP64. */
+    const float32_t margin32 = float32_t(params.margin);
+#endif
+    for (uint point_index = lane; point_index < params.point_count; point_index += lanes) {
+        // Same operation order as the CPU reference (x + r*t per axis);
+        // `precise` keeps the compiler from fusing the multiply-add.
+        precise vec3 point = atom.xyz + sphere_points.values[point_index].xyz *
+                                        expanded_radius;
+#ifdef FASTSASA_FP64
+        // The prefilter shadow is grid-local, so the point is shifted the
+        // same way before the FP32 comparison.
+        const f32vec3 point_f = f32vec3(point - vec3(params.min_x, params.min_y, params.min_z));
+#else
+        const vec3 point_f = point - vec3(params.min_x, params.min_y, params.min_z);
+#endif
+        bool buried = false;
+        for (uint ordinal = 0u; ordinal < 27u && !buried; ++ordinal) {
+            const uint first = cell_first[range_base + ordinal];
+            const uint last = cell_last[range_base + ordinal];
+            {
+                {
+                    for (uint slot = first; slot < last; ++slot) {
+                        const int neighbor_index = cell_atoms.values[slot];
+                        if (uint(neighbor_index) != atom_index) {
+#ifdef FASTSASA_FP64
+                            const f32vec4 shadow = atoms_f_sorted.values[slot];
+                            const f32vec3 delta_f = point_f - shadow.xyz;
+                            const float32_t diff = dot(delta_f, delta_f) - shadow.w;
+                            if (diff < -margin32) {
+                                buried = true;
+                                break;
+                            }
+                            if (diff <= margin32) {
+                            const vec4 neighbor = atoms.values[neighbor_index];
+                            const float neighbor_radius = neighbor.w + params.probe_radius;
+                            precise vec3 delta = point - neighbor.xyz;
+                            precise float distance2 = delta.x * delta.x + delta.y * delta.y +
+                                                      delta.z * delta.z;
+                            precise float radius2 = neighbor_radius * neighbor_radius;
+                            if (distance2 < radius2) {
+                                buried = true;
+                                break;
+                            }
+                            }
+#else
+                            // FP32: one shadow load per test, fused
+                            // arithmetic allowed (FP32 is not held to bit
+                            // identity, only to its documented tolerance).
+                            const vec4 shadow = atoms_f_sorted.values[slot];
+                            const vec3 delta_f = point_f - shadow.xyz;
+                            if (dot(delta_f, delta_f) < shadow.w) {
+                                buried = true;
+                                break;
+                            }
+#endif
+                        }
+                    }
+                }
+            }
+        }
+        if (!buried) ++exposed;
+    }
+
+    // The exposed-point count is exact in both precisions; the host applies
+    // the 4*pi*r^2*count/n area formula in FP64 for CUDA-parity accuracy.
+#ifdef SR_SUBGROUP_ATOMS
+    const uint total = subgroupAdd(exposed);
+    if (subgroupElect()) areas.values[output_index] = float(total);
+#else
+    exposed_counts[lane] = exposed;
+    barrier();
+    for (uint stride = lanes / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) exposed_counts[lane] += exposed_counts[lane + stride];
+        barrier();
+    }
+    if (lane == 0u) areas.values[output_index] = float(exposed_counts[0]);
+#endif
+}

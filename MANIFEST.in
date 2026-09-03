@@ -1,0 +1,52 @@
+include README.md
+include LICENSE
+include NOTICE
+include CONTRIBUTING.md
+include CMakeLists.txt
+include setup.py
+include cmake/FastSASAConfig.cmake.in
+include mkdocs.yml
+include share/protor.config
+include share/protor_glycans.config
+recursive-include licenses *.txt *.md
+recursive-include docs *.md *.csv *.png
+recursive-include python *.py
+recursive-include examples *.py
+recursive-include tests *.py *.c *.cc *.pdb *.cif *.config
+include tests/cmake_consumer/CMakeLists.txt
+prune tests/external_mmcif
+include tools/fastsasa_benchmark.py
+include tools/fastsasa_precision_report.py
+include tools/fastsasa_trajectory_precision_report.py
+include tools/fetch_benchmark_corpus.py
+include tools/fetch_benchmark_trajectories.py
+include tools/check_cuda_toolchain.sh
+recursive-include tools/benchmarks *.py
+include tools/fastsasa_cli.cc
+include tools/fastsasa_trajectory_cli.c
+recursive-include third-party/gemmi/include *.hpp *.h
+include third-party/gemmi/LICENSE.txt
+include third-party/gemmi/README.md
+include third-party/volk/volk.h
+include third-party/volk/volk.c
+include third-party/volk/LICENSE.md
+recursive-include include fastsasa*.h
+include src/fastsasa_api.c
+include src/fastsasa_backend_internal.h
+include src/fastsasa_exact_math.h
+include cmake/embed_binary.cmake
+include src/fastsasa_portable.h
+include src/fastsasa_cpu.cc
+include src/fastsasa_device_stub.c
+include src/fastsasa_vulkan.cc
+include src/fastsasa_vulkan_internal.h
+include src/fastsasa_radius.c
+include src/fastsasa_trajectory.c
+include src/dcd_reader.c
+include src/gemmi_topology.cc
+include src/sr_cuda.cu
+include src/fastsasa_native.map
+include src/xtc_reader.c
+recursive-include shaders/vulkan *.comp
+recursive-include integration/vmd *.tcl
+global-exclude __pycache__ *.py[cod] *.ncu-rep *.ncu.txt

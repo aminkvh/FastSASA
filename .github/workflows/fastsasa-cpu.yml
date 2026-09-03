@@ -1,0 +1,204 @@
+name: FastSASA CPU-only checks
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  cpu-only:
+    name: CPU-only build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python test dependencies
+        run: python -m pip install numpy
+      - name: Configure FastSASA without CUDA
+        run: |
+          cmake -S . -B build-cpu \
+            -DFASTSASA_ENABLE_CUDA=OFF \
+            -DFASTSASA_BUILD_NATIVE_TESTS=ON
+      - name: Build FastSASA
+        run: cmake --build build-cpu -j2
+      - name: Run CPU-only validation
+        run: ctest --test-dir build-cpu --output-on-failure -L release
+      - name: Install FastSASA
+        run: cmake --install build-cpu --prefix "${{ runner.temp }}/fastsasa-install"
+      - name: Validate installed CMake package
+        run: |
+          cmake -S tests/cmake_consumer -B build-consumer \
+            -DCMAKE_PREFIX_PATH="${{ runner.temp }}/fastsasa-install"
+          cmake --build build-consumer -j2
+          ./build-consumer/fastsasa_consumer
+      - name: Package the build
+        run: |
+          mkdir -p dist-cpu
+          cp build-cpu/fastsasa build-cpu/libfastsasa_native.* dist-cpu/
+          cp -r share integration python LICENSE NOTICE dist-cpu/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastsasa-${{ matrix.os }}-cpu
+          path: dist-cpu
+      - name: Validate CPU-only Python source install
+        run: |
+          python -m venv "${{ runner.temp }}/fastsasa-venv"
+          "${{ runner.temp }}/fastsasa-venv/bin/python" -m pip install --upgrade pip
+          FASTSASA_ENABLE_CUDA=OFF "${{ runner.temp }}/fastsasa-venv/bin/python" -m pip install .
+          "${{ runner.temp }}/fastsasa-venv/bin/python" -c \
+            "import fastsasa; assert fastsasa.default_radius_config_path().is_file(); print(fastsasa.__version__)"
+
+  vulkan-fallback:
+    name: Vulkan fallback build and validation (Mesa llvmpipe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Vulkan and Python test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            glslc libvulkan-dev mesa-vulkan-drivers vulkan-tools
+          python -m pip install numpy
+      - name: Select the Mesa software Vulkan driver
+        run: |
+          LVP_ICD=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)
+          test -n "$LVP_ICD"
+          echo "VK_DRIVER_FILES=$LVP_ICD" >> "$GITHUB_ENV"
+      - name: Configure FastSASA with Vulkan and without CUDA
+        run: |
+          cmake -S . -B build-vulkan \
+            -DFASTSASA_ENABLE_CUDA=OFF \
+            -DFASTSASA_ENABLE_VULKAN=ON \
+            -DFASTSASA_BUILD_NATIVE_TESTS=ON
+      - name: Build FastSASA
+        run: cmake --build build-vulkan -j2
+      - name: Run Vulkan validation
+        run: ctest --test-dir build-vulkan --output-on-failure -L vulkan
+      - name: Package the build
+        run: |
+          mkdir -p dist-vulkan
+          cp build-vulkan/fastsasa build-vulkan/libfastsasa_native.* dist-vulkan/
+          cp -r share integration python LICENSE NOTICE dist-vulkan/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastsasa-linux-x64-cpu-vulkan
+          path: dist-vulkan
+
+  rhel-family:
+    name: RHEL-family build and validation (Rocky Linux 9, CPU + Vulkan)
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build toolchain and Vulkan (dnf/EPEL)
+        run: |
+          dnf install -y epel-release
+          dnf install -y gcc-toolset-13 cmake make git python3 python3-pip \
+            vulkan-loader-devel vulkan-headers glslc mesa-vulkan-drivers vulkan-tools
+          python3 -m pip install numpy
+          echo "CC=/opt/rh/gcc-toolset-13/root/usr/bin/gcc" >> "$GITHUB_ENV"
+          echo "CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++" >> "$GITHUB_ENV"
+      - name: Select the Mesa software Vulkan driver
+        run: |
+          LVP_ICD=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)
+          test -n "$LVP_ICD"
+          echo "VK_DRIVER_FILES=$LVP_ICD" >> "$GITHUB_ENV"
+          echo "XDG_RUNTIME_DIR=/tmp" >> "$GITHUB_ENV"
+      - name: Configure FastSASA (CPU + Vulkan, no CUDA)
+        run: |
+          cmake -S . -B build-rhel \
+            -DFASTSASA_ENABLE_CUDA=OFF \
+            -DFASTSASA_ENABLE_VULKAN=ON \
+            -DFASTSASA_BUILD_NATIVE_TESTS=ON
+      - name: Build FastSASA
+        run: cmake --build build-rhel -j2
+      - name: Run validation
+        run: ctest --test-dir build-rhel --output-on-failure
+      - name: Package the build
+        run: |
+          mkdir -p dist-rhel
+          cp build-rhel/fastsasa build-rhel/libfastsasa_native.* dist-rhel/
+          cp -r share integration python LICENSE NOTICE dist-rhel/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastsasa-rhel9-x64-cpu-vulkan
+          path: dist-rhel
+
+  macos-vulkan:
+    name: macOS build and validation (Vulkan via MoltenVK)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Vulkan SDK components (Homebrew MoltenVK)
+        run: |
+          brew install vulkan-headers vulkan-loader vulkan-tools molten-vk shaderc
+          python -m pip install numpy
+      - name: Select the MoltenVK ICD
+        run: |
+          # Neither $(brew --prefix)/share/vulkan/icd.d (only vulkan-tools'
+          # mock ICD lands there) nor guessing the formula's own keg layout
+          # is reliable, and a plain `find` on a path that turns out not to
+          # exist trips this shell's `set -e` before any fallback can run.
+          # `brew list <formula>` enumerates the formula's actual installed
+          # file paths directly, so grep that instead of guessing a layout.
+          set +e
+          ICD=$(brew list molten-vk 2>/dev/null | grep -E '/icd\.d/.*\.json$' | head -n1)
+          set -e
+          if [ -z "$ICD" ]; then
+            echo "::error::no MoltenVK ICD json found in 'brew list molten-vk' output:"
+            brew list molten-vk || true
+            exit 1
+          fi
+          echo "Using MoltenVK ICD: $ICD"
+          echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
+          # volk (FastSASA's Vulkan loader, third-party/volk) dlopen()s
+          # libvulkan.dylib and falls back to /usr/local/lib/libvulkan.dylib
+          # for Homebrew's Intel-Mac prefix, but GitHub's macos-latest
+          # runners are Apple Silicon, where Homebrew installs to
+          # /opt/homebrew - not on dyld's default unqualified-name search
+          # path. Export DYLD_LIBRARY_PATH so dlopen("libvulkan.dylib")
+          # finds Homebrew's vulkan-loader without touching vendored code.
+          echo "DYLD_LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
+      - name: Configure FastSASA with Vulkan and without CUDA
+        run: |
+          cmake -S . -B build-macos-vulkan \
+            -DFASTSASA_ENABLE_CUDA=OFF \
+            -DFASTSASA_ENABLE_VULKAN=ON \
+            -DFASTSASA_BUILD_NATIVE_TESTS=ON
+      - name: Build FastSASA
+        run: cmake --build build-macos-vulkan -j3
+      - name: Run Vulkan validation
+        run: ctest --test-dir build-macos-vulkan --output-on-failure -L vulkan
+      - name: Package the build
+        run: |
+          mkdir -p dist-macos-vulkan
+          cp build-macos-vulkan/fastsasa build-macos-vulkan/libfastsasa_native.* dist-macos-vulkan/
+          cp -r share integration python LICENSE NOTICE dist-macos-vulkan/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastsasa-macos-arm64-cpu-vulkan
+          path: dist-macos-vulkan

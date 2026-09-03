@@ -1,0 +1,59 @@
+#version 450
+
+// Pass 2 of the contiguous cell list: exclusive prefix sum of the per-cell
+// counts into cell_offsets[0..cells], with cell_offsets[cells] = atom total.
+// One workgroup; each invocation scans a contiguous block of cells, the
+// block totals are combined in shared memory. Counts are left untouched
+// because the fill pass uses them as per-cell cursors.
+
+#define SCAN_THREADS 128
+
+layout(local_size_x = SCAN_THREADS) in;
+
+layout(set = 0, binding = 2, std430) writeonly buffer CellOffsets {
+    int values[];
+} cell_offsets;
+
+layout(set = 0, binding = 7, std430) readonly buffer CellCounts {
+    int values[];
+} cell_counts;
+
+layout(push_constant) uniform Parameters {
+    uint atom_count;
+    uint point_count;
+    uint center_count;
+    uint base_index;
+    uint dim_x;
+    uint dim_y;
+    uint dim_z;
+    float probe_radius;
+    float cell_size;
+    float min_x;
+    float min_y;
+    float min_z;
+    float margin;
+} params;
+
+shared int block_totals[SCAN_THREADS];
+
+void main()
+{
+    const uint thread = gl_LocalInvocationID.x;
+    const uint cells = params.dim_x * params.dim_y * params.dim_z;
+    const uint block = (cells + SCAN_THREADS - 1u) / SCAN_THREADS;
+    const uint begin = min(thread * block, cells);
+    const uint end = min(begin + block, cells);
+
+    int total = 0;
+    for (uint cell = begin; cell < end; ++cell) total += cell_counts.values[cell];
+    block_totals[thread] = total;
+    barrier();
+
+    int prefix = 0;
+    for (uint other = 0u; other < thread; ++other) prefix += block_totals[other];
+    for (uint cell = begin; cell < end; ++cell) {
+        cell_offsets.values[cell] = prefix;
+        prefix += cell_counts.values[cell];
+    }
+    if (thread == SCAN_THREADS - 1u) cell_offsets.values[cells] = prefix;
+}

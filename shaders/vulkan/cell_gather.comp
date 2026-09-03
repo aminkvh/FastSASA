@@ -1,0 +1,40 @@
+#version 450
+
+// Pass 4 of the contiguous cell list: copy the single-precision atom shadow
+// (grid-local xyz, expanded radius squared) into cell order, so a cell's
+// neighbour records are one contiguous, coalesced range for the SR shader.
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 3, std430) readonly buffer CellAtoms {
+    int values[];
+} cell_atoms;
+layout(set = 0, binding = 6, std430) readonly buffer AtomsF {
+    vec4 values[];
+} atoms_f;
+layout(set = 0, binding = 8, std430) writeonly buffer AtomsFSorted {
+    vec4 values[];
+} atoms_f_sorted;
+
+layout(push_constant) uniform Parameters {
+    uint atom_count;
+    uint point_count;
+    uint center_count;
+    uint base_index;
+    uint dim_x;
+    uint dim_y;
+    uint dim_z;
+    float probe_radius;
+    float cell_size;
+    float min_x;
+    float min_y;
+    float min_z;
+    float margin;
+} params;
+
+void main()
+{
+    const uint slot = gl_GlobalInvocationID.x + params.base_index;
+    if (slot >= params.atom_count) return;
+    atoms_f_sorted.values[slot] = atoms_f.values[cell_atoms.values[slot]];
+}

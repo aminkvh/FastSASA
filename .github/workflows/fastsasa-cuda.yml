@@ -1,0 +1,85 @@
+name: FastSASA CUDA release checks
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  cuda-container-build:
+    name: CUDA container build (${{ matrix.image }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: nvidia/cuda:12.0.1-devel-ubuntu22.04
+            host: clang++-14
+            packages: clang-14 cmake ninja-build g++ python3 python3-numpy git
+          - image: nvidia/cuda:12.2.2-devel-ubuntu22.04
+            host: g++-11
+            packages: g++-11 cmake ninja-build python3 python3-numpy git
+          - image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            host: g++-12
+            packages: g++-12 cmake ninja-build python3 python3-numpy git
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${{ matrix.packages }}
+      - name: Check CUDA host compiler compatibility
+        run: |
+          chmod +x tools/check_cuda_toolchain.sh
+          CUDAHOSTCXX=${{ matrix.host }} CXX=${{ matrix.host }} tools/check_cuda_toolchain.sh
+      - name: Configure FastSASA
+        run: |
+          cmake -S . -B build-ci -G Ninja \
+            -DCMAKE_CUDA_HOST_COMPILER=${{ matrix.host }} \
+            -DFASTSASA_BUILD_NATIVE_TESTS=ON
+      - name: Build FastSASA
+        run: cmake --build build-ci
+      - name: Run CPU-safe validation in the CUDA build
+        run: ctest --test-dir build-ci --output-on-failure -L cpu
+
+  cuda-gpu-validation:
+    name: CUDA GPU validation
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, Linux, X64]
+    env:
+      CUDAHOSTCXX: clang++-14
+      CXX: clang++-14
+      FASTSASA_CUDA_HOST_COMPILER: clang-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show GPU and CUDA toolchain
+        run: |
+          nvidia-smi
+          nvcc --version
+      - name: Check CUDA host compiler compatibility
+        run: |
+          chmod +x tools/check_cuda_toolchain.sh
+          tools/check_cuda_toolchain.sh
+      - name: Configure FastSASA
+        run: |
+          cmake -S . -B build-gpu \
+            -DCMAKE_CUDA_HOST_COMPILER=${FASTSASA_CUDA_HOST_COMPILER} \
+            -DCMAKE_CUDA_ARCHITECTURES=native \
+            -DFASTSASA_BUILD_NATIVE_TESTS=ON
+      - name: Build FastSASA
+        run: cmake --build build-gpu -j4
+      - name: Run GPU smoke tests
+        env:
+          FASTSASA_REQUIRE_GPU_TESTS: "1"
+        run: ctest --test-dir build-gpu --output-on-failure -L release

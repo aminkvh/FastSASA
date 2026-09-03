@@ -1,0 +1,7 @@
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+# The Vulkan loader is dlopen'd at runtime; consumers do not need a Vulkan
+# link-time dependency.
+
+include("${CMAKE_CURRENT_LIST_DIR}/FastSASATargets.cmake")
+set(FastSASA_VERSION "@FASTSASA_VERSION@")

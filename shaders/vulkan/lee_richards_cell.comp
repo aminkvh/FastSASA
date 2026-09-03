@@ -1,0 +1,498 @@
+#version 450
+
+#ifdef FASTSASA_FP64
+#extension GL_ARB_gpu_shader_fp64 : require
+#define float double
+#define vec2 dvec2
+#define vec3 dvec3
+#define vec4 dvec4
+#endif
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Atoms {
+    vec4 values[];
+} atoms;
+layout(set = 0, binding = 1, std430) writeonly buffer SliceAreas {
+    float values[];
+} slice_areas;
+layout(set = 0, binding = 2, std430) readonly buffer CellOffsets {
+    int values[];
+} cell_offsets;
+layout(set = 0, binding = 3, std430) readonly buffer CellAtoms {
+    int values[];
+} cell_atoms;
+layout(set = 0, binding = 4, std430) readonly buffer Centers {
+    uint values[];
+} centers;
+
+layout(push_constant) uniform Parameters {
+    uint atom_count;
+    uint point_count; // Lee-Richards slices
+    uint center_count;
+    uint base_index;
+    uint dim_x;
+    uint dim_y;
+    uint dim_z;
+    float probe_radius;
+    float cell_size;
+    float min_x;
+    float min_y;
+    float min_z;
+    float margin;
+} params;
+
+const float PI = 3.14159265358979323846;
+const float TWO_PI = 6.28318530717958647692;
+
+// Degenerate-geometry epsilons mirror the CUDA kernels per precision.
+#ifdef FASTSASA_FP64
+#define CONCENTRIC_EPSILON 1.0e-14
+#define EVENT_EPSILON 1.0e-12
+#else
+#define CONCENTRIC_EPSILON 1.0e-6
+#define EVENT_EPSILON 1.0e-5
+#endif
+
+#ifdef FASTSASA_FP64
+// acos/atan/atan2 derived from FreeBSD msun (via musl), the same operation
+// sequence as src/fastsasa_exact_math.h used by the CPU reference and the CUDA
+// kernels; `precise` blocks FMA contraction so every rounding matches.
+double exact_nan()
+{
+    return packDouble2x32(uvec2(0u, 0x7ff80000u));
+}
+
+double asin_r(double z)
+{
+    const double pS0 = 1.66666666666666657415e-01;
+    const double pS1 = -3.25565818622400915405e-01;
+    const double pS2 = 2.01212532134862925881e-01;
+    const double pS3 = -4.00555345006794114027e-02;
+    const double pS4 = 7.91534994289814532176e-04;
+    const double pS5 = 3.47933107596021167570e-05;
+    const double qS1 = -2.40339491173441421878e+00;
+    const double qS2 = 2.02094576023350569471e+00;
+    const double qS3 = -6.88283971605453293030e-01;
+    const double qS4 = 7.70381505559019352791e-02;
+    precise double p = z * (pS0 + z * (pS1 + z * (pS2 + z * (pS3 + z * (pS4 + z * pS5)))));
+    precise double q = 1.0 + z * (qS1 + z * (qS2 + z * (qS3 + z * qS4)));
+    precise double r = p / q;
+    return r;
+}
+
+double exact_acos(double x)
+{
+    const double pio2_hi = 1.57079632679489655800e+00;
+    const double pio2_lo = 6.12323399573676603587e-17;
+    const uvec2 words = unpackDouble2x32(x);
+    const uint hx = words.y;
+    const uint ix = hx & 0x7fffffffu;
+
+    if (ix >= 0x3ff00000u) {
+        if (((ix - 0x3ff00000u) | words.x) == 0u) return (hx >> 31) != 0u ? 2.0 * pio2_hi : 0.0;
+        return exact_nan();
+    }
+    if (ix < 0x3fe00000u) {
+        if (ix <= 0x3c600000u) return pio2_hi;
+        precise double xx = x * x;
+        precise double t = x * asin_r(xx);
+        precise double u = pio2_lo - t;
+        precise double v = x - u;
+        precise double r = pio2_hi - v;
+        return r;
+    }
+    if ((hx >> 31) != 0u) {
+        precise double z = (1.0 + x) * 0.5;
+        precise double s = sqrt(z);
+        precise double w = asin_r(z) * s - pio2_lo;
+        precise double sw = s + w;
+        precise double r = 2.0 * (pio2_hi - sw);
+        return r;
+    }
+    precise double z = (1.0 - x) * 0.5;
+    precise double s = sqrt(z);
+    const double df = packDouble2x32(uvec2(0u, unpackDouble2x32(s).y));
+    precise double c = (z - df * df) / (s + df);
+    precise double w = asin_r(z) * s + c;
+    precise double r = 2.0 * (df + w);
+    return r;
+}
+
+double exact_atan(double input_value)
+{
+    const double atanhi[4] = double[4](
+        4.63647609000806093515e-01, 7.85398163397448278999e-01,
+        9.82793723247329054082e-01, 1.57079632679489655800e+00);
+    const double atanlo[4] = double[4](
+        2.26987774529616870924e-17, 3.06161699786838301793e-17,
+        1.39033110312309984516e-17, 6.12323399573676603587e-17);
+    const double aT0 = 3.33333333333329318027e-01;
+    const double aT1 = -1.99999999998764832476e-01;
+    const double aT2 = 1.42857142725034663711e-01;
+    const double aT3 = -1.11111104054623557880e-01;
+    const double aT4 = 9.09088713343650656196e-02;
+    const double aT5 = -7.69187620504482999495e-02;
+    const double aT6 = 6.66107313738753120669e-02;
+    const double aT7 = -5.83357013379057348645e-02;
+    const double aT8 = 4.97687799461593236017e-02;
+    const double aT9 = -3.65315727442169155270e-02;
+    const double aT10 = 1.62858201153657823623e-02;
+    double x = input_value;
+    uint ix = unpackDouble2x32(x).y;
+    const uint sign = ix >> 31;
+    int id;
+
+    ix &= 0x7fffffffu;
+    if (ix >= 0x44100000u) {
+        if (isnan(x)) return x;
+        return sign != 0u ? -atanhi[3] : atanhi[3];
+    }
+    if (ix < 0x3fdc0000u) {
+        if (ix < 0x3e400000u) return x;
+        id = -1;
+    } else {
+        x = abs(x);
+        if (ix < 0x3ff30000u) {
+            if (ix < 0x3fe60000u) {
+                id = 0;
+                precise double t = (2.0 * x - 1.0) / (2.0 + x);
+                x = t;
+            } else {
+                id = 1;
+                precise double t = (x - 1.0) / (x + 1.0);
+                x = t;
+            }
+        } else {
+            if (ix < 0x40038000u) {
+                id = 2;
+                precise double t = (x - 1.5) / (1.0 + 1.5 * x);
+                x = t;
+            } else {
+                id = 3;
+                precise double t = -1.0 / x;
+                x = t;
+            }
+        }
+    }
+    precise double z = x * x;
+    precise double w = z * z;
+    precise double s1 = z * (aT0 + w * (aT2 + w * (aT4 + w * (aT6 + w * (aT8 + w * aT10)))));
+    precise double s2 = w * (aT1 + w * (aT3 + w * (aT5 + w * (aT7 + w * aT9))));
+    precise double s = s1 + s2;
+    if (id < 0) {
+        precise double r = x - x * s;
+        return r;
+    }
+    precise double xs = x * s;
+    precise double r = atanhi[id] - ((xs - atanlo[id]) - x);
+    return sign != 0u ? -r : r;
+}
+
+double exact_atan2(double y, double x)
+{
+    const double pi = 3.1415926535897931160e+00;
+    const double pi_lo = 1.2246467991473531772e-16;
+    if (isnan(x) || isnan(y)) return x + y;
+    const uvec2 wx = unpackDouble2x32(x);
+    const uvec2 wy = unpackDouble2x32(y);
+    uint ix = wx.y;
+    const uint lx = wx.x;
+    uint iy = wy.y;
+    const uint ly = wy.x;
+    if (((ix - 0x3ff00000u) | lx) == 0u) return exact_atan(y);
+    const uint m = ((iy >> 31) & 1u) | ((ix >> 30) & 2u);
+    ix &= 0x7fffffffu;
+    iy &= 0x7fffffffu;
+    if ((iy | ly) == 0u) {
+        if (m <= 1u) return y;
+        return m == 2u ? pi : -pi;
+    }
+    if ((ix | lx) == 0u) return (m & 1u) != 0u ? -pi / 2.0 : pi / 2.0;
+    if (ix == 0x7ff00000u) {
+        if (iy == 0x7ff00000u) {
+            if (m == 0u) return pi / 4.0;
+            if (m == 1u) return -pi / 4.0;
+            if (m == 2u) return 3.0 * pi / 4.0;
+            return -3.0 * pi / 4.0;
+        }
+        if (m == 0u) return 0.0;
+        if (m == 1u) return -0.0;
+        if (m == 2u) return pi;
+        return -pi;
+    }
+    if (ix + (64u << 20) < iy || iy == 0x7ff00000u) return (m & 1u) != 0u ? -pi / 2.0 : pi / 2.0;
+    double z;
+    if ((m & 2u) != 0u && iy + (64u << 20) < ix) {
+        z = 0.0;
+    } else {
+        precise double q = y / x;
+        z = exact_atan(abs(q));
+    }
+    if (m == 0u) return z;
+    if (m == 1u) return -z;
+    if (m == 2u) {
+        precise double r = pi - (z - pi_lo);
+        return r;
+    }
+    precise double r = (z - pi_lo) - pi;
+    return r;
+}
+#endif
+
+int neighbor_arcs(uint atom_index, int other_index, float slice_z,
+                  float ri_prime, float ri_prime2, vec2 center,
+                  out vec4 arcs)
+{
+    if (other_index < 0 || uint(other_index) == atom_index) return 0;
+    // Same operation sequence as lee_richards_atom_area in fastsasa_cpu.cc;
+    // `precise` keeps the compiler from fusing multiply-adds.
+    const vec4 other = atoms.values[other_index];
+    precise float rj = other.w + params.probe_radius;
+    precise float dj = abs(other.z - slice_z);
+    if (dj >= rj) return 0;
+    precise float rj_prime2 = rj * rj - dj * dj;
+    if (rj_prime2 <= 0.0) return 0;
+    precise float rj_prime = sqrt(rj_prime2);
+    precise float dx = other.x - center.x;
+    precise float dy = other.y - center.y;
+    precise float distance = sqrt(dx * dx + dy * dy);
+    precise float touching = ri_prime + rj_prime;
+    if (distance >= touching) return 0;
+    if (distance < CONCENTRIC_EPSILON) return rj_prime >= ri_prime ? -1 : 0;
+    precise float reach_i = distance + ri_prime;
+    if (reach_i < rj_prime) return -1;
+    precise float reach_j = distance + rj_prime;
+    if (reach_j < ri_prime) return 0;
+
+    precise float argument = clamp((ri_prime2 + distance * distance - rj_prime2) /
+                                   (2.0 * ri_prime * distance), -1.0, 1.0);
+#ifdef FASTSASA_FP64
+    const float alpha = exact_acos(argument);
+    precise float beta = exact_atan2(dy, dx) + PI;
+#else
+    const float alpha = acos(argument);
+    precise float beta = atan(dy, dx) + PI;
+#endif
+    precise float lower = beta - alpha;
+    precise float upper = beta + alpha;
+    if (lower < 0.0) lower += TWO_PI;
+    if (upper > TWO_PI) upper -= TWO_PI;
+    if (upper < lower) {
+        arcs = vec4(0.0, upper, lower, TWO_PI);
+        return 2;
+    }
+    arcs = vec4(lower, upper, 0.0, 0.0);
+    return 1;
+}
+
+bool interval_covered(uint atom_index, ivec3 atom_cell, float angle,
+                      float slice_z, float ri_prime, float ri_prime2,
+                      vec2 center)
+{
+    for (int dz = -1; dz <= 1; ++dz) {
+        const int cz = atom_cell.z + dz;
+        if (cz < 0 || cz >= int(params.dim_z)) continue;
+        for (int dy = -1; dy <= 1; ++dy) {
+            const int cy = atom_cell.y + dy;
+            if (cy < 0 || cy >= int(params.dim_y)) continue;
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int cx = atom_cell.x + dx;
+                if (cx < 0 || cx >= int(params.dim_x)) continue;
+                const uint cell_index = uint(cx) + params.dim_x *
+                    (uint(cy) + params.dim_y * uint(cz));
+                const uint first = uint(cell_offsets.values[cell_index]);
+                const uint last = uint(cell_offsets.values[cell_index + 1u]);
+                for (uint slot = first; slot < last; ++slot) {
+                    const int other = cell_atoms.values[slot];
+                    vec4 arcs;
+                    const int count = neighbor_arcs(atom_index, other, slice_z,
+                                                    ri_prime, ri_prime2, center,
+                                                    arcs);
+                    if (count < 0) return true;
+                    if (count >= 1 && angle >= arcs.x && angle <= arcs.y) return true;
+                    if (count == 2 && angle >= arcs.z && angle <= arcs.w) return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+float exposed_arc(uint atom_index, ivec3 atom_cell, float slice_z,
+                  float ri_prime, float ri_prime2, vec2 center)
+{
+    const float epsilon = EVENT_EPSILON;
+    float current = 0.0;
+    float exposed = 0.0;
+    for (uint guard = 0u; guard < 4u * params.atom_count + 4u &&
+                              current < TWO_PI - epsilon; ++guard) {
+        float next_angle = TWO_PI;
+        bool fully_buried = false;
+        for (int dz = -1; dz <= 1; ++dz) {
+            const int cz = atom_cell.z + dz;
+            if (cz < 0 || cz >= int(params.dim_z)) continue;
+            for (int dy = -1; dy <= 1; ++dy) {
+                const int cy = atom_cell.y + dy;
+                if (cy < 0 || cy >= int(params.dim_y)) continue;
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int cx = atom_cell.x + dx;
+                    if (cx < 0 || cx >= int(params.dim_x)) continue;
+                    const uint cell_index = uint(cx) + params.dim_x *
+                        (uint(cy) + params.dim_y * uint(cz));
+                    const uint first = uint(cell_offsets.values[cell_index]);
+                    const uint last = uint(cell_offsets.values[cell_index + 1u]);
+                    for (uint slot = first; slot < last; ++slot) {
+                        const int other = cell_atoms.values[slot];
+                        vec4 arcs;
+                        const int count = neighbor_arcs(atom_index, other, slice_z,
+                                                        ri_prime, ri_prime2,
+                                                        center, arcs);
+                        if (count < 0) {
+                            fully_buried = true;
+                            break;
+                        }
+                        if (count >= 1) {
+                            if (arcs.x > current + epsilon) next_angle = min(next_angle, arcs.x);
+                            if (arcs.y > current + epsilon) next_angle = min(next_angle, arcs.y);
+                        }
+                        if (count == 2) {
+                            if (arcs.z > current + epsilon) next_angle = min(next_angle, arcs.z);
+                            if (arcs.w > current + epsilon) next_angle = min(next_angle, arcs.w);
+                        }
+                    }
+                    if (fully_buried) break;
+                }
+                if (fully_buried) break;
+            }
+            if (fully_buried) break;
+        }
+        if (fully_buried) return 0.0;
+        if (next_angle <= current + epsilon) break;
+        if (!interval_covered(atom_index, atom_cell,
+                              0.5 * (current + next_angle), slice_z,
+                              ri_prime, ri_prime2, center)) {
+            exposed += next_angle - current;
+        }
+        current = next_angle;
+    }
+    return clamp(exposed, 0.0, TWO_PI);
+}
+
+bool insert_arc(float begin_angle, float end_angle,
+                inout float arc_begin[64], inout float arc_end[64],
+                inout int count)
+{
+    if (count >= 64) return false;
+    int position = count;
+    while (position > 0 && arc_begin[position - 1] > begin_angle) {
+        arc_begin[position] = arc_begin[position - 1];
+        arc_end[position] = arc_end[position - 1];
+        --position;
+    }
+    arc_begin[position] = begin_angle;
+    arc_end[position] = end_angle;
+    ++count;
+    return true;
+}
+
+float exposed_arc_local(uint atom_index, ivec3 atom_cell, float slice_z,
+                        float ri_prime, float ri_prime2, vec2 center)
+{
+    float arc_begin[64];
+    float arc_end[64];
+    int count = 0;
+    for (int dz = -1; dz <= 1; ++dz) {
+        const int cz = atom_cell.z + dz;
+        if (cz < 0 || cz >= int(params.dim_z)) continue;
+        for (int dy = -1; dy <= 1; ++dy) {
+            const int cy = atom_cell.y + dy;
+            if (cy < 0 || cy >= int(params.dim_y)) continue;
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int cx = atom_cell.x + dx;
+                if (cx < 0 || cx >= int(params.dim_x)) continue;
+                const uint cell_index = uint(cx) + params.dim_x *
+                    (uint(cy) + params.dim_y * uint(cz));
+                const uint first = uint(cell_offsets.values[cell_index]);
+                const uint last = uint(cell_offsets.values[cell_index + 1u]);
+                for (uint slot = first; slot < last; ++slot) {
+                    const int other = cell_atoms.values[slot];
+                    vec4 arcs;
+                    const int arc_count = neighbor_arcs(atom_index, other, slice_z,
+                                                        ri_prime, ri_prime2,
+                                                        center, arcs);
+                    if (arc_count < 0) return 0.0;
+#ifdef FASTSASA_FP64
+                    // More arcs than the local buffer holds: flag the slice
+                    // with NaN so the host recomputes the whole atom with the
+                    // CPU reference, keeping the result bit-identical.
+                    if (arc_count >= 1 &&
+                        !insert_arc(arcs.x, arcs.y, arc_begin, arc_end, count)) {
+                        return exact_nan();
+                    }
+                    if (arc_count == 2 &&
+                        !insert_arc(arcs.z, arcs.w, arc_begin, arc_end, count)) {
+                        return exact_nan();
+                    }
+#else
+                    if (arc_count >= 1 &&
+                        !insert_arc(arcs.x, arcs.y, arc_begin, arc_end, count)) {
+                        return exposed_arc(atom_index, atom_cell, slice_z,
+                                           ri_prime, ri_prime2, center);
+                    }
+                    if (arc_count == 2 &&
+                        !insert_arc(arcs.z, arcs.w, arc_begin, arc_end, count)) {
+                        return exposed_arc(atom_index, atom_cell, slice_z,
+                                           ri_prime, ri_prime2, center);
+                    }
+#endif
+                }
+            }
+        }
+    }
+    if (count == 0) return TWO_PI;
+    precise float exposed = arc_begin[0];
+    float covered_until = arc_end[0];
+    for (int i = 1; i < count; ++i) {
+        if (covered_until < arc_begin[i]) exposed += arc_begin[i] - covered_until;
+        covered_until = max(covered_until, arc_end[i]);
+    }
+    // (exposed + 2*pi) - covered, the CPU reference's closing expression.
+    precise float closed = exposed + TWO_PI - covered_until;
+#ifdef FASTSASA_FP64
+    return closed;
+#else
+    return clamp(closed, 0.0, TWO_PI);
+#endif
+}
+
+void main()
+{
+    const uint flat_index = gl_GlobalInvocationID.x + params.base_index;
+    const uint total = params.center_count * params.point_count;
+    if (flat_index >= total) return;
+    const uint output_index = flat_index / params.point_count;
+    const uint slice = flat_index - output_index * params.point_count;
+    const uint atom_index = centers.values[output_index];
+    const vec4 atom = atoms.values[atom_index];
+    precise float radius = atom.w + params.probe_radius;
+    precise float delta = 2.0 * radius / float(params.point_count);
+    const vec3 relative = (atom.xyz - vec3(params.min_x, params.min_y, params.min_z)) /
+                          params.cell_size;
+    const ivec3 atom_cell = clamp(ivec3(floor(relative)), ivec3(0),
+                                  ivec3(int(params.dim_x) - 1,
+                                        int(params.dim_y) - 1,
+                                        int(params.dim_z) - 1));
+    precise float slice_z = atom.z - radius + delta * (float(slice) + 0.5);
+    precise float distance_z = abs(atom.z - slice_z);
+    precise float slice_radius2 = radius * radius - distance_z * distance_z;
+    precise float area = 0.0;
+    if (slice_radius2 > 0.0) {
+        precise float slice_radius = sqrt(slice_radius2);
+        const float exposed = exposed_arc_local(atom_index, atom_cell, slice_z,
+                                                slice_radius, slice_radius2,
+                                                atom.xy);
+        area = delta * radius * exposed;
+    }
+    slice_areas.values[flat_index] = area;
+}

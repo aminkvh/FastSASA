@@ -1,0 +1,55 @@
+FreeSASA Shrake-Rupley NULL-pointer read on atoms with zero neighbors
+======================================================================
+
+Confirmed present in FreeSASA 2.1.3 (C library, autotools build) and
+2.2.1 (PyPI `freesasa` Python package, which bundles the same sasa_sr.c).
+
+Root cause (src/nb.c): a neighbor-list slot for atom i is left as
+`nb->nb[i] = NULL` / `nb->nn[i] = 0` until that atom's first neighbor is
+recorded (nb.c, chunk_up/nb_add_pair). An atom with zero SASA-relevant
+neighbors -- e.g. an isolated counter-ion with no other atom within the
+probe-inclusive cutoff, as occurs in the Cx46 hemichannel MD system used
+for this benchmark -- therefore has nb->nb[i] == NULL for the whole
+calculation.
+
+src/sasa_sr.c's sr_atom_area() does not check nn[i] before walking the
+neighbor list: its first loop iteration unconditionally evaluates
+`a = nbi[current_nb]` (nbi == NULL, current_nb == 0), a NULL-pointer read.
+Confirmed via AddressSanitizer:
+
+    AddressSanitizer: SEGV ... READ memory access
+    #0 sr_atom_area sasa_sr.c:314
+    #1 freesasa_shrake_rupley sasa_sr.c:219
+    #2 freesasa_calc freesasa.c:99
+    #3 freesasa_calc_coord freesasa.c:136
+
+This reproducibly crashes both freesasa.calcCoord()/freesasa.calc() (the
+PyPI Cython bindings) and a from-scratch C program calling
+freesasa_calc_coord() directly -- so it is a defect in libfreesasa itself,
+not the Python bindings, and it does not depend on thread count (it
+reproduces at n_threads=1).
+
+Fix: an atom with no neighbors has nothing to occlude any of its test
+points, so the correct SASA is the fully exposed sphere area -- return
+that directly instead of walking a NULL neighbor list.
+
+--- a/src/sasa_sr.c
++++ b/src/sasa_sr.c
+@@ -292,6 +292,16 @@ sr_atom_area(int i,
+     /* testpoints for this atom */
+     coord_t *restrict tp_coord_ri = sr->tp_local[thread_index];
+
++    /* An atom with zero SASA-relevant neighbors (e.g. an isolated ion) has
++       nb->nb[i] == NULL (see nb.c: nb[i] is left NULL until the first
++       neighbor is recorded). The neighbor-walk below unconditionally reads
++       nbi[current_nb] on its first iteration, so for such an atom it reads
++       through a NULL pointer. Nothing occludes any test point on an atom
++       with no neighbors, so the correct result is the fully exposed sphere
++       area; short-circuit before the neighbor walk instead of segfaulting. */
++    if (nni == 0) {
++        return 4.0 * M_PI * ri * ri;
++    }
++
+     freesasa_coord_copy(tp_coord_ri, sr->srp);
+     freesasa_coord_scale(tp_coord_ri, ri);
+     freesasa_coord_translate(tp_coord_ri, vi);

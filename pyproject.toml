@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77", "wheel", "cmake>=3.18"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastsasa"
+version = "0.1.0rc19"
+description = "GPU-accelerated Shrake-Rupley and Lee-Richards SASA calculations (Vulkan, CUDA, CPU)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT AND MPL-2.0"
+license-files = ["LICENSE", "licenses/*.txt", "licenses/*.md", "third-party/gemmi/LICENSE.txt", "third-party/volk/LICENSE.md"]
+authors = [
+  {name = "Amin Akbari Ahangar"}
+]
+dependencies = [
+  "numpy"
+]
+
+[project.urls]
+Homepage = "https://github.com/aminkvh/fastsasa"
+Documentation = "https://github.com/aminkvh/fastsasa/tree/main/docs"
+Issues = "https://github.com/aminkvh/fastsasa/issues"
+Repository = "https://github.com/aminkvh/fastsasa"
+
+[project.optional-dependencies]
+analysis = ["MDAnalysis", "mdtraj"]
+docs = ["mkdocs", "mkdocs-material", "pymdown-extensions"]
+rdkit = ["rdkit"]
+
+[tool.setuptools]
+py-modules = ["fastsasa", "fastsasa_native", "fastsasa_adapters", "fastsasa_features"]
+package-dir = {"" = "python"}

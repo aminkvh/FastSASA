@@ -1,0 +1,13 @@
+pdb_id,category,tier,label,default,cli_extra,notes
+1UBQ,control,small,Ubiquitin,true,,Small protein sanity check.
+2ISK,protein,medium,Large protein,false,,Medium protein stress structure already used in local benchmarks.
+5HDN,dna,medium,Protein-DNA complex,true,,Protein-DNA parser and SASA validation case.
+1BNA,dna,small,B-DNA dodecamer,true,,DNA-only nucleic acid case.
+1AOI,dna,large,Nucleosome core particle,true,,Large protein-DNA complex.
+1EHZ,rna,small,Yeast phenylalanine tRNA,true,,RNA-only nucleic acid case.
+4V9C,rna,large,Ribosome complex,false,,Large RNA-protein stress case; opt-in because it can be slow to download and run.
+6VSB,glycoprotein,large,SARS-CoV-2 spike ectodomain,true,--hetatm,Glycosylated viral spike; includes HETATM/glycan handling.
+6VXX,glycoprotein,large,SARS-CoV-2 spike closed state,true,--hetatm,Large glycoprotein trimer.
+6BFU,glycoprotein,large,Coronavirus spike glycoprotein,false,--hetatm,Alternate glycoprotein stress case.
+1EN2,glycan,small,Glycan-heavy mmCIF edge fixture,true,--hetatm,Small glycan/altloc-oriented fixture.
+3J3Q,large,huge,HIV-1 capsid,false,,Very large stress test; opt-in only.

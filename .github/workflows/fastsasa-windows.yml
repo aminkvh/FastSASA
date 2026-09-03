@@ -1,0 +1,104 @@
+name: FastSASA Windows checks
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  windows-cpu-vulkan:
+    name: Windows build (MSVC, CPU + Vulkan)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python test dependencies
+        run: python -m pip install numpy
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Install the Vulkan SDK (loader, headers, glslc)
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk --no-progress -y
+          $sdk = Get-ChildItem C:\VulkanSDK | Sort-Object Name -Descending | Select-Object -First 1
+          "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$($sdk.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Configure FastSASA (CPU + Vulkan, no CUDA)
+        run: >
+          cmake -S . -B build-windows -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DFASTSASA_ENABLE_CUDA=OFF
+          -DFASTSASA_ENABLE_VULKAN=ON
+          -DFASTSASA_BUILD_NATIVE_TESTS=ON
+      - name: Build FastSASA
+        run: cmake --build build-windows -j2
+      - name: Run CPU validation
+        run: ctest --test-dir build-windows --output-on-failure -L release
+      - name: Smoke-test the CLI and the Python bridge
+        shell: pwsh
+        run: |
+          .\build-windows\fastsasa.exe --version
+          .\build-windows\fastsasa.exe --backend cpu tests\data\1ubq.pdb | Select-Object -First 12
+          $env:FASTSASA_NATIVE_LIBRARY = "$PWD\build-windows\fastsasa_native.dll"
+          $env:FASTSASA_BACKEND = "cpu"
+          python -c "import sys; sys.path.insert(0, 'python'); import fastsasa_native; e = fastsasa_native.SasaEngine(); print('backend', e.backend); e.close()"
+      - name: Package the Windows build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-windows | Out-Null
+          Copy-Item build-windows\fastsasa.exe, build-windows\fastsasa_native.dll dist-windows\
+          Copy-Item -Recurse share, integration, python, LICENSE, NOTICE dist-windows\
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastsasa-windows-x64-cpu-vulkan
+          path: dist-windows
+
+  windows-cuda:
+    name: Windows build (MSVC + CUDA, compile only)
+    # windows-latest ships Visual Studio 2026, which CUDA 12.x's cudafe++
+    # cannot parse (it crashes even with -allow-unsupported-compiler).
+    # Visual Studio 2022 on windows-2022 is the officially supported host.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "12.8.1"
+          method: network
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+          use-github-cache: false
+          use-local-cache: false
+      - name: Configure FastSASA (CUDA, no Vulkan)
+        # -allow-unsupported-compiler only matters if the image's MSVC point
+        # release is newer than the toolkit's host_config.h list.
+        run: >
+          cmake -S . -B build-windows-cuda -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DFASTSASA_ENABLE_CUDA=ON
+          -DFASTSASA_ENABLE_VULKAN=OFF
+          -DCMAKE_CUDA_ARCHITECTURES=86
+          -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler
+      - name: Build FastSASA
+        run: cmake --build build-windows-cuda -j2
+      - name: Smoke-test the CLI on the CPU backend
+        shell: pwsh
+        run: |
+          .\build-windows-cuda\fastsasa.exe --version
+          .\build-windows-cuda\fastsasa.exe --backend cpu tests\data\1ubq.pdb | Select-Object -First 8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fastsasa-windows-x64-cuda
+          path: |
+            build-windows-cuda/fastsasa.exe
+            build-windows-cuda/fastsasa_native.dll

@@ -1,0 +1,37 @@
+site_name: FastSASA
+site_description: GPU-accelerated SASA for structures, MD trajectories, and ML-ready exposure features.
+repo_url: https://github.com/aminkvh/fastsasa
+repo_name: aminkvh/fastsasa
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.instant
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - Prerequisites And Compatibility: prerequisites.md
+  - User Guide:
+      - CLI Reference: cli.md
+      - Trajectory Analysis: trajectory.md
+      - Selection Syntax: selection.md
+      - Radius Configuration: classifier_config.md
+      - VMD Integration: vmd_integration.md
+  - Python:
+      - API Reference: api.md
+      - MDAnalysis Tutorial: tutorial_mdanalysis.md
+      - MDTraj Tutorial: tutorial_mdtraj.md
+      - Feature Extraction Tutorial: tutorial_feature_extraction.md
+  - Testing And Benchmarks:
+      - Verifying A Build: testing.md
+      - Benchmark Corpus: benchmark_corpus.md
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences

@@ -1,0 +1,63 @@
+#version 450
+
+// Pass 3 of the contiguous cell list: place each atom index into its cell's
+// range. The per-cell count doubles as a cursor that is decremented to zero.
+
+#ifdef FASTSASA_FP64
+#extension GL_ARB_gpu_shader_fp64 : require
+#define float double
+#define vec3 dvec3
+#define vec4 dvec4
+#endif
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Atoms {
+    vec4 values[];
+} atoms;
+
+layout(set = 0, binding = 2, std430) readonly buffer CellOffsets {
+    int values[];
+} cell_offsets;
+
+layout(set = 0, binding = 3, std430) writeonly buffer CellAtoms {
+    int values[];
+} cell_atoms;
+
+layout(set = 0, binding = 7, std430) buffer CellCounts {
+    int values[];
+} cell_counts;
+
+layout(push_constant) uniform Parameters {
+    uint atom_count;
+    uint point_count;
+    uint center_count;
+    uint base_index;
+    uint dim_x;
+    uint dim_y;
+    uint dim_z;
+    float probe_radius;
+    float cell_size;
+    float min_x;
+    float min_y;
+    float min_z;
+    float margin;
+} params;
+
+void main()
+{
+    const uint atom_index = gl_GlobalInvocationID.x + params.base_index;
+    if (atom_index >= params.atom_count) return;
+
+    const vec3 relative = (atoms.values[atom_index].xyz -
+                           vec3(params.min_x, params.min_y, params.min_z)) /
+                          params.cell_size;
+    const ivec3 cell = clamp(ivec3(floor(relative)), ivec3(0),
+                             ivec3(int(params.dim_x) - 1, int(params.dim_y) - 1,
+                                   int(params.dim_z) - 1));
+    const uint cell_index = uint(cell.x) + params.dim_x *
+                            (uint(cell.y) + params.dim_y * uint(cell.z));
+    const int slot = cell_offsets.values[cell_index] +
+                     atomicAdd(cell_counts.values[cell_index], -1) - 1;
+    cell_atoms.values[slot] = int(atom_index);
+}

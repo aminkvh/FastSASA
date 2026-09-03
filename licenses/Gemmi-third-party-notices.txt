@@ -1,0 +1,19 @@
+Gemmi bundled third-party header notices
+========================================
+
+Gemmi includes small third-party header-only components under
+`third-party/gemmi/include/gemmi/third_party`.
+
+The full notices remain in the corresponding source headers. The key bundled
+components in this FastSASA snapshot are:
+
+- TAO PEGTL: MIT License, copyright Dr. Colin Hirsch and Daniel Frey.
+  A standalone copy is shipped as `licenses/TAO-PEGTL-MIT.txt`.
+- stb_sprintf: dual MIT or public-domain/unlicense terms, copyright Sean
+  Barrett. See `stb_sprintf.h`.
+- fast_float: dual Apache-2.0 or MIT terms, copyright the fast_float authors.
+  See `fast_float.h`.
+- sajson: MIT-style permissive terms, copyright Chad Austin. See `sajson.h`.
+- tinydir: BSD-style permissive terms, copyright tinydir authors. See
+  `tinydir.h`.
+- pocketfft header: BSD-style permissive terms. See `pocketfft_hdronly.h`.

@@ -1,0 +1,83 @@
+FastSASA Notices
+==============
+
+FastSASA is a GPU-accelerated SASA implementation with Vulkan, CUDA, and
+threaded CPU backends. Its kernels, shaders, CPU fallback, trajectory
+engine, parsers, and command-line implementation are FastSASA-owned.
+
+Bundled radius table
+---------------------
+
+The standard residue/atom mappings in `share/protor.config`, and the same base
+mappings reused by `share/protor_glycans.config`, derive from the generated
+ProtOr configuration distributed by FreeSASA (Mitternacht S. FreeSASA: An
+open source C library for solvent accessible surface area calculations.
+F1000Research 2016, 5:189). The underlying ProtOr radii are from Tsai J,
+Taylor R, Chothia C, Gerstein M. J Mol Biol. 1999;290:253-266. The glycan
+mappings in
+`share/protor_glycans.config` are a FastSASA opt-in extension; that file is not
+an unmodified upstream file.
+The per-residue maximum-ASA reference table used for relative SASA
+(`--format rsa`, in `tools/fastsasa_cli.cc`) is FreeSASA's own ProtOr
+reference values, reproduced in FastSASA-native source rather than as a
+separate config file. FastSASA does not compile, link, or vendor the
+FreeSASA CPU implementation itself. It contains only the attributed reference
+data described above.
+
+Copyright (c) 2016 Simon Mitternacht
+
+Distributed under the MIT License; the full text is kept in
+`licenses/FreeSASA-radii-table-MIT.txt` and must be included with source
+and binary redistributions that contain this material.
+
+FreeBSD msun / musl (acos, atan, atan2)
+---------------------------------------
+
+`src/fastsasa_exact_math.h` contains double-precision acos, atan and atan2
+routines derived from the FreeBSD msun sources (e_acos.c, s_atan.c,
+e_atan2.c) as distributed by musl. They are compiled for both the CPU
+reference and the CUDA FP64 kernels so both produce bit-identical results.
+
+Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+Developed at SunPro/SunSoft, a Sun Microsystems, Inc. business.
+Permission to use, copy, modify, and distribute this software is freely
+granted, provided that this notice is preserved.
+
+Gemmi
+-----
+
+FastSASA uses Gemmi headers for native mmCIF parsing and writing.
+
+Gemmi is distributed under the Mozilla Public License Version 2.0. The full
+license text is kept in `licenses/Gemmi-MPL-2.0.txt` in FastSASA release
+packages and `third-party/gemmi/LICENSE.txt` in the development checkout. It
+must be included with source and binary redistributions that contain
+Gemmi-covered material.
+
+Gemmi bundles small third-party header-only components. Their notices are kept
+in the corresponding source headers under `third-party/gemmi/include/gemmi`
+and in `third-party/gemmi/include/gemmi/third_party/tao/LICENSE`. Release
+packages also ship summary notice files under `licenses/`, including
+`Gemmi-third-party-notices.txt` and `TAO-PEGTL-MIT.txt`.
+
+volk
+----
+
+FastSASA vendors the volk Vulkan meta-loader (https://github.com/zeux/volk) to
+load the Vulkan runtime dynamically. volk is distributed under the MIT
+license; the full text is kept in `licenses/volk-MIT.md` in FastSASA release
+packages and `third-party/volk/LICENSE.md` in the development checkout.
+
+Validation fixtures
+-------------------
+
+The repository includes small PDB/mmCIF validation fixtures for parser,
+selection, and numerical regression tests. Keep their original metadata intact
+when redistributing source archives.
+
+CUDA
+----
+
+FastSASA links against the NVIDIA CUDA runtime/toolkit during CUDA builds. CUDA is
+provided under NVIDIA's own license terms and is not redistributed by this
+notice.

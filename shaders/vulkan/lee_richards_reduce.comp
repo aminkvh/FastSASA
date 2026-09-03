@@ -1,0 +1,56 @@
+#version 450
+
+#ifdef FASTSASA_FP64
+#extension GL_ARB_gpu_shader_fp64 : require
+#define float double
+#endif
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 1, std430) readonly buffer SliceAreas {
+    float values[];
+} slice_areas;
+layout(set = 0, binding = 5, std430) writeonly buffer Areas {
+    float values[];
+} areas;
+
+layout(push_constant) uniform Parameters {
+    uint atom_count;
+    uint point_count;
+    uint center_count;
+    uint base_index;
+    uint dim_x;
+    uint dim_y;
+    uint dim_z;
+    float probe_radius;
+    float cell_size;
+    float min_x;
+    float min_y;
+    float min_z;
+    float margin;
+} params;
+
+void main()
+{
+    const uint center = gl_GlobalInvocationID.x + params.base_index;
+    if (center >= params.center_count) return;
+    const uint first = center * params.point_count;
+#ifdef FASTSASA_FP64
+    float area = 0.0;
+    for (uint slice = 0u; slice < params.point_count; ++slice) {
+        area += slice_areas.values[first + slice];
+    }
+#else
+    // Kahan summation keeps the FP32 slice sum near the accuracy of the
+    // CUDA FP32 path, which accumulates slices in FP64.
+    float area = 0.0;
+    float compensation = 0.0;
+    for (uint slice = 0u; slice < params.point_count; ++slice) {
+        const float value = slice_areas.values[first + slice] - compensation;
+        const float next = area + value;
+        compensation = (next - area) - value;
+        area = next;
+    }
+#endif
+    areas.values[center] = area;
+}

@@ -1,0 +1,44 @@
+name: Feature request
+description: Suggest a new workflow, API, parser, output, or algorithmic capability.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What workflow is blocked or difficult today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should FastSASA do?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI
+        - Python API
+        - trajectory I/O
+        - feature extraction
+        - performance
+        - validation
+        - documentation
+        - algorithm
+        - packaging
+        - other
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation idea
+      description: How could we test that this feature is correct and useful?
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Related tools, papers, files, or examples.
