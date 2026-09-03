@@ -65,8 +65,11 @@ jobs:
           wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | gpg --dearmor > /etc/apt/trusted.gpg.d/lunarg.gpg
           wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libvulkan-dev shaderc
+          # LunarG splits the headers out of libvulkan-dev (Ubuntu's own
+          # package bundles them), and CMake's FindVulkan needs both.
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends vulkan-headers libvulkan-dev shaderc
           glslc --version
+          test -f /usr/include/vulkan/vulkan.h
       - name: Build the distributable binary (CUDA + Vulkan + CPU)
         if: matrix.image == 'nvidia/cuda:12.4.1-devel-ubuntu22.04'
         run: |
