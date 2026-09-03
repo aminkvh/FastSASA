@@ -58,7 +58,15 @@ jobs:
       # every supported major architecture plus PTX (Volta through Hopper).
       - name: Install Vulkan headers and glslc for the distributable build
         if: matrix.image == 'nvidia/cuda:12.4.1-devel-ubuntu22.04'
-        run: DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libvulkan-dev glslc
+        # Ubuntu 22.04 has no glslc package; LunarG's jammy repository ships
+        # it in `shaderc`.
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends wget ca-certificates gnupg
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | gpg --dearmor > /etc/apt/trusted.gpg.d/lunarg.gpg
+          wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libvulkan-dev shaderc
+          glslc --version
       - name: Build the distributable binary (CUDA + Vulkan + CPU)
         if: matrix.image == 'nvidia/cuda:12.4.1-devel-ubuntu22.04'
         run: |
