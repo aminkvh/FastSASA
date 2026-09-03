@@ -14,6 +14,7 @@ streamed in batches while reusable data stays on the selected backend. Vulkan,
 CUDA, and threaded CPU implementations are included; FastSASA chooses an
 available backend automatically.
 
+[Documentation site](https://aminkvh.github.io/FastSASA/) ·
 [Documentation](docs/index.md) ·
 [CLI reference](docs/cli.md) ·
 [Python API](docs/api.md) ·

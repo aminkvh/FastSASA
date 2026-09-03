@@ -1,7 +1,8 @@
 site_name: FastSASA
+site_url: https://aminkvh.github.io/FastSASA/
 site_description: GPU-accelerated SASA for structures, MD trajectories, and ML-ready exposure features.
-repo_url: https://github.com/aminkvh/fastsasa
-repo_name: aminkvh/fastsasa
+repo_url: https://github.com/aminkvh/FastSASA
+repo_name: aminkvh/FastSASA
 
 theme:
   name: material
