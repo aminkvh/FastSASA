@@ -73,9 +73,14 @@ constexpr int kUnsupported = -100;
 #endif
 constexpr int kThresholdBins = FASTSASA_MASK_TBINS; /* t in [-1, 1] -> table index */
 constexpr double kPi = 3.141592653589793238462643383279502884;
-/* Absolute pad on the dot-product margin, far above double rounding of a
- * distance test (~1e-15) and far below the geometric margin (>= ~0.02). */
-constexpr double kDotPad = 1.0e-7;
+/* Absolute pads on the classification margins. They are sized for the cap
+ * threshold t and the direction being computed in single precision (the
+ * GPU kernels do that; t carries ~4e-6 absolute error for |t| <= 1 and a
+ * unit direction ~2e-7 of chord), so one table serves every backend. Both
+ * are far below the geometric margin (delta >= ~0.02 at resolution 64) and
+ * far above double rounding, so the CPU pays a negligible price. */
+constexpr double kDotPad = 2.0e-5;
+constexpr double kDirPad = 2.0e-6;
 
 /* Octahedral direction encoding (unit vector -> (u, v) in [-1, 1]^2). */
 inline void octa_encode(double x, double y, double z, double &u, double &v)
@@ -218,7 +223,7 @@ struct MaskTable {
                         d_max = std::max(d_max, chord);
                     }
                 }
-                delta[static_cast<size_t>(bin)] = d_max * (1.0 + 1.0e-6) + 1.0e-9;
+                delta[static_cast<size_t>(bin)] = d_max * (1.0 + 1.0e-6) + kDirPad;
 
                 for (int p = 0; p < n; ++p) {
                     const double dot = test_points[3 * p] * cx + test_points[3 * p + 1] * cy + test_points[3 * p + 2] * cz;
@@ -1009,4 +1014,36 @@ fastsasa_cpu_shrake_rupley_mask_fp32(int n_atoms, int n_points, const double *x,
                                      const double *expanded_radii, const double *test_points, int n_threads, double *sasa)
 {
     return mask_kernel(n_atoms, n_points, x, y, z, expanded_radii, test_points, n_threads, true, sasa);
+}
+
+/* Shared access to the direction table for the GPU backends. The handle keeps
+ * the table alive; the fields describe its layout (see MaskTable::entry).
+ * Threshold bins are kThresholdBins; delta_max bounds every bin's angular
+ * radius. Built (and cached) exactly like the CPU kernel's table. */
+extern "C" void *
+fastsasa_cpu_mask_table_acquire(int n_points, const double *test_points, fastsasa_cpu_mask_table_view *view)
+{
+    if (n_points <= 0 || n_points > kMaxPoints || test_points == nullptr || view == nullptr) return nullptr;
+    std::shared_ptr<const MaskTable> table;
+    try {
+        table = acquire_table(n_points, test_points);
+    } catch (...) {
+        return nullptr;
+    }
+    view->n_points = table->n_points;
+    view->words = table->words;
+    view->resolution = table->resolution;
+    view->threshold_bins = kThresholdBins;
+    view->dot_pad = kDotPad;
+    view->max_delta = table->max_delta;
+    view->delta = table->delta.data();
+    view->entry = table->entry.data();
+    view->entry_count = table->entry.size();
+    return new std::shared_ptr<const MaskTable>(table);
+}
+
+extern "C" void
+fastsasa_cpu_mask_table_release(void *handle)
+{
+    delete static_cast<std::shared_ptr<const MaskTable> *>(handle);
 }

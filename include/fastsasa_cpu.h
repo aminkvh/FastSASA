@@ -3,6 +3,9 @@
 
 #include "fastsasa_trajectory.h"
 
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -54,6 +57,26 @@ int fastsasa_cpu_shrake_rupley_mask(int n_atoms,
                                     int n_threads,
                                     double *sasa);
 int fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points, int n_threads);
+
+/* Read-only view of the cached direction table, for backends that run the
+ * same mask construction on a device. entry[(bin * threshold_bins + q) * 2 *
+ * words + w] holds the blocked row (w < words) then the band row; bins are
+ * an octahedral resolution x resolution grid; q = floor((t + 1) *
+ * threshold_bins / 2) clamped. Release the handle when the view is no
+ * longer needed; the table itself stays cached in the process. */
+typedef struct fastsasa_cpu_mask_table_view {
+    int n_points;
+    int words;
+    int resolution;
+    int threshold_bins;
+    double dot_pad;
+    double max_delta;
+    const double *delta;              /* resolution * resolution */
+    const uint64_t *entry;
+    size_t entry_count;               /* number of 64-bit words in entry */
+} fastsasa_cpu_mask_table_view;
+void *fastsasa_cpu_mask_table_acquire(int n_points, const double *test_points, fastsasa_cpu_mask_table_view *view);
+void fastsasa_cpu_mask_table_release(void *handle);
 /* FP32 counterpart: bit-identical to fastsasa_cpu_shrake_rupley_precision at
  * FASTSASA_PRECISION_FP32, selected by the same policy. */
 int fastsasa_cpu_shrake_rupley_mask_fp32(int n_atoms,

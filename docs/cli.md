@@ -86,6 +86,15 @@ grid resolution can be tuned with `FASTSASA_CPU_MASK_RESOLUTION` (default
 64; finer grids trade table size for fewer exact tests). Both kernels are
 compared bit for bit in the test suite (`fastsasa_cpu_mask_kernel`).
 
+The CUDA backend runs the same construction for FP64 Shrake-Rupley: one lane
+per atom, the warp scanning its shared neighbourhood cooperatively on the
+box-local float shadows, the certain caps applied from the shared direction
+table, and the boundary points decided with the reference kernel's exact
+FP64 arithmetic, so CUDA FP64 stays bit-identical to the CPU (the
+`fastsasa_backend_bit_identity` test). It is 4-5x faster than the previous
+FP64 kernel per structure. `FASTSASA_CUDA_SR_KERNEL=reference` selects the
+previous kernel.
+
 ## Core Options
 
 | Option | Meaning |

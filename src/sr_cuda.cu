@@ -148,6 +148,20 @@ struct fastsasa_device_context {
     int pending_capacity;
     double *d_lr_slice_areas;
     size_t lr_slice_areas_capacity;
+    /* Mask-kernel direction table on the device, keyed by the point set it
+     * was built for, plus per-lane pending scratch. */
+    unsigned long long *d_mask_table;
+    size_t mask_table_capacity;
+    int mask_table_n_points;
+    int mask_table_res;
+    int mask_table_tbins;
+    double mask_table_max_delta;
+    double mask_table_dot_pad;
+    double *mask_table_points;          /* host copy of the points it was built for */
+    unsigned long long *d_mask_pending;
+    size_t mask_pending_capacity;
+    int *d_mask_pending_slot;
+    size_t mask_pending_slot_capacity;
     int *d_lr_overflow;
     size_t lr_overflow_capacity;
 };
@@ -1073,6 +1087,56 @@ sort_cell_list_policy(int n_atoms,
     return atoms_per_cell >= threshold;
 }
 
+/* FASTSASA_CUDA_SR_KERNEL=mask|reference (default: mask for FP64). */
+static int
+use_mask_sr(void)
+{
+    const char *value = getenv("FASTSASA_CUDA_SR_KERNEL");
+
+    if (value == NULL || value[0] == '\0') return 1;
+    if (strcmp(value, "mask") == 0) return 1;
+    if (strcmp(value, "reference") == 0) return 0;
+    return 1;
+}
+
+/* Upload (or reuse) the direction table for this point set. */
+static int
+ensure_mask_table(struct fastsasa_device_context *context,
+                  int n_points,
+                  const double *test_points)
+{
+    if (context->d_mask_table != NULL && context->mask_table_n_points == n_points &&
+        context->mask_table_points != NULL &&
+        memcmp(context->mask_table_points, test_points, sizeof(double) * 3u * (size_t)n_points) == 0) {
+        return FASTSASA_SUCCESS;
+    }
+    fastsasa_cpu_mask_table_view view;
+    void *handle = fastsasa_cpu_mask_table_acquire(n_points, test_points, &view);
+    if (handle == NULL) return FASTSASA_INVALID_ARGUMENT;
+    const size_t bytes = sizeof(unsigned long long) * view.entry_count;
+    int status = ensure_device_capacity((void **)&context->d_mask_table, &context->mask_table_capacity, bytes);
+    if (status == FASTSASA_SUCCESS) {
+        status = cuda_status(cudaMemcpyAsync(context->d_mask_table, view.entry, bytes, cudaMemcpyHostToDevice, context->stream));
+    }
+    if (status == FASTSASA_SUCCESS) {
+        double *points = (double *)realloc(context->mask_table_points, sizeof(double) * 3u * (size_t)n_points);
+        if (points == NULL) status = FASTSASA_MEMORY_ERROR;
+        else {
+            memcpy(points, test_points, sizeof(double) * 3u * (size_t)n_points);
+            context->mask_table_points = points;
+            context->mask_table_n_points = n_points;
+            context->mask_table_res = view.resolution;
+            context->mask_table_tbins = view.threshold_bins;
+            context->mask_table_max_delta = view.max_delta;
+            context->mask_table_dot_pad = view.dot_pad;
+        }
+    }
+    /* cudaMemcpyAsync from pageable host memory completes before returning
+     * to the caller, so the table's lifetime does not need to outlive this. */
+    fastsasa_cpu_mask_table_release(handle);
+    return status;
+}
+
 static int
 use_float_sr(void)
 {
@@ -1298,6 +1362,10 @@ fastsasa_device_context_free(fastsasa_device_context *context)
     cudaFree(context->d_z);
     cudaFree(context->d_radii);
     cudaFree(context->d_radii2);
+    cudaFree(context->d_mask_table);
+    cudaFree(context->d_mask_pending);
+    cudaFree(context->d_mask_pending_slot);
+    free(context->mask_table_points);
     cudaFree(context->d_test_points);
     cudaFree(context->d_sasa);
     cudaFree(context->d_total_sasa);
@@ -2633,6 +2701,274 @@ shrake_rupley_cell_kernel(int n_atoms,
     }
 }
 
+
+/*
+ * Mask-accelerated exact FP64 Shrake-Rupley: the GPU form of the CPU kernel
+ * in fastsasa_cpu_mask.cc, sharing its direction table. One lane owns one
+ * atom and a 64*W-bit visibility mask in registers. For every neighbour
+ * (from the 27-cell list), the cap threshold t and octahedral direction bin
+ * select one table entry: a row of points certainly blocked for every
+ * direction in the bin, and the band of points that might be. Certain
+ * points are cleared with ANDs; band points still visible are parked and,
+ * after the neighbour loop, decided with the exact FP64 test of
+ * shrake_rupley_cell_kernel (fastsasa_dmul/fastsasa_dadd in the same
+ * operation order). The result is therefore the reference's bit for bit.
+ * A neighbour at the same centre has no cap direction: all its points go
+ * through the exact test, which is what the reference's rounding decides.
+ *
+ * Table entry layout (see fastsasa_cpu_mask_table_view): entry[(bin *
+ * tbins + q) * 2 * W + w], blocked row then band row.
+ */
+#define FASTSASA_MASK_PENDING 32    /* parked (neighbour, band) pairs per lane */
+
+template <int W>
+__global__ static void
+shrake_rupley_cell_mask_kernel(int n_atoms,
+                               int n_points,
+                               const double *__restrict__ x,
+                               const double *__restrict__ y,
+                               const double *__restrict__ z,
+                               const double *__restrict__ radii,
+                               const double *__restrict__ radii2,
+                               const double *__restrict__ test_points,
+                               const float *__restrict__ xf,        /* box-local float shadows */
+                               const float *__restrict__ yf,
+                               const float *__restrict__ zf,
+                               const float *__restrict__ radii_f,
+                               const unsigned long long *__restrict__ table,
+                               int table_res,
+                               int table_tbins,
+                               double table_max_delta,
+                               double table_dot_pad,
+                               int nx,
+                               int ny,
+                               int nz,
+                               const int *__restrict__ atom_cells,
+                               const int *__restrict__ cell_offsets,
+                               const int *__restrict__ cell_atoms,
+                               const int *__restrict__ center_indices,
+                               int n_centers,
+                               const unsigned int *__restrict__ center_masks,
+                               unsigned int active_center_mask,
+                               unsigned long long *__restrict__ pending_words,   /* n_centers * PENDING * W */
+                               int *__restrict__ pending_slot,                    /* n_centers * PENDING */
+                               double *__restrict__ sasa,
+                               double *__restrict__ total_sasa)
+{
+    const int center = blockIdx.x * blockDim.x + threadIdx.x;
+    if (center >= n_centers) return;
+    /* Lanes take atoms in cell-list order when running over all atoms, so a
+     * warp's 32 atoms share (nearly) the same neighbourhood and the
+     * cooperative scan below reuses each candidate load across lanes. */
+    const int atom = center_indices != NULL ? __ldg(&center_indices[center]) : __ldg(&cell_atoms[center]);
+    if (active_center_mask != 0u &&
+        ((__ldg(&center_masks[atom]) & active_center_mask) == 0u)) {
+        if (sasa != NULL) sasa[atom] = 0.0;
+        return;
+    }
+    const double ri = __ldg(&radii[atom]);
+    const double ri2 = __ldg(&radii2[atom]);
+    const double xi = __ldg(&x[atom]);
+    const double yi = __ldg(&y[atom]);
+    const double zi = __ldg(&z[atom]);
+    const float inv_two_ri_f = 1.0f / (2.0f * (float)ri);
+    const float res_half = 0.5f * (float)table_res;
+    const int res_max = table_res - 1;
+    /* the lim tests use the same pads, widened again for the float t */
+    const float lim_hi = (float)(1.0 + table_max_delta + table_dot_pad);
+    const float lim_lo = (float)(-1.0 - table_max_delta - table_dot_pad);
+    const int center_cell = __ldg(&atom_cells[atom]);
+    const int cz = center_cell / (nx * ny);
+    const int rem = center_cell - cz * nx * ny;
+    const int cy = rem / nx;
+    const int cx = rem - cy * nx;
+
+    unsigned long long visible[W];
+#pragma unroll
+    for (int w = 0; w < W; ++w) visible[w] = ~0ull;
+    if (n_points < 64 * W) {
+        /* mask off the unused high bits of the last word */
+        const int rest = n_points - 64 * (W - 1);
+        visible[W - 1] = rest >= 64 ? ~0ull : ((1ull << rest) - 1ull);
+    }
+    unsigned long long *my_pending = pending_words + (size_t)center * FASTSASA_MASK_PENDING * W;
+    int *my_pending_slot = pending_slot + (size_t)center * FASTSASA_MASK_PENDING;
+    int n_pending = 0;
+    int overflow = 0;         /* pending list full: fall back to exact tests for the rest */
+    int buried_all = 0;
+    int any_visible = 1;
+
+    const float xif = __ldg(&xf[atom]);
+    const float yif = __ldg(&yf[atom]);
+    const float zif = __ldg(&zf[atom]);
+    const float rif = __ldg(&radii_f[atom]);
+    /* Warp-cooperative candidate scan. The warp's lanes hold atoms from the
+     * same or adjacent cells, so the union of their 3x3x3 stencils lies in
+     * the 5x5x5 block around the leader's cell. Every lane walks that block
+     * (uniform control flow, coalesced candidate loads); each lane keeps the
+     * candidates that overlap its own atom. Lanes whose own cell is not
+     * within one of the leader's fall back to their own 27-cell walk. */
+    const unsigned full_mask = 0xffffffffu;
+    const int leader_cx = __shfl_sync(full_mask, cx, 0);
+    const int leader_cy = __shfl_sync(full_mask, cy, 0);
+    const int leader_cz = __shfl_sync(full_mask, cz, 0);
+    const int near_leader = abs(cx - leader_cx) <= 1 && abs(cy - leader_cy) <= 1 && abs(cz - leader_cz) <= 1;
+    const int all_near = __all_sync(full_mask, near_leader);
+    const int span = all_near ? 2 : 1;
+    const int bcx = all_near ? leader_cx : cx;
+    const int bcy = all_near ? leader_cy : cy;
+    const int bcz = all_near ? leader_cz : cz;
+    for (int dz = -span; dz <= span && !buried_all; ++dz) {
+        const int iz = bcz + dz;
+        if (iz < 0 || iz >= nz) continue;
+        for (int dy = -span; dy <= span && !buried_all; ++dy) {
+            const int iy = bcy + dy;
+            if (iy < 0 || iy >= ny) continue;
+            /* cells (bcx-span .. bcx+span, iy, iz) are contiguous in the list */
+            const int ix0 = max(bcx - span, 0);
+            const int ix1 = min(bcx + span, nx - 1);
+            const int first = __ldg(&cell_offsets[ix0 + nx * (iy + ny * iz)]);
+            const int last = __ldg(&cell_offsets[ix1 + nx * (iy + ny * iz) + 1]);
+            for (int n = first; n < last && !buried_all; ++n) {
+                const int other = __ldg(&cell_atoms[n]);
+                if (other == atom || !any_visible) continue;
+                /* float prefilter on the box-local shadows: conservative with
+                 * a relative pad far above float rounding of these magnitudes */
+                const float vx = __ldg(&xf[other]) - xif;
+                const float vy = __ldg(&yf[other]) - yif;
+                const float vz = __ldg(&zf[other]) - zif;
+                const float d2 = vx * vx + vy * vy + vz * vz;
+                const float reach = rif + __ldg(&radii_f[other]);
+                if (!(d2 < reach * reach * 1.00001f + 1.0e-6f)) continue;
+                if (d2 == 0.0f) {
+                    /* (near-)coincident centre in float: no cap direction;
+                     * every visible point is ambiguous */
+                    if (n_pending < FASTSASA_MASK_PENDING) {
+#pragma unroll
+                        for (int w = 0; w < W; ++w) my_pending[n_pending * W + w] = visible[w];
+                        my_pending_slot[n_pending] = other;
+                        ++n_pending;
+                    } else {
+                        overflow = 1;
+                    }
+                    continue;
+                }
+                const double rj2 = __ldg(&radii2[other]);
+                /* Cap threshold and direction bin in single precision: they
+                 * only select a conservative table entry, and the table's
+                 * pads cover float error (kDotPad, kDirPad). ri2 - rj2 is
+                 * formed in double then rounded once. */
+                const float inv_d = rsqrtf(d2);
+                const float t = ((float)(ri2 - rj2) + d2) * inv_two_ri_f * inv_d;
+                if (t >= lim_hi) continue;
+                if (t <= lim_lo) { buried_all = 1; break; }
+                const float inv_l1 = 1.0f / (fabsf(vx) + fabsf(vy) + fabsf(vz));
+                const float px = vx * inv_l1;
+                const float py = vy * inv_l1;
+                const float pz = vz * inv_l1;
+                float u;
+                float v;
+                if (pz >= 0.0f) {
+                    u = px;
+                    v = py;
+                } else {
+                    u = (1.0f - fabsf(py)) * (px >= 0.0f ? 1.0f : -1.0f);
+                    v = (1.0f - fabsf(px)) * (py >= 0.0f ? 1.0f : -1.0f);
+                }
+                int bx = (int)((u + 1.0f) * res_half);
+                int by = (int)((v + 1.0f) * res_half);
+                bx = bx < 0 ? 0 : (bx > res_max ? res_max : bx);
+                by = by < 0 ? 0 : (by > res_max ? res_max : by);
+                int q = (int)((t + 1.0f) * (0.5f * (float)table_tbins));
+                q = q < 0 ? 0 : (q >= table_tbins ? table_tbins - 1 : q);
+                const unsigned long long *e = table + ((size_t)(by * table_res + bx) * table_tbins + q) * 2u * W;
+                unsigned long long amb_any = 0ull;
+                unsigned long long any = 0ull;
+                unsigned long long amb[W];
+#pragma unroll
+                for (int w = 0; w < W; ++w) {
+                    const unsigned long long vis = visible[w] & ~__ldg(&e[w]);
+                    amb[w] = vis & __ldg(&e[W + w]);
+                    amb_any |= amb[w];
+                    visible[w] = vis;
+                    any |= vis;
+                }
+                if (amb_any) {
+                    if (n_pending < FASTSASA_MASK_PENDING) {
+#pragma unroll
+                        for (int w = 0; w < W; ++w) my_pending[n_pending * W + w] = amb[w];
+                        my_pending_slot[n_pending] = other;
+                        ++n_pending;
+                    } else {
+                        /* no room to park: decide these points now, exactly */
+                        const double xj = __ldg(&x[other]);
+                        const double yj = __ldg(&y[other]);
+                        const double zj = __ldg(&z[other]);
+#pragma unroll
+                        for (int w = 0; w < W; ++w) {
+                            unsigned long long a = amb[w];
+                            while (a) {
+                                const int bit = __ffsll((long long)a) - 1;
+                                a &= a - 1ull;
+                                const int p = w * 64 + bit;
+                                const double qx = fastsasa_dadd(xi, fastsasa_dmul(ri, __ldg(&test_points[3 * p])));
+                                const double qy = fastsasa_dadd(yi, fastsasa_dmul(ri, __ldg(&test_points[3 * p + 1])));
+                                const double qz = fastsasa_dadd(zi, fastsasa_dmul(ri, __ldg(&test_points[3 * p + 2])));
+                                const double dx = qx - xj;
+                                const double dy = qy - yj;
+                                const double dz_ = qz - zj;
+                                if (fastsasa_dadd(fastsasa_dadd(fastsasa_dmul(dx, dx), fastsasa_dmul(dy, dy)), fastsasa_dmul(dz_, dz_)) < rj2) {
+                                    visible[w] &= ~(1ull << bit);
+                                }
+                            }
+                        }
+                        any = 0ull;
+#pragma unroll
+                        for (int w = 0; w < W; ++w) any |= visible[w];
+                    }
+                }
+                if (any == 0ull) any_visible = 0;
+            }
+        }
+    }
+    (void)overflow;
+
+    int exposed = 0;
+    if (!buried_all && any_visible) {
+        /* exact pass over parked bits that are still visible */
+        for (int q = 0; q < n_pending; ++q) {
+            const int other = my_pending_slot[q];
+            const double xj = __ldg(&x[other]);
+            const double yj = __ldg(&y[other]);
+            const double zj = __ldg(&z[other]);
+            const double rj2 = __ldg(&radii2[other]);
+#pragma unroll
+            for (int w = 0; w < W; ++w) {
+                unsigned long long a = my_pending[q * W + w] & visible[w];
+                while (a) {
+                    const int bit = __ffsll((long long)a) - 1;
+                    a &= a - 1ull;
+                    const int p = w * 64 + bit;
+                    const double qx = fastsasa_dadd(xi, fastsasa_dmul(ri, __ldg(&test_points[3 * p])));
+                    const double qy = fastsasa_dadd(yi, fastsasa_dmul(ri, __ldg(&test_points[3 * p + 1])));
+                    const double qz = fastsasa_dadd(zi, fastsasa_dmul(ri, __ldg(&test_points[3 * p + 2])));
+                    const double dx = qx - xj;
+                    const double dy = qy - yj;
+                    const double dz = qz - zj;
+                    if (fastsasa_dadd(fastsasa_dadd(fastsasa_dmul(dx, dx), fastsasa_dmul(dy, dy)), fastsasa_dmul(dz, dz)) < rj2) {
+                        visible[w] &= ~(1ull << bit);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int w = 0; w < W; ++w) exposed += __popcll(visible[w]);
+    }
+    const double atom_sasa = sr_atom_area(ri, exposed, n_points);
+    if (sasa != NULL) sasa[atom] = atom_sasa;
+    if (total_sasa != NULL) atomic_add_double(total_sasa, atom_sasa);
+}
+
 /*
  * FP64-exact Shrake-Rupley with a single-precision prefilter. Consumer GPUs
  * execute FP64 at a small fraction of the FP32 rate, so each point/neighbor
@@ -3746,6 +4082,8 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
                                     ? 1
                                     : use_float_sr());
     const int hybrid_sr = !float_sr && use_sr_fp64_hybrid();
+    /* Mask kernel: FP64 only, up to 255 points, whole-atom centres. */
+    const int mask_sr = !float_sr && use_mask_sr() && input->n_points <= 255;
     const fastsasa_sr_dispatch_policy dispatch = select_sr_dispatch_policy(
         input->n_points,
         input->n_atoms,
@@ -3805,8 +4143,21 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
     if (status != FASTSASA_SUCCESS) goto status_fail;
     status = ensure_soa_capacity(context, coord_bytes);
     if (status != FASTSASA_SUCCESS) goto status_fail;
-    if (float_sr || hybrid_sr) {
+    if (float_sr || hybrid_sr || mask_sr) {
         status = ensure_float_sr_capacity(context, coord_bytes, test_point_bytes);
+        if (status != FASTSASA_SUCCESS) goto status_fail;
+    }
+    if (mask_sr) {
+        const int words = (input->n_points + 63) / 64;
+        status = ensure_mask_table(context, input->n_points, input->test_points);
+        if (status != FASTSASA_SUCCESS) goto status_fail;
+        status = ensure_device_capacity((void **)&context->d_mask_pending,
+                                        &context->mask_pending_capacity,
+                                        sizeof(unsigned long long) * (size_t)sr_center_count * FASTSASA_MASK_PENDING * (size_t)words);
+        if (status != FASTSASA_SUCCESS) goto status_fail;
+        status = ensure_device_capacity((void **)&context->d_mask_pending_slot,
+                                        &context->mask_pending_slot_capacity,
+                                        sizeof(int) * (size_t)sr_center_count * FASTSASA_MASK_PENDING);
         if (status != FASTSASA_SUCCESS) goto status_fail;
     }
     if (aggregate_total) {
@@ -3948,8 +4299,9 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
     } else {
         square_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii, context->d_radii2);
         if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
-        if (hybrid_sr) {
-            /* Box-local float shadows feed the hybrid kernel's prefilter. */
+        if (hybrid_sr || mask_sr) {
+            /* Box-local float shadows feed the hybrid kernel's prefilter and
+             * the mask kernel's candidate scan. */
             double_to_shifted_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_x, min_x, context->d_xf);
             if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
             double_to_shifted_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_y, min_y, context->d_yf);
@@ -3957,6 +4309,8 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
             double_to_shifted_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_z, min_z, context->d_zf);
             if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
             double_to_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii2, context->d_radii2_f);
+            if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
+            double_to_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii, context->d_radii_f);
             if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
         }
     }
@@ -4130,6 +4484,30 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
             active_center ? input->active_center_mask : 0u,
             sasa != NULL || aggregate_host ? context->d_sasa : NULL,
             NULL);
+    } else if (mask_sr) {
+        const int mask_threads = 128;
+        const int mask_blocks = (sr_center_count + mask_threads - 1) / mask_threads;
+        const int W = (input->n_points + 63) / 64;
+#define FASTSASA_LAUNCH_MASK(WW) \
+        shrake_rupley_cell_mask_kernel<WW><<<mask_blocks, mask_threads, 0, context->stream>>>( \
+            input->n_atoms, input->n_points, context->d_x, context->d_y, context->d_z, \
+            context->d_radii, context->d_radii2, context->d_test_points, \
+            context->d_xf, context->d_yf, context->d_zf, context->d_radii_f, \
+            context->d_mask_table, context->mask_table_res, context->mask_table_tbins, \
+            context->mask_table_max_delta, context->mask_table_dot_pad, nx, ny, nz, \
+            context->d_atom_cells, context->d_cell_offsets, context->d_cell_atoms, \
+            compact_active_centers ? context->d_active_center_indices : NULL, sr_center_count, \
+            active_center ? context->d_selection_masks : NULL, \
+            active_center ? input->active_center_mask : 0u, \
+            context->d_mask_pending, context->d_mask_pending_slot, \
+            sasa != NULL || aggregate_host ? context->d_sasa : NULL, NULL)
+        switch (W) {
+        case 1: FASTSASA_LAUNCH_MASK(1); break;
+        case 2: FASTSASA_LAUNCH_MASK(2); break;
+        case 3: FASTSASA_LAUNCH_MASK(3); break;
+        default: FASTSASA_LAUNCH_MASK(4); break;
+        }
+#undef FASTSASA_LAUNCH_MASK
     } else if (hybrid_sr) {
         /* Conservative FP32-prefilter uncertainty margin. Coordinates are
          * box-local, so magnitudes are bounded by the grid extent; distances
