@@ -15,6 +15,7 @@
         fastsasa_cpu_shrake_rupley;
         fastsasa_cpu_shrake_rupley_precision;
         fastsasa_cpu_shrake_rupley_mask;
+        fastsasa_cpu_shrake_rupley_mask_fp32;
         fastsasa_cpu_mask_policy;
         fastsasa_context_calc_trajectory_soa;
         fastsasa_context_calc_trajectory_soa_selection;

@@ -24,6 +24,10 @@ extern "C" int fastsasa_cpu_shrake_rupley_mask(int n_atoms, int n_points,
                                                const double *expanded_radii, const double *test_points,
                                                int n_threads, double *sasa);
 extern "C" int fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points);
+extern "C" int fastsasa_cpu_shrake_rupley_mask_fp32(int n_atoms, int n_points,
+                                                    const double *x, const double *y, const double *z,
+                                                    const double *expanded_radii, const double *test_points,
+                                                    int n_threads, double *sasa);
 
 static void
 join_threads(std::vector<std::thread> *threads) noexcept
@@ -547,6 +551,11 @@ cpu_shrake_rupley_impl_fp32(int n_atoms,
     const double max_radius = maximum_radius(expanded_radii, n_atoms);
     if (max_radius <= 0.0 || !cell_keys_fit(n_atoms, x, y, z, max_radius)) {
         return FASTSASA_INVALID_ARGUMENT;
+    }
+    if (fastsasa_cpu_mask_policy(n_atoms, n_points, test_points)) {
+        const int status = fastsasa_cpu_shrake_rupley_mask_fp32(n_atoms, n_points, x, y, z,
+                                                                expanded_radii, test_points, n_threads, sasa);
+        if (status != -100) return status;
     }
 
     /* The FP32 coordinates are box-local, matching the CUDA and Vulkan FP32

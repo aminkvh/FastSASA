@@ -76,7 +76,11 @@ bit for bit:
 By default the CPU backend switches to the mask kernel once the work in the
 process (atoms times frames) repays that table build, which is immediate for
 trajectories and for anything beyond a few small structures. Override with
-`FASTSASA_CPU_KERNEL=reference` or `FASTSASA_CPU_KERNEL=mask`. The table's
+`FASTSASA_CPU_KERNEL=reference` or `FASTSASA_CPU_KERNEL=mask`. The same
+construction serves `--precision fp32` on the CPU, with the boundary tests
+run in the FP32 kernel's float arithmetic, so FP32 output is unchanged and
+gets the same speedup; on the CPU, FP32 is therefore no faster than FP64
+and exists for consistency with the GPU precision modes. The table's
 grid resolution can be tuned with `FASTSASA_CPU_MASK_RESOLUTION` (default
 64; finer grids trade table size for fewer exact tests). Both kernels are
 compared bit for bit in the test suite (`fastsasa_cpu_mask_kernel`).

@@ -4,7 +4,9 @@
  * kernel treats specially: coincident centres (equal and unequal radii),
  * large coordinate offsets, rotations, touching pairs, single atoms, dense
  * random packings, and every mask width (1 to 4 words, i.e. up to 255
- * points). Also checks the automatic policy and the unsupported-input path.
+ * points), at both FP64 and FP32 (each mask variant against its own
+ * reference kernel). Also checks the automatic policy and the
+ * unsupported-input path.
  */
 #include "fastsasa.h"
 #include "fastsasa_cpu.h"
@@ -40,15 +42,17 @@ fibonacci_points(int n_points)
 
 /* Run both kernels; report the first per-atom difference. */
 static void
-compare(const char *name, int n_atoms, int n_points,
-        const double *x, const double *y, const double *z, const double *expanded,
-        int n_threads)
+compare_precision(const char *name, int n_atoms, int n_points,
+                  const double *x, const double *y, const double *z, const double *expanded,
+                  int n_threads, int precision)
 {
     double *points = fibonacci_points(n_points);
     double *ref = (double *)calloc((size_t)n_atoms, sizeof(double));
     double *msk = (double *)calloc((size_t)n_atoms, sizeof(double));
-    const int sr = fastsasa_cpu_shrake_rupley(n_atoms, n_points, x, y, z, expanded, points, n_threads, ref);
-    const int sm = fastsasa_cpu_shrake_rupley_mask(n_atoms, n_points, x, y, z, expanded, points, n_threads, msk);
+    const int sr = fastsasa_cpu_shrake_rupley_precision(n_atoms, n_points, x, y, z, expanded, points, n_threads, precision, ref);
+    const int sm = precision == FASTSASA_PRECISION_FP32
+        ? fastsasa_cpu_shrake_rupley_mask_fp32(n_atoms, n_points, x, y, z, expanded, points, n_threads, msk)
+        : fastsasa_cpu_shrake_rupley_mask(n_atoms, n_points, x, y, z, expanded, points, n_threads, msk);
     int bad = -1;
 
     /* the reference entry point may itself have routed to the mask kernel
@@ -62,7 +66,7 @@ compare(const char *name, int n_atoms, int n_points,
 #else
         setenv("FASTSASA_CPU_KERNEL", "reference", 1);
 #endif
-        fastsasa_cpu_shrake_rupley(n_atoms, n_points, x, y, z, expanded, points, n_threads, ref2);
+        fastsasa_cpu_shrake_rupley_precision(n_atoms, n_points, x, y, z, expanded, points, n_threads, precision, ref2);
 #if defined(_WIN32)
         _putenv_s("FASTSASA_CPU_KERNEL", "");
 #else
@@ -84,7 +88,8 @@ compare(const char *name, int n_atoms, int n_points,
         } else {
             double total = 0.0;
             for (int a = 0; a < n_atoms; ++a) total += ref[a];
-            printf("ok   %-40s %6d atoms %3d points total %.6f\n", name, n_atoms, n_points, total);
+            printf("ok   %-40s %6d atoms %3d points %s total %.6f\n", name, n_atoms, n_points,
+                   precision == FASTSASA_PRECISION_FP32 ? "fp32" : "fp64", total);
         }
     } else {
         printf("ok   %-40s both rejected (status %d)\n", name, sr);
@@ -92,6 +97,15 @@ compare(const char *name, int n_atoms, int n_points,
     free(points);
     free(ref);
     free(msk);
+}
+
+static void
+compare(const char *name, int n_atoms, int n_points,
+        const double *x, const double *y, const double *z, const double *expanded,
+        int n_threads)
+{
+    compare_precision(name, n_atoms, n_points, x, y, z, expanded, n_threads, FASTSASA_PRECISION_FP64);
+    compare_precision(name, n_atoms, n_points, x, y, z, expanded, n_threads, FASTSASA_PRECISION_FP32);
 }
 
 static double

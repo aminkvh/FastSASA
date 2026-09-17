@@ -347,9 +347,12 @@ struct Grid {
     std::vector<int> atom_of;             /* sorted slot -> atom id */
     std::vector<double> sx, sy, sz, sr;   /* sorted coordinates and expanded radii */
     std::vector<double> sr2, inv_two_r;   /* R^2 and 1/(2R), sorted */
+    /* FP32 mode: the reference's float shadow (coordinates box-local in
+     * double, then cast; float radii and squared radii), in slot order. */
+    std::vector<float> fx, fy, fz, fr, fr2;
 
     bool build(int n_atoms, const double *x, const double *y, const double *z, const double *r,
-               double reach, double cell_size)
+               double reach, double cell_size, bool fp32)
     {
         double lo[3] = {x[0], y[0], z[0]};
         double hi[3] = {x[0], y[0], z[0]};
@@ -390,6 +393,10 @@ struct Grid {
         sr.resize(static_cast<size_t>(n_atoms));
         sr2.resize(static_cast<size_t>(n_atoms));
         inv_two_r.resize(static_cast<size_t>(n_atoms));
+        if (fp32) {
+            fx.resize(static_cast<size_t>(n_atoms)); fy.resize(static_cast<size_t>(n_atoms)); fz.resize(static_cast<size_t>(n_atoms));
+            fr.resize(static_cast<size_t>(n_atoms)); fr2.resize(static_cast<size_t>(n_atoms));
+        }
         std::vector<int> fill(cell_start.begin(), cell_start.end() - 1);
         for (int a = 0; a < n_atoms; ++a) {
             const int slot = fill[static_cast<size_t>(cell_of[static_cast<size_t>(a)])]++;
@@ -400,6 +407,14 @@ struct Grid {
             sr[static_cast<size_t>(slot)] = r[a];
             sr2[static_cast<size_t>(slot)] = r[a] * r[a];
             inv_two_r[static_cast<size_t>(slot)] = 1.0 / (2.0 * r[a]);
+            if (fp32) {
+                /* same expressions as cpu_shrake_rupley_impl_fp32 */
+                fx[static_cast<size_t>(slot)] = static_cast<float>(x[a] - lo[0]);
+                fy[static_cast<size_t>(slot)] = static_cast<float>(y[a] - lo[1]);
+                fz[static_cast<size_t>(slot)] = static_cast<float>(z[a] - lo[2]);
+                fr[static_cast<size_t>(slot)] = static_cast<float>(r[a]);
+                fr2[static_cast<size_t>(slot)] = fr[static_cast<size_t>(slot)] * fr[static_cast<size_t>(slot)];
+            }
         }
         return true;
     }
@@ -439,6 +454,8 @@ struct WorkerArgs {
     const Grid &grid;
     const MaskTable &lut;
     const double *test_points;
+    const float *test_points_f;      /* FP32 mode only */
+    bool fp32;
     double *sasa;
     Stats *stats;
     std::atomic<int> *status;
@@ -547,6 +564,13 @@ static FASTSASA_ALWAYS_INLINE void worker_body(const WorkerArgs &A, int begin, i
         const double *const FASTSASA_RESTRICT gsr = grid.sr.data();
         const double *const FASTSASA_RESTRICT gsr2 = grid.sr2.data();
         const int *const FASTSASA_RESTRICT gcell = grid.cell_start.data();
+        const bool fp32 = A.fp32;
+        const float *const FASTSASA_RESTRICT gfx = fp32 ? grid.fx.data() : nullptr;
+        const float *const FASTSASA_RESTRICT gfy = fp32 ? grid.fy.data() : nullptr;
+        const float *const FASTSASA_RESTRICT gfz = fp32 ? grid.fz.data() : nullptr;
+        const float *const FASTSASA_RESTRICT gfr = fp32 ? grid.fr.data() : nullptr;
+        const float *const FASTSASA_RESTRICT gfr2 = fp32 ? grid.fr2.data() : nullptr;
+        const float *const FASTSASA_RESTRICT test_points_f = A.test_points_f;
         alignas(64) int bidx[kMaxPoints];
         int pending_cap_storage_size = 1024;
         std::vector<std::uint64_t> pending_storage(static_cast<size_t>(kMaxWords) * 1024u);
@@ -567,6 +591,10 @@ static FASTSASA_ALWAYS_INLINE void worker_body(const WorkerArgs &A, int begin, i
             const double xi = gsx[slot];
             const double yi = gsy[slot];
             const double zi = gsz[slot];
+            const float xif = fp32 ? gfx[slot] : 0.0f;
+            const float yif = fp32 ? gfy[slot] : 0.0f;
+            const float zif = fp32 ? gfz[slot] : 0.0f;
+            const float rif = fp32 ? gfr[slot] : 0.0f;
             ++st.atoms;
 
             /* Growth for pathological densities: a stencil can hold at most
@@ -623,9 +651,20 @@ static FASTSASA_ALWAYS_INLINE void worker_body(const WorkerArgs &A, int begin, i
                     const v4d vx = px - vxi, vy = py - vyi, vz = pz - vzi;
                     const v4d d2 = vx * vx + vy * vy + vz * vz;
                     const v4d reach = vri + pr;
-                    const v4l hit = d2 < reach * reach;
                     unsigned m = 0;
-                    for (int l = 0; l < 4; ++l) m |= static_cast<unsigned>(hit[l] != 0) << l;
+                    if (!fp32) {
+                        const v4l hit = d2 < reach * reach;
+                        for (int l = 0; l < 4; ++l) m |= static_cast<unsigned>(hit[l] != 0) << l;
+                    } else {
+                        /* the FP32 reference's neighbour prefilter, in float */
+                        for (int l = 0; l < 4; ++l) {
+                            const float dxf = xif - gfx[b + l];
+                            const float dyf = yif - gfy[b + l];
+                            const float dzf = zif - gfz[b + l];
+                            const float md = rif + gfr[b + l];
+                            m |= static_cast<unsigned>(dxf * dxf + dyf * dyf + dzf * dzf < md * md) << l;
+                        }
+                    }
                     if (b <= slot && slot < b + 4) m &= ~(1u << (slot - b));
                     if (!m) continue;
                     /* Geometry for all four lanes. d2 == 0 lanes (self, or a
@@ -670,7 +709,15 @@ static FASTSASA_ALWAYS_INLINE void worker_body(const WorkerArgs &A, int begin, i
                         while (mm) {
                             const int l = fastsasa_ctz32(mm);
                             mm &= mm - 1;
-                            if (zero_d[l]) { park_all_points<W>(visible, b + l, pending, pending_cap, n_pending); ++st.neighbours; continue; }
+                            const bool coincident = fp32
+                                ? (xif == gfx[b + l] && yif == gfy[b + l] && zif == gfz[b + l])
+                                : (zero_d[l] != 0);
+                            if (coincident) { park_all_points<W>(visible, b + l, pending, pending_cap, n_pending); ++st.neighbours; continue; }
+                            if (zero_d[l]) {
+                                /* double centres coincide but float do not (cannot
+                                 * happen: equal doubles cast to equal floats) */
+                                park_all_points<W>(visible, b + l, pending, pending_cap, n_pending); ++st.neighbours; continue;
+                            }
                             const double tl = t[l];
                             if (tl >= lim_hi) continue;
                             if (tl <= lim_lo) { buried_now = true; break; }
@@ -713,9 +760,19 @@ static FASTSASA_ALWAYS_INLINE void worker_body(const WorkerArgs &A, int begin, i
                     const double vz = gsz[b] - zi;
                     const double d2 = vx * vx + vy * vy + vz * vz;
                     const double reach = ri + gsr[b];
-                    if (!(d2 < reach * reach) || b == slot) continue;
+                    if (b == slot) continue;
+                    if (!fp32) {
+                        if (!(d2 < reach * reach)) continue;
+                    } else {
+                        const float dxf = xif - gfx[b];
+                        const float dyf = yif - gfy[b];
+                        const float dzf = zif - gfz[b];
+                        const float md = rif + gfr[b];
+                        if (!(dxf * dxf + dyf * dyf + dzf * dzf < md * md)) continue;
+                    }
                     double t, su, sv;
-                    if (d2 == 0.0) { park_all_points<W>(visible, b, pending, pending_cap, n_pending); ++st.neighbours; continue; }
+                    const bool coincident = fp32 ? (xif == gfx[b] && yif == gfy[b] && zif == gfz[b]) : (d2 == 0.0);
+                    if (coincident || d2 == 0.0) { park_all_points<W>(visible, b, pending, pending_cap, n_pending); ++st.neighbours; continue; }
                     geometry_one(vx, vy, vz, d2, gsr2[b], ri2, inv_two_ri, res_half, t, su, sv);
                     go = apply_cap<W>(lut, visible, b, t, su, sv, lim_lo, lim_hi, res_max,
                                       pending, pending_cap, n_pending, fully_buried, st);
@@ -740,23 +797,44 @@ static FASTSASA_ALWAYS_INLINE void worker_body(const WorkerArgs &A, int begin, i
                     }
                     if (!n_amb) continue;
                     const int js = pending_cap[q];
-                    const double rj2 = gsr2[js];
-                    const double xj = gsx[js];
-                    const double yj = gsy[js];
-                    const double zj = gsz[js];
                     st.exact_tests += n_amb;
-                    /* The reference's exact test, same operation order. */
-                    for (int k = 0; k < n_amb; ++k) {
-                        const int p = bidx[k];
-                        const double px = xi + ri * test_points[3 * p];
-                        const double py = yi + ri * test_points[3 * p + 1];
-                        const double pz = zi + ri * test_points[3 * p + 2];
-                        const double ddx = px - xj;
-                        const double ddy = py - yj;
-                        const double ddz = pz - zj;
-                        if (ddx * ddx + ddy * ddy + ddz * ddz < rj2) {
-                            visible[p >> 6] &= ~(std::uint64_t(1) << (p & 63));
-                            ++st.cleared_by_test;
+                    if (!fp32) {
+                        const double rj2 = gsr2[js];
+                        const double xj = gsx[js];
+                        const double yj = gsy[js];
+                        const double zj = gsz[js];
+                        /* The FP64 reference's exact test, same operation order. */
+                        for (int k = 0; k < n_amb; ++k) {
+                            const int p = bidx[k];
+                            const double px = xi + ri * test_points[3 * p];
+                            const double py = yi + ri * test_points[3 * p + 1];
+                            const double pz = zi + ri * test_points[3 * p + 2];
+                            const double ddx = px - xj;
+                            const double ddy = py - yj;
+                            const double ddz = pz - zj;
+                            if (ddx * ddx + ddy * ddy + ddz * ddz < rj2) {
+                                visible[p >> 6] &= ~(std::uint64_t(1) << (p & 63));
+                                ++st.cleared_by_test;
+                            }
+                        }
+                    } else {
+                        const float rj2f = gfr2[js];
+                        const float xjf = gfx[js];
+                        const float yjf = gfy[js];
+                        const float zjf = gfz[js];
+                        /* The FP32 reference's exact test, same operation order. */
+                        for (int k = 0; k < n_amb; ++k) {
+                            const int p = bidx[k];
+                            const float px = xif + rif * test_points_f[3 * p];
+                            const float py = yif + rif * test_points_f[3 * p + 1];
+                            const float pz = zif + rif * test_points_f[3 * p + 2];
+                            const float ddx = px - xjf;
+                            const float ddy = py - yjf;
+                            const float ddz = pz - zjf;
+                            if (ddx * ddx + ddy * ddy + ddz * ddz < rj2f) {
+                                visible[p >> 6] &= ~(std::uint64_t(1) << (p & 63));
+                                ++st.cleared_by_test;
+                            }
                         }
                     }
                 }
@@ -816,16 +894,9 @@ fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points)
     return work >= break_even ? 1 : 0;
 }
 
-extern "C" int
-fastsasa_cpu_shrake_rupley_mask(int n_atoms,
-                                int n_points,
-                                const double *x,
-                                const double *y,
-                                const double *z,
-                                const double *expanded_radii,
-                                const double *test_points,
-                                int n_threads,
-                                double *sasa)
+static int
+mask_kernel(int n_atoms, int n_points, const double *x, const double *y, const double *z,
+            const double *expanded_radii, const double *test_points, int n_threads, bool fp32, double *sasa)
 {
     if (n_points > kMaxPoints) return kUnsupported;
     if (n_points <= 0 || n_atoms <= 0) return FASTSASA_INVALID_ARGUMENT;
@@ -841,7 +912,12 @@ fastsasa_cpu_shrake_rupley_mask(int n_atoms,
     /* Cell edge = max radius, stencil 2: covers reach 2 * max_radius with a
      * 5x5x5 block, 42% less volume than 3x3x3 cells of twice the edge. */
     Grid grid;
-    if (!grid.build(n_atoms, x, y, z, expanded_radii, 2.0 * max_radius, max_radius)) return kUnsupported;
+    if (!grid.build(n_atoms, x, y, z, expanded_radii, 2.0 * max_radius, max_radius, fp32)) return kUnsupported;
+    std::vector<float> points_f;
+    if (fp32) {
+        points_f.resize(3u * static_cast<size_t>(n_points));
+        for (int i = 0; i < 3 * n_points; ++i) points_f[static_cast<size_t>(i)] = static_cast<float>(test_points[i]);
+    }
 
     /* Threads: at ~1 us per atom, a thread launch (~20-40 us) only pays
      * for itself above a few hundred atoms per thread; measured optimum on
@@ -866,7 +942,7 @@ fastsasa_cpu_shrake_rupley_mask(int n_atoms,
      * atoms are processed in sorted slot order so their neighbourhoods are
      * spatially and cache local). The worker is instantiated per mask width
      * so the visibility mask is a fixed-size register array. */
-    WorkerArgs args{grid, lut, test_points, sasa, stats.data(), &worker_status, &candidates};
+    WorkerArgs args{grid, lut, test_points, fp32 ? points_f.data() : nullptr, fp32, sasa, stats.data(), &worker_status, &candidates};
     auto run = [&](int begin, int end, int tid) {
         switch (words) {
         case 1: worker_impl<1>(args, begin, end, tid); break;
@@ -902,4 +978,22 @@ fastsasa_cpu_shrake_rupley_mask(int n_atoms,
                      static_cast<double>(total.early_break) / total.atoms, static_cast<double>(total.fully_buried) / total.atoms, n_pairs);
     }
     return worker_status.load();
+}
+
+extern "C" int
+fastsasa_cpu_shrake_rupley_mask(int n_atoms, int n_points, const double *x, const double *y, const double *z,
+                                const double *expanded_radii, const double *test_points, int n_threads, double *sasa)
+{
+    return mask_kernel(n_atoms, n_points, x, y, z, expanded_radii, test_points, n_threads, false, sasa);
+}
+
+/* FP32 variant: same construction, with the neighbour prefilter, coincidence
+ * test and exact boundary test evaluated in the FP32 reference kernel's
+ * float arithmetic (box-local float shadow), so its output is that kernel's
+ * bit for bit. The direction table is shared (it only has to be conservative). */
+extern "C" int
+fastsasa_cpu_shrake_rupley_mask_fp32(int n_atoms, int n_points, const double *x, const double *y, const double *z,
+                                     const double *expanded_radii, const double *test_points, int n_threads, double *sasa)
+{
+    return mask_kernel(n_atoms, n_points, x, y, z, expanded_radii, test_points, n_threads, true, sasa);
 }
