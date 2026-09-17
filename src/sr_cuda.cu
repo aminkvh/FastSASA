@@ -2719,7 +2719,13 @@ shrake_rupley_cell_kernel(int n_atoms,
  * Table entry layout (see fastsasa_cpu_mask_table_view): entry[(bin *
  * tbins + q) * 2 * W + w], blocked row then band row.
  */
-#define FASTSASA_MASK_PENDING 32    /* parked (neighbour, band) pairs per lane */
+/* Parked (neighbour, band) pairs per lane. The CPU kernel's statistics show
+ * ~5-7 neighbours per atom leave band points behind at 128 points; when the
+ * list is full the kernel decides that neighbour's band points inline with
+ * the exact test instead (correct, just less deferred), so this only bounds
+ * scratch memory (32 * W * 8 B per atom). Measured on a 6x-density random
+ * packing and at 255 points with no slowdown from overflow. */
+#define FASTSASA_MASK_PENDING 32
 
 template <int W>
 __global__ static void

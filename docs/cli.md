@@ -91,9 +91,11 @@ per atom, the warp scanning its shared neighbourhood cooperatively on the
 box-local float shadows, the certain caps applied from the shared direction
 table, and the boundary points decided with the reference kernel's exact
 FP64 arithmetic, so CUDA FP64 stays bit-identical to the CPU (the
-`fastsasa_backend_bit_identity` test). It is 4-5x faster than the previous
-FP64 kernel per structure. `FASTSASA_CUDA_SR_KERNEL=reference` selects the
-previous kernel.
+`fastsasa_backend_bit_identity` test). The kernel itself is 4-5x faster
+than the previous FP64 kernel; per trajectory frame the gain is smaller
+(about 2.5x through the Python API, less through the CLI) because the
+per-frame upload, cell-list build and readback are now comparable to the
+kernel. `FASTSASA_CUDA_SR_KERNEL=reference` selects the previous kernel.
 
 ## Core Options
 
