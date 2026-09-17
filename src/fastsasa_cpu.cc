@@ -16,6 +16,15 @@
 
 static const double FASTSASA_CPU_PI = 3.141592653589793238462643383279502884;
 
+/* src/fastsasa_cpu_mask.cc: exact, bit-identical, mask-accelerated SR.
+ * The kernel returns -100 when it cannot handle the input (falls back
+ * here); the policy decides whether to use it (FASTSASA_CPU_KERNEL). */
+extern "C" int fastsasa_cpu_shrake_rupley_mask(int n_atoms, int n_points,
+                                               const double *x, const double *y, const double *z,
+                                               const double *expanded_radii, const double *test_points,
+                                               int n_threads, double *sasa);
+extern "C" int fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points);
+
 static void
 join_threads(std::vector<std::thread> *threads) noexcept
 {
@@ -268,6 +277,11 @@ cpu_shrake_rupley_impl(int n_atoms,
     const double max_radius = maximum_radius(expanded_radii, n_atoms);
     if (max_radius <= 0.0 || !cell_keys_fit(n_atoms, x, y, z, max_radius)) {
         return FASTSASA_INVALID_ARGUMENT;
+    }
+    if (fastsasa_cpu_mask_policy(n_atoms, n_points, test_points)) {
+        const int status = fastsasa_cpu_shrake_rupley_mask(n_atoms, n_points, x, y, z,
+                                                           expanded_radii, test_points, n_threads, sasa);
+        if (status != -100) return status;
     }
     radius2.resize(static_cast<size_t>(n_atoms));
     for (int atom = 0; atom < n_atoms; ++atom) {

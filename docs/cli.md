@@ -57,6 +57,30 @@ Matching backends use the same algorithm, radii, probe radius, resolution,
 and reduction order. See [Radius Configuration](classifier_config.md) when
 comparing FastSASA with another SASA implementation.
 
+### The CPU Shrake-Rupley kernels
+
+The CPU backend has two FP64 Shrake-Rupley kernels that give the same result
+bit for bit:
+
+- the reference kernel, which tests every sphere point against every
+  overlapping neighbour;
+- a mask-accelerated kernel, which settles most points with precomputed
+  spherical-cap masks (indexed by the neighbour's direction on a 64x64
+  octahedral grid and its cap threshold) and hands only the points near a
+  cap boundary to the reference test, in the reference's own operation
+  order. It is typically 3-4x faster per atom and, unlike approximate
+  bitmask methods, exact and rotation-invariant. Its one-time direction
+  table costs about 40 ms at 128 points (about 0.3 ms per point) and is
+  cached per process; it supports up to 255 points.
+
+By default the CPU backend switches to the mask kernel once the work in the
+process (atoms times frames) repays that table build, which is immediate for
+trajectories and for anything beyond a few small structures. Override with
+`FASTSASA_CPU_KERNEL=reference` or `FASTSASA_CPU_KERNEL=mask`. The table's
+grid resolution can be tuned with `FASTSASA_CPU_MASK_RESOLUTION` (default
+64; finer grids trade table size for fewer exact tests). Both kernels are
+compared bit for bit in the test suite (`fastsasa_cpu_mask_kernel`).
+
 ## Core Options
 
 | Option | Meaning |

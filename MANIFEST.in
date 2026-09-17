@@ -37,6 +37,7 @@ include src/fastsasa_exact_math.h
 include cmake/embed_binary.cmake
 include src/fastsasa_portable.h
 include src/fastsasa_cpu.cc
+include src/fastsasa_cpu_mask.cc
 include src/fastsasa_device_stub.c
 include src/fastsasa_vulkan.cc
 include src/fastsasa_vulkan_internal.h

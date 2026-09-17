@@ -37,6 +37,24 @@ int fastsasa_cpu_shrake_rupley_precision(int n_atoms,
                                        int precision,
                                        double *sasa);
 
+/* Mask-accelerated exact Shrake-Rupley (FP64 only, n_points <= 255). Same
+ * result as fastsasa_cpu_shrake_rupley bit for bit; typically 3-4x faster on
+ * the CPU. The one-time direction table (~43 ms at 128 points) is cached per
+ * process. fastsasa_cpu_shrake_rupley selects this kernel automatically once
+ * the work in the process repays that build, or always/never with
+ * FASTSASA_CPU_KERNEL=mask|reference; fastsasa_cpu_mask_policy() reports
+ * that decision. Returns -100 for inputs the kernel does not handle. */
+int fastsasa_cpu_shrake_rupley_mask(int n_atoms,
+                                    int n_points,
+                                    const double *x,
+                                    const double *y,
+                                    const double *z,
+                                    const double *expanded_radii,
+                                    const double *test_points,
+                                    int n_threads,
+                                    double *sasa);
+int fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points);
+
 /*
  * Writes a row-major n_atoms x n_points mask marking which Shrake-Rupley
  * test points on each atom's probe-expanded sphere are solvent accessible.

@@ -261,6 +261,7 @@ if(FASTSASA_BUILD_STATIC)
     add_library(fastsasa STATIC
         src/fastsasa_api.c
         src/fastsasa_cpu.cc
+        src/fastsasa_cpu_mask.cc
         src/fastsasa_radius.c
         src/fastsasa_trajectory.c
         src/dcd_reader.c
@@ -274,6 +275,7 @@ endif()
 add_library(fastsasa_native SHARED
     src/fastsasa_api.c
     src/fastsasa_cpu.cc
+        src/fastsasa_cpu_mask.cc
     src/fastsasa_radius.c
     src/fastsasa_trajectory.c
     src/gemmi_topology.cc
@@ -745,6 +747,26 @@ if(FASTSASA_BUILD_NATIVE_TESTS)
     # The same feature/RSA validation the GPU builds run, pinned to the
     # threaded CPU tier so CPU-only builds exercise it too (including the
     # --format rsa cross-check, the CPU FP32 path, and the FP64 fallbacks).
+    add_executable(fastsasa_cpu_mask_kernel_validate
+        tests/cpu_mask_kernel_validation.c
+    )
+    target_link_libraries(fastsasa_cpu_mask_kernel_validate
+        PRIVATE
+            fastsasa
+            $<$<NOT:$<PLATFORM_ID:Windows>>:m>
+    )
+    # Bit-identity of the mask-accelerated CPU Shrake-Rupley kernel against
+    # the reference kernel: bundled structures at every mask width, plus the
+    # geometric edge cases (coincident centres, offsets, rotations, packing).
+    add_test(NAME fastsasa_cpu_mask_kernel
+        COMMAND $<TARGET_FILE:fastsasa_cpu_mask_kernel_validate>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/1ubq.cif
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/5hdn.cif
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/2isk.cif
+    )
+    set_tests_properties(fastsasa_cpu_mask_kernel
+        PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} LABELS "cpu;release"
+    )
     add_test(NAME fastsasa_python_feature_cpu
         COMMAND ${CMAKE_COMMAND} -E env
                 FASTSASA_BACKEND=cpu
@@ -882,7 +904,8 @@ foreach(FASTSASA_DEVELOPER_TARGET
         fastsasa_context_isolation_validate
         fastsasa_autotune_dispatch_validate
         fastsasa_mmcif_selection_validate
-        fastsasa_mmcif_corpus_validate)
+        fastsasa_mmcif_corpus_validate
+        fastsasa_cpu_mask_kernel_validate)
     if(TARGET ${FASTSASA_DEVELOPER_TARGET})
         fastsasa_apply_developer_options(${FASTSASA_DEVELOPER_TARGET})
     endif()
