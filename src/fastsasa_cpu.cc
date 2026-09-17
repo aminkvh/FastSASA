@@ -1,5 +1,6 @@
 #include "fastsasa.h"
 #include "fastsasa_cpu.h"
+#include "fastsasa_cpu_pool.h"
 #include "fastsasa_exact_math.h"
 
 #include <algorithm>
@@ -199,7 +200,9 @@ thread_count(int requested,
     int count = requested > 0 ? requested : fastsasa_cpu_default_threads();
 
     if (count < 1) count = 1;
-    if (count > n_atoms) count = n_atoms;
+    /* A few dozen atoms per worker is the point where handing work out
+     * costs more than doing it. */
+    if (count > n_atoms / 32 + 1) count = n_atoms / 32 + 1;
     return count;
 }
 
@@ -264,7 +267,6 @@ cpu_shrake_rupley_impl(int n_atoms,
                        int n_threads,
                        double *sasa)
 {
-    std::vector<std::thread> threads;
     std::vector<double> radius2;
     std::atomic<int> worker_status(FASTSASA_SUCCESS);
     int count;
@@ -292,20 +294,16 @@ cpu_shrake_rupley_impl(int n_atoms,
         radius2[static_cast<size_t>(atom)] = expanded_radii[atom] * expanded_radii[atom];
     }
     count = thread_count(n_threads, n_atoms);
-    threads.reserve(static_cast<size_t>(count));
     if (!env_enabled("FASTSASA_CPU_SIMD", 1)) {
         const cell_list cells(n_atoms, x, y, z, max_radius);
 
-        try {
-            for (int thread_id = 0; thread_id < count; ++thread_id) {
+        fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
                 const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
                                                    static_cast<size_t>(n_atoms) /
                                                    static_cast<size_t>(count));
                 const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
                                                  static_cast<size_t>(n_atoms) /
                                                  static_cast<size_t>(count));
-
-                threads.emplace_back([=, &cells, &radius2, &worker_status]() {
                     try {
                 for (int atom = begin; atom < end; ++atom) {
                     const double radius = expanded_radii[atom];
@@ -337,28 +335,19 @@ cpu_shrake_rupley_impl(int n_atoms,
                     } catch (...) {
                         worker_status.store(FASTSASA_INVALID_ARGUMENT);
                     }
-                });
-            }
-        } catch (...) {
-            join_threads(&threads);
-            throw;
-        }
-        join_threads(&threads);
+            });
         return worker_status.load();
     }
 
     const cell_list cells(n_atoms, x, y, z, 2.0 * max_radius);
     const int point_simd = env_enabled("FASTSASA_CPU_POINT_SIMD", 0);
-    try {
-        for (int thread_id = 0; thread_id < count; ++thread_id) {
+    fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
             const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
                                                static_cast<size_t>(n_atoms) /
                                                static_cast<size_t>(count));
             const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
                                              static_cast<size_t>(n_atoms) /
                                              static_cast<size_t>(count));
-
-            threads.emplace_back([=, &cells, &radius2, &worker_status]() {
                 try {
             std::vector<int> candidates;
             std::vector<int> neighbors;
@@ -428,13 +417,7 @@ cpu_shrake_rupley_impl(int n_atoms,
                 } catch (...) {
                     worker_status.store(FASTSASA_INVALID_ARGUMENT);
                 }
-            });
-        }
-    } catch (...) {
-        join_threads(&threads);
-        throw;
-    }
-    join_threads(&threads);
+        });
     return worker_status.load();
 }
 
@@ -532,7 +515,6 @@ cpu_shrake_rupley_impl_fp32(int n_atoms,
                             int n_threads,
                             double *sasa)
 {
-    std::vector<std::thread> threads;
     std::atomic<int> worker_status(FASTSASA_SUCCESS);
     int count;
 
@@ -589,20 +571,15 @@ cpu_shrake_rupley_impl_fp32(int n_atoms,
     for (int i = 0; i < 3 * n_points; ++i) points_f[static_cast<size_t>(i)] = static_cast<float>(test_points[i]);
 
     count = thread_count(n_threads, n_atoms);
-    threads.reserve(static_cast<size_t>(count));
     const cell_list32 cells(n_atoms, xf.data(), yf.data(), zf.data(), 2.0f * static_cast<float>(max_radius));
 
-    try {
-        for (int thread_id = 0; thread_id < count; ++thread_id) {
+    fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
             const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
                                                static_cast<size_t>(n_atoms) /
                                                static_cast<size_t>(count));
             const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
                                              static_cast<size_t>(n_atoms) /
                                              static_cast<size_t>(count));
-
-            threads.emplace_back([=, &cells, &worker_status,
-                                  &xf, &yf, &zf, &radius_f, &radius2_f, &points_f]() {
                 try {
                     std::vector<int> candidates;
                     std::vector<int> neighbors;
@@ -663,13 +640,7 @@ cpu_shrake_rupley_impl_fp32(int n_atoms,
                 } catch (...) {
                     worker_status.store(FASTSASA_INVALID_ARGUMENT);
                 }
-            });
-        }
-    } catch (...) {
-        join_threads(&threads);
-        throw;
-    }
-    join_threads(&threads);
+        });
     return worker_status.load();
 }
 
@@ -713,7 +684,6 @@ cpu_exposed_points_impl(int n_atoms,
                         int n_threads,
                         unsigned char *exposed)
 {
-    std::vector<std::thread> threads;
     std::vector<double> radius2;
     std::atomic<int> worker_status(FASTSASA_SUCCESS);
     int count;
@@ -736,18 +706,14 @@ cpu_exposed_points_impl(int n_atoms,
         radius2[static_cast<size_t>(atom)] = expanded_radii[atom] * expanded_radii[atom];
     }
     count = thread_count(n_threads, n_atoms);
-    threads.reserve(static_cast<size_t>(count));
     const cell_list cells(n_atoms, x, y, z, 2.0 * max_radius);
-    try {
-        for (int thread_id = 0; thread_id < count; ++thread_id) {
+    fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
             const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
                                                static_cast<size_t>(n_atoms) /
                                                static_cast<size_t>(count));
             const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
                                              static_cast<size_t>(n_atoms) /
                                              static_cast<size_t>(count));
-
-            threads.emplace_back([=, &cells, &radius2, &worker_status]() {
                 try {
                     for (int atom = begin; atom < end; ++atom) {
                         const double radius = expanded_radii[atom];
@@ -780,13 +746,7 @@ cpu_exposed_points_impl(int n_atoms,
                 } catch (...) {
                     worker_status.store(FASTSASA_INVALID_ARGUMENT);
                 }
-            });
-        }
-    } catch (...) {
-        join_threads(&threads);
-        throw;
-    }
-    join_threads(&threads);
+        });
     return worker_status.load();
 }
 
@@ -939,7 +899,6 @@ cpu_lee_richards_impl(int n_atoms,
                       int n_threads,
                       double *sasa)
 {
-    std::vector<std::thread> threads;
     std::atomic<int> worker_status(FASTSASA_SUCCESS);
     int count;
 
@@ -956,17 +915,13 @@ cpu_lee_richards_impl(int n_atoms,
     }
     const cell_list cells(n_atoms, x, y, z, 2.0 * max_radius);
     count = thread_count(n_threads, n_atoms);
-    threads.reserve(static_cast<size_t>(count));
-    try {
-        for (int thread_id = 0; thread_id < count; ++thread_id) {
+    fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
             const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
                                                static_cast<size_t>(n_atoms) /
                                                static_cast<size_t>(count));
             const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
                                              static_cast<size_t>(n_atoms) /
                                              static_cast<size_t>(count));
-
-            threads.emplace_back([=, &cells, &worker_status]() {
                 try {
             for (int atom = begin; atom < end; ++atom) {
                 sasa[atom] = lee_richards_atom_area(n_atoms,
@@ -983,13 +938,7 @@ cpu_lee_richards_impl(int n_atoms,
                 } catch (...) {
                     worker_status.store(FASTSASA_INVALID_ARGUMENT);
                 }
-            });
-        }
-    } catch (...) {
-        join_threads(&threads);
-        throw;
-    }
-    join_threads(&threads);
+        });
     return worker_status.load();
 }
 

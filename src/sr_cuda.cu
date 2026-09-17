@@ -277,15 +277,15 @@ fastsasa_device_recommended_parallel_frames(int n_atoms,
         free_bytes = 0;
     }
 
-    if (selection_only) {
-        if (prop.multiProcessorCount >= 30) lanes = 4;
-        else if (prop.multiProcessorCount >= 16) lanes = 2;
-    } else if (n_atoms < 8000 && prop.multiProcessorCount >= 24) {
-        lanes = 2;
-    } else if (n_atoms >= 8000 && n_points <= 128 && prop.multiProcessorCount >= 48) {
-        lanes = 2;
-    }
-    if (prop.totalGlobalMem <= 5ull * 1024ull * 1024ull * 1024ull && lanes > 2) lanes = 2;
+    /* Lanes overlap one frame's upload, launch gaps and readback with
+     * another's kernels; measured on a 34-SM card: 3k atoms 2.7k -> 5.1k
+     * fps and 32k atoms 780 -> 1080 fps from 1 to 8 lanes. The caller
+     * ramps up to this count as frames arrive (lane contexts persist). */
+    (void)selection_only;
+    if (prop.multiProcessorCount >= 24) lanes = 8;
+    else if (prop.multiProcessorCount >= 12) lanes = 4;
+    else lanes = 2;
+    if (prop.totalGlobalMem <= 5ull * 1024ull * 1024ull * 1024ull && lanes > 4) lanes = 4;
     if (free_bytes > 0 && free_bytes < 1536ull * 1024ull * 1024ull) lanes = 1;
     if (lanes > batch_size) lanes = batch_size;
     if (lanes < 1) lanes = 1;

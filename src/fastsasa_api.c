@@ -24,6 +24,11 @@ struct fastsasa_context {
     enum fastsasa_backend_kind backend;
     int precision;
     fastsasa_device_context *cuda;
+    /* Extra contexts for parallel trajectory frames, created on first use
+     * and kept for the life of this context (lanes[0] is this context). */
+    fastsasa_context **lanes;
+    int n_lanes;
+    long frames_seen;
 #ifdef FASTSASA_HAVE_VULKAN
     fastsasa_vk_context *vulkan;
     double *vk_xyz;
@@ -685,6 +690,12 @@ fastsasa_context_precision(const fastsasa_context *context)
 void
 fastsasa_context_free(fastsasa_context *context)
 {
+    if (context != NULL && context->lanes != NULL) {
+        for (int lane = 1; lane < context->n_lanes; ++lane) fastsasa_context_free(context->lanes[lane]);
+        free(context->lanes);
+        context->lanes = NULL;
+        context->n_lanes = 0;
+    }
     if (context == NULL) return;
     if (context->backend == FASTSASA_BACKEND_CUDA) {
         fastsasa_device_context_free(context->cuda);
@@ -741,6 +752,43 @@ fastsasa_context_last_cell_profile(fastsasa_context *context,
     }
     memset(profile, 0, sizeof(*profile));
     return FASTSASA_SUCCESS;
+}
+
+fastsasa_context **
+fastsasa_context_frame_lanes(fastsasa_context *primary, int n_frames, int *n_lanes)
+{
+    int wanted;
+    int granted;
+
+    if (primary == NULL || n_lanes == NULL || *n_lanes <= 1) return NULL;
+    /* A lane costs about a millisecond to create and pays that back in a
+     * handful of frames, so lanes are added as the context sees frames:
+     * a short run never pays for lanes it cannot use. */
+    wanted = *n_lanes;
+    granted = (int)(2 + primary->frames_seen / 8);
+    if (granted > wanted) granted = wanted;
+    if (granted > n_frames) granted = n_frames;
+    primary->frames_seen += n_frames;
+    *n_lanes = granted > 1 ? granted : 1;
+    if (granted <= 1) return NULL;
+    if (primary->lanes == NULL || primary->n_lanes < granted) {
+        fastsasa_context **lanes = (fastsasa_context **)realloc(primary->lanes, sizeof(*lanes) * (size_t)granted);
+        int lane = primary->n_lanes > 1 ? primary->n_lanes : 1;
+
+        if (lanes == NULL) return NULL;
+        primary->lanes = lanes;
+        lanes[0] = primary;
+        if (primary->n_lanes < 1) primary->n_lanes = 1;
+        for (; lane < granted; ++lane) {
+            if (fastsasa_context_create(&lanes[lane]) != FASTSASA_SUCCESS) return NULL;
+            primary->n_lanes = lane + 1;
+        }
+    }
+    /* The primary's precision may have changed since the lanes were made. */
+    for (int lane = 1; lane < granted; ++lane) {
+        if (fastsasa_context_set_precision(primary->lanes[lane], primary->precision) != FASTSASA_SUCCESS) return NULL;
+    }
+    return primary->lanes;
 }
 
 int fastsasa_host_alloc(void **ptr, size_t bytes)

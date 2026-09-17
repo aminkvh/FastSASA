@@ -166,47 +166,6 @@ use_selected_center_optimization(void)
             strcmp(value, "FALSE") != 0);
 }
 
-static fastsasa_context **
-trajectory_context_lanes_new(fastsasa_context *primary,
-                             int n_lanes)
-{
-    fastsasa_context **lanes;
-
-    if (primary == NULL || n_lanes <= 1) return NULL;
-    lanes = (fastsasa_context **)calloc((size_t)n_lanes, sizeof(fastsasa_context *));
-    if (lanes == NULL) return NULL;
-    lanes[0] = primary;
-    for (int lane = 1; lane < n_lanes; ++lane) {
-        if (fastsasa_context_create(&lanes[lane]) != FASTSASA_SUCCESS) {
-            for (int cleanup = 1; cleanup < lane; ++cleanup) {
-                fastsasa_context_free(lanes[cleanup]);
-            }
-            free(lanes);
-            return NULL;
-        }
-        if (fastsasa_context_set_precision(
-                lanes[lane], fastsasa_context_precision(primary)) != FASTSASA_SUCCESS) {
-            fastsasa_context_free(lanes[lane]);
-            for (int cleanup = 1; cleanup < lane; ++cleanup) {
-                fastsasa_context_free(lanes[cleanup]);
-            }
-            free(lanes);
-            return NULL;
-        }
-    }
-    return lanes;
-}
-
-static void
-trajectory_context_lanes_free(fastsasa_context **lanes,
-                              int n_lanes)
-{
-    if (lanes == NULL) return;
-    for (int lane = 1; lane < n_lanes; ++lane) {
-        fastsasa_context_free(lanes[lane]);
-    }
-    free(lanes);
-}
 
 int
 fastsasa_context_calc_trajectory_soa(fastsasa_context *context,
@@ -292,7 +251,7 @@ fastsasa_context_calc_trajectory_soa(fastsasa_context *context,
         if (strcmp(fastsasa_context_backend(context), "vulkan") == 0) n_lanes = 1;
         if (n_lanes > frames->n_frames) n_lanes = frames->n_frames;
         if (n_lanes > 1) {
-            fastsasa_context **lanes = trajectory_context_lanes_new(context, n_lanes);
+            fastsasa_context **lanes = fastsasa_context_frame_lanes(context, frames->n_frames, &n_lanes);
 
             if (lanes != NULL) {
                 for (int frame = 0; frame < frames->n_frames && status == FASTSASA_SUCCESS; frame += n_lanes) {
@@ -319,7 +278,6 @@ fastsasa_context_calc_trajectory_soa(fastsasa_context *context,
                         }
                     }
                 }
-                trajectory_context_lanes_free(lanes, n_lanes);
                 free(scratch_sasa);
                 free(test_points);
                 free(expanded_radii);
@@ -483,7 +441,7 @@ fastsasa_context_calc_trajectory_soa_selection(fastsasa_context *context,
         if (strcmp(fastsasa_context_backend(context), "vulkan") == 0) n_lanes = 1;
         if (n_lanes > frames->n_frames) n_lanes = frames->n_frames;
         if (n_lanes > 1) {
-            fastsasa_context **lanes = trajectory_context_lanes_new(context, n_lanes);
+            fastsasa_context **lanes = fastsasa_context_frame_lanes(context, frames->n_frames, &n_lanes);
 
             if (lanes != NULL) {
                 for (int frame = 0; frame < frames->n_frames && status == FASTSASA_SUCCESS; frame += n_lanes) {
@@ -511,7 +469,6 @@ fastsasa_context_calc_trajectory_soa_selection(fastsasa_context *context,
                         }
                     }
                 }
-                trajectory_context_lanes_free(lanes, n_lanes);
                 free(active_center_indices);
                 free(scratch_sasa);
                 free(test_points);

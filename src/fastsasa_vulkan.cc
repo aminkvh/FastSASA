@@ -977,6 +977,7 @@ int calculate(fastsasa_vk_context *context,
     }
 
     try {
+        const auto pt0 = std::chrono::steady_clock::now();
         const bool use_fp64 = std::is_same<Real, double>::value;
         /* The FP32 shadow serves the FP64 prefilter and is the FP32 path's
          * neighbour record, so it is built for every SR run. */
@@ -1071,6 +1072,7 @@ int calculate(fastsasa_vk_context *context,
         const VkMemoryPropertyFlags device_memory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         const VkMemoryPropertyFlags host_memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const auto pt1 = std::chrono::steady_clock::now();
         ensure_buffer(context, &context->atoms, sizeof(Vec4T<Real>) * atom_count,
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                       VK_BUFFER_USAGE_TRANSFER_DST_BIT, device_memory);
@@ -1125,6 +1127,7 @@ int calculate(fastsasa_vk_context *context,
                                    requested_centers == nullptr && center_count == atom_count);
         }
         update_descriptors(context);
+        const auto pt2 = std::chrono::steady_clock::now();
 
         const ParametersT<Real> parameters{
             atom_count, point_count, center_count, 0u, dim_x, dim_y, dim_z,
@@ -1208,9 +1211,11 @@ int calculate(fastsasa_vk_context *context,
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &context->command;
+        const auto pt3 = std::chrono::steady_clock::now();
         check(vkQueueSubmit(context->queue, 1, &submit, VK_NULL_HANDLE),
               "vkQueueSubmit");
         check(vkQueueWaitIdle(context->queue), "vkQueueWaitIdle");
+        const auto pt4 = std::chrono::steady_clock::now();
         const Real *areas = static_cast<const Real *>(context->staging_areas.mapped);
         for (uint32_t center = 0; center < center_count; ++center) {
             sasa[center] = lee_richards
@@ -1222,6 +1227,11 @@ int calculate(fastsasa_vk_context *context,
         if (lee_richards && use_fp64) {
             recompute_nan_lee_richards(xyz, radii, atom_count, point_count, probe_radius,
                                        centers.data(), center_count, sasa);
+        }
+        if (std::getenv("FASTSASA_VK_PROFILE") != nullptr) {
+            const auto ms = [](auto x, auto y) { return std::chrono::duration<double, std::milli>(y - x).count(); };
+            const auto pt5 = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "vk call atoms=%u pack %.3f buffers+staging %.3f record %.3f submit+wait %.3f readout %.3f\n", atom_count, ms(pt0,pt1), ms(pt1,pt2), ms(pt2,pt3), ms(pt3,pt4), ms(pt4,pt5));
         }
         context->error.clear();
         return 0;
@@ -1287,7 +1297,9 @@ int calculate_frames(fastsasa_vk_context *context,
                 static_cast<Real>(radii[atom] + probe_radius));
         }
         const Real cell_size = Real(2) * max_expanded_radius;
+        double t_pack = 0, t_shadow = 0;
         for (uint32_t frame = 0; frame < frame_count; ++frame) {
+            const auto tp0 = std::chrono::steady_clock::now();
             Real min_x = std::numeric_limits<Real>::infinity();
             Real min_y = min_x;
             Real min_z = min_x;
@@ -1311,15 +1323,24 @@ int calculate_frames(fastsasa_vk_context *context,
                 max_y = std::max(max_y, y);
                 max_z = std::max(max_z, z);
             }
+            const auto tp1 = std::chrono::steady_clock::now();
             if (sr_hybrid) {
                 /* Grid-local FP32 shadow; see calculate(). */
+                /* Read the source coordinates again rather than the staging
+                 * records: staging memory may be uncached for the host. */
                 for (uint32_t atom = 0; atom < atom_count; ++atom) {
                     const size_t slot = static_cast<size_t>(frame) * atom_count + atom;
+                    const size_t input = 3ull * slot;
                     const double expanded = radii[atom] + probe_radius;
-                    shadow[slot] = {(float)(atoms[slot].x - min_x), (float)(atoms[slot].y - min_y),
-                                    (float)(atoms[slot].z - min_z), (float)(expanded * expanded)};
+                    shadow[slot] = {(float)(static_cast<Real>(frame_xyz[input]) - min_x),
+                                    (float)(static_cast<Real>(frame_xyz[input + 1u]) - min_y),
+                                    (float)(static_cast<Real>(frame_xyz[input + 2u]) - min_z),
+                                    (float)(expanded * expanded)};
                 }
             }
+            const auto tp2 = std::chrono::steady_clock::now();
+            t_pack += std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+            t_shadow += std::chrono::duration<double, std::milli>(tp2 - tp1).count();
             auto dimension = [cell_size](Real minimum, Real maximum) {
                 const double value = std::floor((static_cast<double>(maximum) - minimum) /
                                                 cell_size) + 1.0;
@@ -1540,8 +1561,8 @@ int calculate_frames(fastsasa_vk_context *context,
                 return std::chrono::duration<double, std::milli>(b - a).count();
             };
             std::fprintf(stderr,
-                         "vk frames=%u atoms=%u host_prep %.3f ms, record+gpu %.3f ms, readback %.3f ms\n",
-                         frame_count, atom_count, ms(profile_t0, profile_t1),
+                         "vk frames=%u atoms=%u host_prep %.3f ms (pack %.3f shadow %.3f), record+gpu %.3f ms, readback %.3f ms\n",
+                         frame_count, atom_count, ms(profile_t0, profile_t1), t_pack, t_shadow,
                          ms(profile_t1, profile_t2), ms(profile_t2, profile_t3));
         }
         context->error.clear();

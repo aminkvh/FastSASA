@@ -34,6 +34,7 @@
  * once (half stencil) and recorded for both atoms.
  */
 #include "fastsasa_cpu.h"
+#include "fastsasa_cpu_pool.h"
 
 #include <algorithm>
 #include <atomic>
@@ -974,18 +975,11 @@ mask_kernel(int n_atoms, int n_points, const double *x, const double *y, const d
         }
     };
 
-    if (count == 1) {
-        run(0, n_atoms, 0);
-    } else {
-        std::vector<std::thread> threads;
-        threads.reserve(static_cast<size_t>(count));
-        for (int tid = 0; tid < count; ++tid) {
-            const int begin = static_cast<int>(static_cast<size_t>(tid) * static_cast<size_t>(n_atoms) / static_cast<size_t>(count));
-            const int end = static_cast<int>(static_cast<size_t>(tid + 1) * static_cast<size_t>(n_atoms) / static_cast<size_t>(count));
-            threads.emplace_back(run, begin, end, tid);
-        }
-        for (std::thread &thread : threads) thread.join();
-    }
+    fastsasa_cpu::WorkerPool::run(count, [&](int tid) {
+        const int begin = static_cast<int>(static_cast<size_t>(tid) * static_cast<size_t>(n_atoms) / static_cast<size_t>(count));
+        const int end = static_cast<int>(static_cast<size_t>(tid + 1) * static_cast<size_t>(n_atoms) / static_cast<size_t>(count));
+        run(begin, end, tid);
+    });
     if (want_stats) {
         Stats total;
         for (const Stats &s : stats) {
