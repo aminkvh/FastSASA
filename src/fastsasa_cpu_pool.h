@@ -25,10 +25,14 @@ namespace fastsasa_cpu {
 
 class WorkerPool {
 public:
+    /* Never destroyed: a static destructor would tear down the mutex and
+     * condition variables while a worker can still be waking on them
+     * (observed as a crash during exit on Windows, truncating stdout). The
+     * parked workers cost nothing and the OS reclaims them at exit. */
     static WorkerPool &instance()
     {
-        static WorkerPool pool;
-        return pool;
+        static WorkerPool *pool = new WorkerPool();
+        return *pool;
     }
 
     /* Runs task(0) on the calling thread and task(1 .. count-1) on the
@@ -80,25 +84,6 @@ private:
         }
     }
 
-    ~WorkerPool()
-    {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stop_ = true;
-            generation_.fetch_add(1, std::memory_order_acq_rel);
-        }
-        wake_.notify_all();
-        for (std::thread &worker : workers_) {
-#ifdef _WIN32
-            /* Process exit has already ended the workers; joining from a
-             * static destructor can deadlock on the loader lock. */
-            worker.detach();
-#else
-            worker.join();
-#endif
-        }
-    }
-
     bool owns_process() const
     {
 #ifndef _WIN32
@@ -128,7 +113,6 @@ private:
                 wake_.wait(lock, [&] { return generation_.load(std::memory_order_acquire) != seen; });
             }
             seen = generation_.load(std::memory_order_acquire);
-            if (stop_) return;
             if (index + 1 < count_) (*task_)(index + 1);
             if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -165,7 +149,6 @@ private:
     std::atomic<std::uint64_t> generation_{0};
     std::atomic<int> pending_{0};
     std::atomic<bool> busy_{false};
-    bool stop_ = false;
     const std::function<void(int)> *task_ = nullptr;
     int count_ = 0;
 #ifndef _WIN32
