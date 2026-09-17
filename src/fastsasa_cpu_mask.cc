@@ -442,7 +442,7 @@ struct WorkerArgs {
     double *sasa;
     Stats *stats;
     std::atomic<int> *status;
-    long *candidates;
+    std::atomic<long> *candidates;
 };
 
 /* One neighbour's cap applied to the visibility mask. Returns false when
@@ -770,7 +770,7 @@ static FASTSASA_ALWAYS_INLINE void worker_body(const WorkerArgs &A, int begin, i
         A.status->store(FASTSASA_INVALID_ARGUMENT);
     }
     A.stats[tid] = st;
-    __atomic_fetch_add(A.candidates, candidates, __ATOMIC_RELAXED);
+    A.candidates->fetch_add(candidates, std::memory_order_relaxed);
 }
 
 
@@ -843,14 +843,22 @@ fastsasa_cpu_shrake_rupley_mask(int n_atoms,
     Grid grid;
     if (!grid.build(n_atoms, x, y, z, expanded_radii, 2.0 * max_radius, max_radius)) return kUnsupported;
 
+    /* Threads: at ~1 us per atom, a thread launch (~20-40 us) only pays
+     * for itself above a few hundred atoms per thread; measured optimum on
+     * a 602-atom structure was 4 threads, so cap at one thread per 256
+     * atoms when the caller did not ask for a specific count. */
     int count = n_threads > 0 ? n_threads : fastsasa_cpu_default_threads();
     if (count < 1) count = 1;
+    if (n_threads <= 0) {
+        const int by_size = n_atoms / 256 + 1;
+        if (count > by_size) count = by_size;
+    }
     if (count > n_atoms) count = n_atoms;
 
     const bool want_stats = std::getenv("FASTSASA_CPU_MASK_STATS") != nullptr;
     std::vector<Stats> stats(static_cast<size_t>(count));
     std::atomic<int> worker_status(FASTSASA_SUCCESS);
-    long candidates = 0;
+    std::atomic<long> candidates{0};
     const std::size_t n_pairs = 0;
 
     /* Atom-major: each atom scans its own stencil (every pair is seen twice,
@@ -888,7 +896,7 @@ fastsasa_cpu_shrake_rupley_mask(int n_atoms,
         }
         std::fprintf(stderr,
                      "mask-stats res=%d atoms=%ld cand/atom=%.1f nbr/atom=%.1f exact/atom=%.1f cleared/exact=%.2f early_break=%.2f fully_buried=%.3f pairs=%zu\n",
-                     lut.resolution, total.atoms, static_cast<double>(candidates) / n_atoms,
+                     lut.resolution, total.atoms, static_cast<double>(candidates.load()) / n_atoms,
                      static_cast<double>(total.neighbours) / total.atoms, static_cast<double>(total.exact_tests) / total.atoms,
                      static_cast<double>(total.cleared_by_test) / std::max(1L, total.exact_tests),
                      static_cast<double>(total.early_break) / total.atoms, static_cast<double>(total.fully_buried) / total.atoms, n_pairs);
