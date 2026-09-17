@@ -17,7 +17,7 @@ ctest --test-dir build --output-on-failure -L vulkan
 ```
 
 Set `FASTSASA_BACKEND=cuda` to exercise CUDA explicitly on a CUDA+Vulkan
-build; normal execution prefers Vulkan, then CUDA.
+build; normal execution prefers CUDA, then Vulkan.
 
 ## Python Install Smoke Test
 

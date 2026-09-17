@@ -181,6 +181,10 @@ if(FASTSASA_ENABLE_VULKAN)
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_cell_count_fp64_spv
             fastsasa_vk_cell_count_fp64_spv -DFASTSASA_FP64=1)
         fastsasa_compile_vulkan_shader(
+            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/cell_gather.comp
+            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_cell_gather_fp64_spv
+            fastsasa_vk_cell_gather_fp64_spv -DFASTSASA_FP64=1)
+        fastsasa_compile_vulkan_shader(
             ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/cell_fill.comp
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_cell_fill_fp64_spv
             fastsasa_vk_cell_fill_fp64_spv -DFASTSASA_FP64=1)
@@ -256,6 +260,7 @@ if(FASTSASA_ENABLE_VULKAN)
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_lee_richards_cell_spv.h
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_lee_richards_reduce_spv.h
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_cell_count_fp64_spv.h
+            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_cell_gather_fp64_spv.h
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_cell_fill_fp64_spv.h
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_cell_list_fp64_32_spv.h
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_cell_list_fp64_64_spv.h

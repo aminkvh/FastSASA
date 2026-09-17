@@ -31,6 +31,7 @@ namespace {
 #include "fastsasa_vk_lee_richards_cell_spv.h"
 #include "fastsasa_vk_lee_richards_reduce_spv.h"
 #include "fastsasa_vk_cell_count_fp64_spv.h"
+#include "fastsasa_vk_cell_gather_fp64_spv.h"
 #include "fastsasa_vk_cell_fill_fp64_spv.h"
 #include "fastsasa_vk_sr_cell_list_fp64_32_spv.h"
 #include "fastsasa_vk_sr_cell_list_fp64_64_spv.h"
@@ -264,6 +265,7 @@ struct fastsasa_vk_context {
     VkShaderModule scan_shader = VK_NULL_HANDLE;
     VkShaderModule fill_shader = VK_NULL_HANDLE;
     VkShaderModule gather_shader = VK_NULL_HANDLE;
+    VkShaderModule gather_fp64_shader = VK_NULL_HANDLE;
     VkShaderModule sr32_shader = VK_NULL_HANDLE;
     VkShaderModule sr64_shader = VK_NULL_HANDLE;
     VkShaderModule sr_sg_shader = VK_NULL_HANDLE;
@@ -291,12 +293,14 @@ struct fastsasa_vk_context {
     Buffer mask_pending;
     Buffer mask_pending_slot;
     Buffer placeholder;                   /* bound where a mask buffer is absent */
+    VkQueryPool profile_pool = VK_NULL_HANDLE; /* GPU timestamps, FASTSASA_VK_PROFILE */
     int mask_table_n_points = 0;
     std::vector<double> mask_table_points;
     VkPipeline count_pipeline = VK_NULL_HANDLE;
     VkPipeline scan_pipeline = VK_NULL_HANDLE;
     VkPipeline fill_pipeline = VK_NULL_HANDLE;
     VkPipeline gather_pipeline = VK_NULL_HANDLE;
+    VkPipeline gather_fp64_pipeline = VK_NULL_HANDLE;
     VkPipeline sr32_pipeline = VK_NULL_HANDLE;
     VkPipeline sr64_pipeline = VK_NULL_HANDLE;
     VkPipeline sr_sg_pipeline = VK_NULL_HANDLE;
@@ -423,7 +427,7 @@ void record_cell_list_build(fastsasa_vk_context *context,
                          &compute_barrier, 0, nullptr, 0, nullptr);
     if (gather_shadow) {
         vkCmdBindPipeline(context->command, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          context->gather_pipeline);
+                          use_fp64 ? context->gather_fp64_pipeline : context->gather_pipeline);
         dispatch_chunked(context, parameters,
                          (atom_count + kBinThreads - 1u) / kBinThreads, kBinThreads);
         vkCmdPipelineBarrier(context->command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -684,6 +688,9 @@ void initialize(fastsasa_vk_context *context, int device_index)
         context->fill_fp64_shader = make_shader(
             context, fastsasa_vk_cell_fill_fp64_spv,
             fastsasa_vk_cell_fill_fp64_spv_len);
+        context->gather_fp64_shader = make_shader(
+            context, fastsasa_vk_cell_gather_fp64_spv,
+            fastsasa_vk_cell_gather_fp64_spv_len);
         context->sr_fp64_32_shader = make_shader(
             context, fastsasa_vk_sr_cell_list_fp64_32_spv,
             fastsasa_vk_sr_cell_list_fp64_32_spv_len);
@@ -703,6 +710,7 @@ void initialize(fastsasa_vk_context *context, int device_index)
             fastsasa_vk_lee_richards_reduce_fp64_spv_len);
         context->count_fp64_pipeline = make_pipeline(context, context->count_fp64_shader);
         context->fill_fp64_pipeline = make_pipeline(context, context->fill_fp64_shader);
+        context->gather_fp64_pipeline = make_pipeline(context, context->gather_fp64_shader);
         context->sr_fp64_32_pipeline = make_pipeline(context, context->sr_fp64_32_shader);
         context->sr_fp64_64_pipeline = make_pipeline(context, context->sr_fp64_64_shader);
         if (context->subgroup_sr) context->sr_fp64_sg_pipeline = make_pipeline(context, context->sr_fp64_sg_shader);
@@ -982,8 +990,10 @@ int calculate(fastsasa_vk_context *context,
         /* The FP32 shadow serves the FP64 prefilter and is the FP32 path's
          * neighbour record, so it is built for every SR run. */
         const bool sr_hybrid = !lee_richards;
+        /* The FP64 gather shader derives the shadow on the device. */
+        const bool host_shadow = sr_hybrid && !use_fp64;
         std::vector<Vec4T<Real>> atoms(atom_count);
-        std::vector<Vec4T<float>> shadow(sr_hybrid ? atom_count : 1u);
+        std::vector<Vec4T<float>> shadow(host_shadow ? atom_count : 1u);
         std::vector<Vec4T<Real>> points(lee_richards ? 1u : point_count);
         std::vector<uint32_t> centers(center_count);
         Real min_x = std::numeric_limits<Real>::infinity();
@@ -1012,7 +1022,7 @@ int calculate(fastsasa_vk_context *context,
             max_expanded_radius = std::max(
                 max_expanded_radius, radius + static_cast<Real>(probe_radius));
         }
-        if (sr_hybrid) {
+        if (host_shadow) {
             /* The FP32 shadow is grid-local (the FP64 coordinates are not
              * shifted), which keeps its magnitudes inside the extent the
              * prefilter margin is derived from. */
@@ -1103,16 +1113,16 @@ int calculate(fastsasa_vk_context *context,
                       VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       readback_memory_flags(context->physical));
         ensure_buffer(context, &context->atoms_shadow,
-                      sr_hybrid ? sizeof(Vec4T<float>) * atom_count : 4u,
+                      host_shadow ? sizeof(Vec4T<float>) * atom_count : 4u,
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                       VK_BUFFER_USAGE_TRANSFER_DST_BIT, device_memory);
         ensure_buffer(context, &context->atoms_shadow_sorted,
                       sr_hybrid ? sizeof(Vec4T<float>) * atom_count : 4u,
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, device_memory);
         ensure_buffer(context, &context->staging_atoms_shadow,
-                      sr_hybrid ? sizeof(Vec4T<float>) * atom_count : 4u,
+                      host_shadow ? sizeof(Vec4T<float>) * atom_count : 4u,
                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT, readback_memory_flags(context->physical));
-        if (sr_hybrid) {
+        if (host_shadow) {
             std::memcpy(context->staging_atoms_shadow.mapped, shadow.data(),
                         sizeof(Vec4T<float>) * atom_count);
         }
@@ -1140,6 +1150,19 @@ int calculate(fastsasa_vk_context *context,
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         check(vkBeginCommandBuffer(context->command, &begin), "vkBeginCommandBuffer");
+        const bool gpu_profile = std::getenv("FASTSASA_VK_PROFILE") != nullptr &&
+                                 context->properties.limits.timestampComputeAndGraphics;
+        if (gpu_profile && context->profile_pool == VK_NULL_HANDLE) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = 8;
+            check(vkCreateQueryPool(context->device, &qi, nullptr, &context->profile_pool), "vkCreateQueryPool");
+        }
+        auto stamp = [&](uint32_t i) {
+            if (gpu_profile) vkCmdWriteTimestamp(context->command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, context->profile_pool, i);
+        };
+        if (gpu_profile) vkCmdResetQueryPool(context->command, context->profile_pool, 0, 8);
+        stamp(0);
         record_mask_table_upload(context);
 
         VkBufferCopy atom_copy{0, 0, sizeof(Vec4T<Real>) * atom_count};
@@ -1147,7 +1170,7 @@ int calculate(fastsasa_vk_context *context,
         VkBufferCopy center_copy{0, 0, sizeof(uint32_t) * center_count};
         vkCmdCopyBuffer(context->command, context->staging_atoms.handle,
                         context->atoms.handle, 1, &atom_copy);
-        if (sr_hybrid) {
+        if (host_shadow) {
             VkBufferCopy shadow_copy{0, 0, sizeof(Vec4T<float>) * atom_count};
             vkCmdCopyBuffer(context->command, context->staging_atoms_shadow.handle,
                             context->atoms_shadow.handle, 1, &shadow_copy);
@@ -1161,7 +1184,9 @@ int calculate(fastsasa_vk_context *context,
         }
         vkCmdCopyBuffer(context->command, context->staging_centers.handle,
                         context->centers.handle, 1, &center_copy);
+        stamp(1);
         record_cell_list_build(context, parameters, atom_count, cell_count, use_fp64, sr_hybrid);
+        stamp(2);
 
         if (lee_richards) {
             vkCmdBindPipeline(context->command, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1192,6 +1217,7 @@ int calculate(fastsasa_vk_context *context,
                              context->sr_atoms_per_group);
         }
 
+        stamp(3);
         VkMemoryBarrier output_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         output_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         output_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -1207,6 +1233,7 @@ int calculate(fastsasa_vk_context *context,
         vkCmdPipelineBarrier(context->command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_barrier,
                              0, nullptr, 0, nullptr);
+        stamp(4);
         check(vkEndCommandBuffer(context->command), "vkEndCommandBuffer");
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
@@ -1216,6 +1243,16 @@ int calculate(fastsasa_vk_context *context,
               "vkQueueSubmit");
         check(vkQueueWaitIdle(context->queue), "vkQueueWaitIdle");
         const auto pt4 = std::chrono::steady_clock::now();
+        if (gpu_profile) {
+            uint64_t ticks[5]{};
+            if (vkGetQueryPoolResults(context->device, context->profile_pool, 0, 5, sizeof(ticks), ticks,
+                                      sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+                const double ns = context->properties.limits.timestampPeriod;
+                std::fprintf(stderr, "vk gpu atoms=%u upload %.3f cells %.3f sr %.3f readback %.3f ms\n", atom_count,
+                             (ticks[1] - ticks[0]) * ns * 1e-6, (ticks[2] - ticks[1]) * ns * 1e-6,
+                             (ticks[3] - ticks[2]) * ns * 1e-6, (ticks[4] - ticks[3]) * ns * 1e-6);
+            }
+        }
         const Real *areas = static_cast<const Real *>(context->staging_areas.mapped);
         for (uint32_t center = 0; center < center_count; ++center) {
             sasa[center] = lee_richards
@@ -1274,12 +1311,14 @@ int calculate_frames(fastsasa_vk_context *context,
          * frames x atoms records cost more in allocation and page faults
          * than the GPU work on large systems. */
         const size_t record_count = static_cast<size_t>(frame_count) * atom_count;
-        const size_t shadow_count = sr_hybrid ? record_count : 1u;
+        /* The FP64 gather shader derives the shadow on the device. */
+        const bool host_shadow = sr_hybrid && !use_fp64;
+        const size_t shadow_count = host_shadow ? record_count : 1u;
         ensure_buffer(context, &context->staging_atoms,
                       sizeof(Vec4T<Real>) * record_count,
                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT, readback_memory_flags(context->physical));
         ensure_buffer(context, &context->staging_atoms_shadow,
-                      sr_hybrid ? sizeof(Vec4T<float>) * shadow_count : 4u,
+                      host_shadow ? sizeof(Vec4T<float>) * shadow_count : 4u,
                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT, readback_memory_flags(context->physical));
         Vec4T<Real> *const atoms = static_cast<Vec4T<Real> *>(context->staging_atoms.mapped);
         Vec4T<float> *const shadow = static_cast<Vec4T<float> *>(context->staging_atoms_shadow.mapped);
@@ -1324,7 +1363,7 @@ int calculate_frames(fastsasa_vk_context *context,
                 max_z = std::max(max_z, z);
             }
             const auto tp1 = std::chrono::steady_clock::now();
-            if (sr_hybrid) {
+            if (host_shadow) {
                 /* Grid-local FP32 shadow; see calculate(). */
                 /* Read the source coordinates again rather than the staging
                  * records: staging memory may be uncached for the host. */
@@ -1432,7 +1471,7 @@ int calculate_frames(fastsasa_vk_context *context,
                       VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       readback_memory_flags(context->physical));
         ensure_buffer(context, &context->atoms_shadow,
-                      sr_hybrid ? sizeof(Vec4T<float>) * atom_count : 4u,
+                      host_shadow ? sizeof(Vec4T<float>) * atom_count : 4u,
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                       VK_BUFFER_USAGE_TRANSFER_DST_BIT, device_memory);
         ensure_buffer(context, &context->atoms_shadow_sorted,
@@ -1473,7 +1512,7 @@ int calculate_frames(fastsasa_vk_context *context,
                 0, sizeof(Vec4T<Real>) * atom_count};
             vkCmdCopyBuffer(context->command, context->staging_atoms.handle,
                             context->atoms.handle, 1, &atom_copy);
-            if (sr_hybrid) {
+            if (host_shadow) {
                 VkBufferCopy shadow_copy{
                     sizeof(Vec4T<float>) * static_cast<uint64_t>(frame) * atom_count,
                     0, sizeof(Vec4T<float>) * atom_count};
@@ -1863,6 +1902,7 @@ extern "C" void fastsasa_vk_context_free(fastsasa_vk_context *context)
     destroy_buffer(context, &context->mask_pending);
     destroy_buffer(context, &context->mask_pending_slot);
     destroy_buffer(context, &context->placeholder);
+    if (context->profile_pool != VK_NULL_HANDLE) vkDestroyQueryPool(context->device, context->profile_pool, nullptr);
     for (int pr = 0; pr < 2; ++pr) for (int w = 0; w < 4; ++w) {
         if (context->sr_mask_pipeline[pr][w] != VK_NULL_HANDLE) vkDestroyPipeline(context->device, context->sr_mask_pipeline[pr][w], nullptr);
         if (context->sr_mask_shader[pr][w] != VK_NULL_HANDLE) vkDestroyShaderModule(context->device, context->sr_mask_shader[pr][w], nullptr);
@@ -1902,6 +1942,8 @@ extern "C" void fastsasa_vk_context_free(fastsasa_vk_context *context)
         vkDestroyPipeline(context->device, context->fill_pipeline, nullptr);
     if (context->gather_pipeline != VK_NULL_HANDLE)
         vkDestroyPipeline(context->device, context->gather_pipeline, nullptr);
+    if (context->gather_fp64_pipeline != VK_NULL_HANDLE)
+        vkDestroyPipeline(context->device, context->gather_fp64_pipeline, nullptr);
     if (context->sr_fp64_64_pipeline != VK_NULL_HANDLE)
         vkDestroyPipeline(context->device, context->sr_fp64_64_pipeline, nullptr);
     if (context->sr_fp64_sg_pipeline != VK_NULL_HANDLE)
@@ -1936,6 +1978,8 @@ extern "C" void fastsasa_vk_context_free(fastsasa_vk_context *context)
         vkDestroyShaderModule(context->device, context->fill_shader, nullptr);
     if (context->gather_shader != VK_NULL_HANDLE)
         vkDestroyShaderModule(context->device, context->gather_shader, nullptr);
+    if (context->gather_fp64_shader != VK_NULL_HANDLE)
+        vkDestroyShaderModule(context->device, context->gather_fp64_shader, nullptr);
     if (context->sr_fp64_64_shader != VK_NULL_HANDLE)
         vkDestroyShaderModule(context->device, context->sr_fp64_64_shader, nullptr);
     if (context->sr_fp64_sg_shader != VK_NULL_HANDLE)

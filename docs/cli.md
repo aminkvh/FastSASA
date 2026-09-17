@@ -16,8 +16,8 @@ to `PATH` or prefix the commands accordingly.
 FastSASA has three compute backends. By default it picks the first one that is
 compiled in and available at runtime, in this order:
 
-1. Vulkan (NVIDIA, AMD, and Intel GPUs)
-2. CUDA (NVIDIA GPUs) — for pinned NVIDIA/HPC deployments.
+1. CUDA (NVIDIA GPUs)
+2. Vulkan (NVIDIA, AMD, and Intel GPUs)
 3. Native threaded CPU
 
 You can pin a backend explicitly:

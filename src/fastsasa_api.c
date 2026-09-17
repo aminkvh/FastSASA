@@ -573,7 +573,7 @@ fastsasa_context_create(fastsasa_context **output)
 {
     const char *request = backend_request();
     fastsasa_context *context;
-    int vulkan_attempted = 0;
+    int cuda_attempted = 0;
 
     if (output == NULL) return FASTSASA_INVALID_ARGUMENT;
     *output = NULL;
@@ -591,41 +591,13 @@ fastsasa_context_create(fastsasa_context **output)
     if (context == NULL) return FASTSASA_MEMORY_ERROR;
     context->precision = FASTSASA_PRECISION_FP64;
 
-    /* Vulkan first: it runs on NVIDIA, AMD, and Intel GPUs and is at least
-     * as fast as CUDA on every backend/precision combination measured, so
-     * it is the default rather than a fallback. CUDA remains available for
-     * pinned NVIDIA/HPC deployments via --backend cuda. */
-#ifdef FASTSASA_HAVE_VULKAN
-    if (backend_is(request, "auto") || backend_is(request, "vulkan")) {
-        vulkan_attempted = 1;
-        if (fastsasa_vk_context_create(&context->vulkan, -1) == 0) {
-            context->backend = FASTSASA_BACKEND_VULKAN;
-            *output = context;
-            set_api_error("");
-            return FASTSASA_SUCCESS;
-        }
-        if (backend_is(request, "vulkan")) {
-            const char *reason = fastsasa_vk_create_error();
-
-            if (reason == NULL || reason[0] == '\0') {
-                reason = "failed to initialize a Vulkan compute device";
-            }
-            set_api_error(reason);
-            free(context);
-            return FASTSASA_NO_DEVICE;
-        }
-    }
-#else
-    if (backend_is(request, "vulkan")) {
-        set_api_error("FastSASA was built without the Vulkan backend");
-        free(context);
-        return FASTSASA_NO_DEVICE;
-    }
-#endif
-
+    /* CUDA first where it exists: on NVIDIA hardware it is the faster
+     * backend (results are identical on every backend). Vulkan covers
+     * NVIDIA, AMD, and Intel GPUs; the CPU backend is the caller's
+     * fallback when neither device is available. */
     if ((backend_is(request, "auto") || backend_is(request, "cuda")) &&
         !test_switch_enabled("FASTSASA_TEST_DISABLE_CUDA")) {
-        int cuda_status = fastsasa_device_context_create(&context->cuda);
+        const int cuda_status = fastsasa_device_context_create(&context->cuda);
 
         if (cuda_status == FASTSASA_SUCCESS) {
             context->backend = FASTSASA_BACKEND_CUDA;
@@ -637,25 +609,44 @@ fastsasa_context_create(fastsasa_context **output)
             free(context);
             return cuda_status;
         }
+        cuda_attempted = 1;
+    }
+
 #ifdef FASTSASA_HAVE_VULKAN
-        if (backend_is(request, "auto") && vulkan_attempted) {
+    if (backend_is(request, "auto") || backend_is(request, "vulkan")) {
+        if (fastsasa_vk_context_create(&context->vulkan, -1) == 0) {
+            context->backend = FASTSASA_BACKEND_VULKAN;
+            *output = context;
+            set_api_error("");
+            return FASTSASA_SUCCESS;
+        }
+        {
             const char *reason = fastsasa_vk_create_error();
             char message[512];
 
             if (reason == NULL || reason[0] == '\0') {
                 reason = "failed to initialize a Vulkan compute device";
             }
-            snprintf(message, sizeof(message),
-                     "no Vulkan device is available (%s) and the CUDA "
-                     "fallback failed", reason);
-            set_api_error(message);
+            if (cuda_attempted) {
+                snprintf(message, sizeof(message),
+                         "no CUDA device is available and no Vulkan device is available (%s)",
+                         reason);
+                set_api_error(message);
+            } else {
+                set_api_error(reason);
+            }
         }
-#else
-        (void)vulkan_attempted;
-#endif
         free(context);
-        return cuda_status;
+        return FASTSASA_NO_DEVICE;
     }
+#else
+    if (backend_is(request, "vulkan")) {
+        set_api_error("FastSASA was built without the Vulkan backend");
+        free(context);
+        return FASTSASA_NO_DEVICE;
+    }
+    (void)cuda_attempted;
+#endif
 
     free(context);
     return FASTSASA_NO_DEVICE;

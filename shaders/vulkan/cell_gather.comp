@@ -1,17 +1,31 @@
 #version 450
 
-// Pass 4 of the contiguous cell list: copy the single-precision atom shadow
-// (grid-local xyz, expanded radius squared) into cell order, so a cell's
+// Pass 4 of the contiguous cell list: the single-precision atom shadow
+// (grid-local xyz, expanded radius squared) in cell order, so a cell's
 // neighbour records are one contiguous, coalesced range for the SR shader.
+// The FP64 build derives it from the double atom records here (double
+// subtract and square, rounded once to float, exactly as the host would),
+// so no shadow is uploaded; the FP32 build copies the host-built shadow,
+// whose radius is squared in double on the host.
+
+#ifdef FASTSASA_FP64
+#extension GL_ARB_gpu_shader_fp64 : require
+#endif
 
 layout(local_size_x = 128) in;
 
 layout(set = 0, binding = 3, std430) readonly buffer CellAtoms {
     int values[];
 } cell_atoms;
+#ifdef FASTSASA_FP64
+layout(set = 0, binding = 0, std430) readonly buffer Atoms {
+    dvec4 values[];
+} atoms;
+#else
 layout(set = 0, binding = 6, std430) readonly buffer AtomsF {
     vec4 values[];
 } atoms_f;
+#endif
 layout(set = 0, binding = 8, std430) writeonly buffer AtomsFSorted {
     vec4 values[];
 } atoms_f_sorted;
@@ -24,17 +38,37 @@ layout(push_constant) uniform Parameters {
     uint dim_x;
     uint dim_y;
     uint dim_z;
+#ifdef FASTSASA_FP64
+    double probe_radius;
+    double cell_size;
+    double min_x;
+    double min_y;
+    double min_z;
+    double margin;
+#else
     float probe_radius;
     float cell_size;
     float min_x;
     float min_y;
     float min_z;
     float margin;
+#endif
 } params;
 
 void main()
 {
     const uint slot = gl_GlobalInvocationID.x + params.base_index;
     if (slot >= params.atom_count) return;
-    atoms_f_sorted.values[slot] = atoms_f.values[cell_atoms.values[slot]];
+    const uint atom_index = uint(cell_atoms.values[slot]);
+#ifdef FASTSASA_FP64
+    const dvec4 atom = atoms.values[atom_index];
+    precise double expanded = atom.w + params.probe_radius;
+    precise double expanded2 = expanded * expanded;
+    precise double dx = atom.x - params.min_x;
+    precise double dy = atom.y - params.min_y;
+    precise double dz = atom.z - params.min_z;
+    atoms_f_sorted.values[slot] = vec4(float(dx), float(dy), float(dz), float(expanded2));
+#else
+    atoms_f_sorted.values[slot] = atoms_f.values[atom_index];
+#endif
 }

@@ -9,7 +9,7 @@ and molecular dynamics trajectories. It includes Shrake-Rupley and
 Lee-Richards algorithms, direct DCD/XTC trajectory processing, a Python array
 API, and feature extraction for exposure and interface analysis.
 
-FastSASA uses an available Vulkan, CUDA, or threaded CPU backend automatically.
+FastSASA uses an available CUDA, Vulkan, or threaded CPU backend automatically.
 You can run the same command on a workstation GPU or on a CPU-only machine.
 
 ## Build From Source

@@ -3,7 +3,7 @@
 FastSASA accepts NumPy-compatible coordinate and radius arrays. It does not
 require a particular structure or trajectory reader. The simplest entry points
 are `sasa()` for Shrake-Rupley and `lee_richards()` for Lee-Richards; both use
-the available Vulkan, CUDA, or threaded CPU backend automatically.
+the available CUDA, Vulkan, or threaded CPU backend automatically.
 
 ## CLI Or Python?
 
