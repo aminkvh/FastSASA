@@ -151,12 +151,6 @@ struct MaskTable {
     double max_delta = 0.0;
     std::vector<double> points;          /* copy of the test points, for cache identity */
     std::vector<double> delta;           /* per bin */
-    /* prefix[(bin * (n_points + 1) + k) * words + w]: bits of the first k
-     * sorted points. At resolution 64 and 128 points this is 8.4 MB; it
-     * lives in L3, and one cap touches one or two adjacent rows. A stride-8
-     * compressed variant (coarse rows plus order bytes) was measured slower:
-     * the bit fix-up loop costs more than the misses it saves. */
-    std::vector<std::uint64_t> prefix;
     /* entry[(bin * kThresholdBins + q) * 2 * words]: for every t in
      * [edge(q), edge(q+1)), edge(q) = -1 + 2 q / kThresholdBins,
      *   blocked = bits of points with dot > edge(q+1) + delta + pad (t rounded up)
@@ -183,10 +177,6 @@ struct MaskTable {
                std::memcmp(points.data(), test_points, sizeof(double) * 3u * static_cast<size_t>(n)) == 0;
     }
 
-    inline const std::uint64_t *prefix_at(int bin, int k) const
-    {
-        return prefix.data() + (static_cast<size_t>(bin) * static_cast<size_t>(n_points + 1) + static_cast<size_t>(k)) * static_cast<size_t>(words);
-    }
 
     void build(int n, const double *test_points, int res)
     {
@@ -196,12 +186,15 @@ struct MaskTable {
         n_bins = res * res;
         points.assign(test_points, test_points + 3 * n);
         delta.assign(static_cast<size_t>(n_bins), 0.0);
-        prefix.assign(static_cast<size_t>(n_bins) * static_cast<size_t>(n + 1) * static_cast<size_t>(words), 0u);
         entry.assign(static_cast<size_t>(n_bins) * static_cast<size_t>(kThresholdBins) * 2u * static_cast<size_t>(words), 0u);
         max_delta = 0.0;
 
+        /* Bins are independent: build rows of bins in parallel. Each worker
+         * owns its own scratch and prefix row buffer. */
+        auto build_rows = [&](int iy_begin, int iy_end) {
         std::vector<std::pair<double, int>> scratch(static_cast<size_t>(n));
-        for (int iy = 0; iy < res; ++iy) {
+        std::vector<std::uint64_t> rowbuf(static_cast<size_t>(n + 1) * static_cast<size_t>(words), 0u);
+        for (int iy = iy_begin; iy < iy_end; ++iy) {
             for (int ix = 0; ix < res; ++ix) {
                 const int bin = iy * res + ix;
                 const double u0 = -1.0 + 2.0 * ix / res;
@@ -226,7 +219,6 @@ struct MaskTable {
                     }
                 }
                 delta[static_cast<size_t>(bin)] = d_max * (1.0 + 1.0e-6) + 1.0e-9;
-                max_delta = std::max(max_delta, delta[static_cast<size_t>(bin)]);
 
                 for (int p = 0; p < n; ++p) {
                     const double dot = test_points[3 * p] * cx + test_points[3 * p + 1] * cy + test_points[3 * p + 2] * cz;
@@ -236,23 +228,25 @@ struct MaskTable {
                           [](const std::pair<double, int> &l, const std::pair<double, int> &r) {
                               return l.first > r.first || (l.first == r.first && l.second < r.second);
                           });
-                std::uint64_t *row = prefix.data() + static_cast<size_t>(bin) * static_cast<size_t>(n + 1) * static_cast<size_t>(words);
+                std::uint64_t *row = rowbuf.data();
+                std::memset(row, 0, sizeof(std::uint64_t) * rowbuf.size());
                 for (int k = 0; k < n; ++k) {
                     std::memcpy(row + static_cast<size_t>(k + 1) * words, row + static_cast<size_t>(k) * words, sizeof(std::uint64_t) * static_cast<size_t>(words));
                     const int id = scratch[static_cast<size_t>(k)].second;
                     row[static_cast<size_t>(k + 1) * words + (id >> 6)] |= std::uint64_t(1) << (id & 63);
                 }
                 const double d_bin = delta[static_cast<size_t>(bin)] + kDotPad;
-                auto count_above = [&](double v) {
-                    int k = 0;
-                    while (k < n && scratch[static_cast<size_t>(k)].first > v) ++k;
-                    return k;
-                };
+                /* Both thresholds rise with q, so the counts of points above
+                 * them fall monotonically: one downward walk each. */
+                int kb = n;
+                int ka = n;
                 for (int q = 0; q < kThresholdBins; ++q) {
                     const double lo_edge = -1.0 + 2.0 * q / kThresholdBins;
                     const double hi_edge = -1.0 + 2.0 * (q + 1) / kThresholdBins;
-                    const int kb = count_above(hi_edge + d_bin);
-                    const int ka = count_above(lo_edge - d_bin);
+                    const double vb = hi_edge + d_bin;
+                    const double va = lo_edge - d_bin;
+                    while (kb > 0 && !(scratch[static_cast<size_t>(kb - 1)].first > vb)) --kb;
+                    while (ka > 0 && !(scratch[static_cast<size_t>(ka - 1)].first > va)) --ka;
                     std::uint64_t *e = entry.data() + (static_cast<size_t>(bin) * kThresholdBins + static_cast<size_t>(q)) * 2u * static_cast<size_t>(words);
                     const std::uint64_t *pb = row + static_cast<size_t>(kb) * words;
                     const std::uint64_t *pa = row + static_cast<size_t>(ka) * words;
@@ -263,8 +257,22 @@ struct MaskTable {
                 }
             }
         }
-        prefix.clear();
-        prefix.shrink_to_fit();
+        };
+        {
+            unsigned hw = std::thread::hardware_concurrency();
+            int n_workers = hw > 1u ? static_cast<int>(hw) : 1;
+            if (n_workers > res) n_workers = res;
+            if (n_workers > 16) n_workers = 16;
+            std::vector<std::thread> workers;
+            for (int w = 0; w < n_workers; ++w) {
+                const int b = res * w / n_workers;
+                const int e = res * (w + 1) / n_workers;
+                workers.emplace_back(build_rows, b, e);
+            }
+            for (std::thread &t : workers) t.join();
+        }
+        max_delta = 0.0;
+        for (double d : delta) max_delta = std::max(max_delta, d);
     }
 
     /* Table entry (blocked row, then band row) for threshold t in
@@ -872,10 +880,11 @@ struct Cap {
  *   FASTSASA_CPU_KERNEL=mask       always the mask kernel (builds the table)
  *   unset / auto                   mask kernel once the cumulative work in
  *                                  this process repays the one-time table
- *                                  build (about 43 ms at 128 points: the
- *                                  equivalent of ~20k atom-evaluations at
- *                                  the ~2.3 us/atom the kernel saves), or
- *                                  immediately if the table already exists.
+ *                                  build (about 6 ms at 128 points, built
+ *                                  on all cores: the equivalent of ~2.5k
+ *                                  atom-evaluations at the ~2.4 us/atom the
+ *                                  kernel saves), or immediately if the
+ *                                  table already exists.
  * Point counts above 255 are always the reference kernel. */
 extern "C" int
 fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points)
@@ -888,8 +897,8 @@ fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points)
     }
     if (table_ready(n_points, test_points)) return 1;
     /* Break-even in atom-evaluations, scaled with the build cost (linear in
-     * n_points at fixed resolution: ~0.33 ms per point at res 64). */
-    const long long break_even = 160LL * static_cast<long long>(n_points);
+     * n_points at fixed resolution: ~0.045 ms per point at res 64). */
+    const long long break_even = 20LL * static_cast<long long>(n_points);
     const long long work = g_atom_work.fetch_add(n_atoms, std::memory_order_relaxed) + n_atoms;
     return work >= break_even ? 1 : 0;
 }

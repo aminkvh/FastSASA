@@ -70,12 +70,13 @@ bit for bit:
   cap boundary to the reference test, in the reference's own operation
   order. It is typically 3-4x faster per atom and, unlike approximate
   bitmask methods, exact and rotation-invariant. Its one-time direction
-  table costs about 40 ms at 128 points (about 0.3 ms per point) and is
-  cached per process; it supports up to 255 points.
+  table costs about 6 ms at 128 points (built on all cores) and is cached
+  per process; it supports up to 255 points.
 
 By default the CPU backend switches to the mask kernel once the work in the
-process (atoms times frames) repays that table build, which is immediate for
-trajectories and for anything beyond a few small structures. Override with
+process (atoms times frames) repays that table build: a few thousand
+atom-evaluations, so a single structure of ordinary size, any trajectory,
+and any batch of structures all use it. Override with
 `FASTSASA_CPU_KERNEL=reference` or `FASTSASA_CPU_KERNEL=mask`. The same
 construction serves `--precision fp32` on the CPU, with the boundary tests
 run in the FP32 kernel's float arithmetic, so FP32 output is unchanged and
