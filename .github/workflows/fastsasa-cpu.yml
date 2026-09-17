@@ -51,7 +51,8 @@ jobs:
       - name: Package the build
         run: |
           mkdir -p dist-cpu
-          cp build-cpu/fastsasa build-cpu/libfastsasa_native.* dist-cpu/
+          LIBEXT=so; [ "$RUNNER_OS" = macOS ] && LIBEXT=dylib
+          cp -L build-cpu/fastsasa "build-cpu/libfastsasa_native.$LIBEXT" dist-cpu/
           cp -r share integration python LICENSE NOTICE dist-cpu/
       - uses: actions/upload-artifact@v4
         with:
@@ -97,7 +98,7 @@ jobs:
       - name: Package the build
         run: |
           mkdir -p dist-vulkan
-          cp build-vulkan/fastsasa build-vulkan/libfastsasa_native.* dist-vulkan/
+          cp -L build-vulkan/fastsasa build-vulkan/libfastsasa_native.so dist-vulkan/
           cp -r share integration python LICENSE NOTICE dist-vulkan/
       - uses: actions/upload-artifact@v4
         with:
@@ -138,7 +139,7 @@ jobs:
       - name: Package the build
         run: |
           mkdir -p dist-rhel
-          cp build-rhel/fastsasa build-rhel/libfastsasa_native.* dist-rhel/
+          cp -L build-rhel/fastsasa build-rhel/libfastsasa_native.so dist-rhel/
           cp -r share integration python LICENSE NOTICE dist-rhel/
       - uses: actions/upload-artifact@v4
         with:
@@ -196,7 +197,7 @@ jobs:
       - name: Package the build
         run: |
           mkdir -p dist-macos-vulkan
-          cp build-macos-vulkan/fastsasa build-macos-vulkan/libfastsasa_native.* dist-macos-vulkan/
+          cp -L build-macos-vulkan/fastsasa build-macos-vulkan/libfastsasa_native.dylib dist-macos-vulkan/
           cp -r share integration python LICENSE NOTICE dist-macos-vulkan/
       - uses: actions/upload-artifact@v4
         with:

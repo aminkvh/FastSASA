@@ -23,6 +23,20 @@ enum fastsasa_precision {
     FASTSASA_PRECISION_FP32 = 1
 };
 
+/* Binary-compatibility version of this header and the shared library.
+ *
+ * Bump it whenever a program compiled against an older header could
+ * misbehave with a newer library or vice versa: any change to the size,
+ * field order, or meaning of a public struct (fastsasa_sr_input,
+ * fastsasa_parameters, fastsasa_topology, fastsasa_owned_topology, ...),
+ * a changed function signature, a changed enum value, or a removed symbol.
+ * Adding a new function or a new enum value at the end does not need a bump.
+ *
+ * fastsasa_abi_version() returns the value the library was built with, so a
+ * consumer can check it against FASTSASA_ABI_VERSION at startup; the
+ * fastsasa_sizeof_* / fastsasa_offsetof_* helpers below let a foreign-function
+ * binding verify struct layouts directly. The shared library's soname is
+ * libfastsasa_native.so.<FASTSASA_ABI_VERSION>, derived from this define. */
 #define FASTSASA_ABI_VERSION 1u
 
 typedef struct fastsasa_sr_input {

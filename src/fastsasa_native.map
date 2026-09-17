@@ -46,6 +46,8 @@
         fastsasa_last_error;
         fastsasa_shrake_rupley_csr;
         fastsasa_sizeof_owned_topology;
+        fastsasa_sizeof_parameters;
+        fastsasa_offsetof_parameters_precision;
         fastsasa_sizeof_sr_input;
         fastsasa_recommended_parallel_frames;
         fastsasa_recommended_trajectory_batch_size;

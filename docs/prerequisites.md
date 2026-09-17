@@ -34,6 +34,29 @@ PyMOL and RDKit are not declared as extras — install them from their own
 distribution (`conda install -c conda-forge pymol-open-source`, `pip install
 rdkit`) if you use the corresponding example script.
 
+## Using The C Library From Another Project
+
+`cmake --install` places the headers, the shared library
+`libfastsasa_native` (soname `.so.1`, tracking `FASTSASA_ABI_VERSION`),
+and a CMake package file in the prefix. A consumer needs only:
+
+```cmake
+find_package(FastSASA CONFIG REQUIRED)
+target_link_libraries(my_tool PRIVATE FastSASA::fastsasa_native)
+```
+
+with `CMAKE_PREFIX_PATH` pointing at the install prefix.
+`tests/cmake_consumer` is a complete example and runs in CI against a fresh
+install on Linux and macOS.
+
+Binary compatibility: `FASTSASA_ABI_VERSION` in `fastsasa.h` is bumped
+whenever a public struct layout, function signature, or enum value changes,
+and `fastsasa_abi_version()` returns the value the library was built with.
+Check the two at startup, as the consumer example does; the
+`fastsasa_sizeof_*` and `fastsasa_offsetof_*` helpers let a foreign-function
+binding verify struct layouts directly, which is what the Python package
+does on load.
+
 ## Where To Look Next
 
 - [CLI Reference](cli.md) for building and running the command-line tool.

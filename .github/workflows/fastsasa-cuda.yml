@@ -100,7 +100,7 @@ jobs:
         if: matrix.image == 'nvidia/cuda:12.4.1-devel-ubuntu22.04'
         run: |
           mkdir -p dist-linux
-          cp build-dist/fastsasa build-dist/libfastsasa_native.* dist-linux/
+          cp -L build-dist/fastsasa build-dist/libfastsasa_native.so dist-linux/
           cp -r share integration python LICENSE NOTICE dist-linux/
       - uses: actions/upload-artifact@v4
         if: matrix.image == 'nvidia/cuda:12.4.1-devel-ubuntu22.04'

@@ -242,6 +242,8 @@ def _verify_native_abi(library):
         ("fastsasa_offsetof_sr_input_force_double_precision", _SrInput.force_double_precision.offset),
         ("fastsasa_sizeof_owned_topology", ctypes.sizeof(_OwnedTopology)),
         ("fastsasa_offsetof_owned_topology_atom_flags", _OwnedTopology.atom_flags.offset),
+        ("fastsasa_sizeof_parameters", ctypes.sizeof(_TrajectoryParameters)),
+        ("fastsasa_offsetof_parameters_precision", _TrajectoryParameters.precision.offset),
     ]
 
     try:

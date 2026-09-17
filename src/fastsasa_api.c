@@ -1,5 +1,6 @@
 #include "fastsasa_exact_math.h"
 #include "fastsasa.h"
+#include "fastsasa_trajectory.h"
 
 #include "fastsasa_backend_internal.h"
 #include "fastsasa_device.h"
@@ -977,6 +978,8 @@ size_t fastsasa_offsetof_sr_input_active_center_mask(void) { return offsetof(fas
 size_t fastsasa_offsetof_sr_input_active_center_indices(void) { return offsetof(fastsasa_sr_input, active_center_indices); }
 size_t fastsasa_offsetof_sr_input_n_active_centers(void) { return offsetof(fastsasa_sr_input, n_active_centers); }
 size_t fastsasa_offsetof_sr_input_force_double_precision(void) { return offsetof(fastsasa_sr_input, force_double_precision); }
+size_t fastsasa_sizeof_parameters(void) { return sizeof(fastsasa_parameters); }
+size_t fastsasa_offsetof_parameters_precision(void) { return offsetof(fastsasa_parameters, precision); }
 
 int
 fastsasa_constant_test_point_limit(void)

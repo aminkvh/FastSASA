@@ -22,6 +22,10 @@ typedef struct fastsasa_parameters {
     int precision;
 } fastsasa_parameters;
 
+/* Layout helpers for foreign-function bindings (see FASTSASA_ABI_VERSION). */
+size_t fastsasa_sizeof_parameters(void);
+size_t fastsasa_offsetof_parameters_precision(void);
+
 typedef struct fastsasa_topology {
     const double *radii;
     const int *residue_ids;

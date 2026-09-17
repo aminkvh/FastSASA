@@ -430,10 +430,21 @@ if(FASTSASA_ENABLE_CUDA)
     )
 endif()
 
+# The soname tracks FASTSASA_ABI_VERSION from include/fastsasa.h, so a
+# consumer linked against libfastsasa_native.so.1 keeps loading a
+# compatible library after an ABI-breaking release installs .so.2.
+file(STRINGS include/fastsasa.h FASTSASA_ABI_VERSION_LINE
+     REGEX "^#define FASTSASA_ABI_VERSION [0-9]+u$")
+string(REGEX REPLACE "^#define FASTSASA_ABI_VERSION ([0-9]+)u$" "\\1"
+       FASTSASA_ABI_VERSION "${FASTSASA_ABI_VERSION_LINE}")
+if(NOT FASTSASA_ABI_VERSION MATCHES "^[0-9]+$")
+    message(FATAL_ERROR "could not read FASTSASA_ABI_VERSION from include/fastsasa.h")
+endif()
 set_target_properties(fastsasa_native PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     EXPORT_NAME fastsasa_native
     OUTPUT_NAME fastsasa_native
+    SOVERSION ${FASTSASA_ABI_VERSION}
 )
 
 set(FASTSASA_INSTALL_TARGETS fastsasa_native)
