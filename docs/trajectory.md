@@ -9,7 +9,7 @@ working arrays stay on the GPU. It does not mean the whole trajectory is loaded
 into VRAM. Coordinates are streamed in batches, which keeps the workflow usable
 on consumer GPUs.
 
-Backend selection is automatic (Vulkan, then CUDA, then threaded CPU) and can
+Backend selection is automatic (CUDA, then Vulkan, then threaded CPU) and can
 be pinned with `--backend auto|vulkan|cuda|cpu`. A native threaded CPU path is
 always available with `--backend cpu --threads N`; `--cpu` is shorthand for
 `--backend cpu`.
@@ -87,7 +87,7 @@ fastsasa trajectory \
 The accelerator API itself is format-neutral. Any reader that produces coordinate
 arrays can feed FastSASA.
 
-Runtime backend selection is automatic: Vulkan, then CUDA when compiled and
+Runtime backend selection is automatic: CUDA, then Vulkan when compiled and
 available, then threaded CPU. Use `--backend auto|vulkan|cuda|cpu` to pin a
 backend from the CLI. The environment variable
 `FASTSASA_BACKEND=auto|vulkan|cuda|cpu` makes the same choice for the C and

@@ -10,8 +10,8 @@ Lee-Richards calculations through a command-line tool, a Python array API, and
 VMD integration.
 
 FastSASA is designed for repeated calculations. Trajectory coordinates are
-streamed in batches while reusable data stays on the selected backend. Vulkan,
-CUDA, and threaded CPU implementations are included; FastSASA chooses an
+streamed in batches while reusable data stays on the selected backend. CUDA,
+Vulkan, and threaded CPU implementations are included; FastSASA chooses an
 available backend automatically.
 
 [Documentation site](https://aminkvh.github.io/FastSASA/) ·
