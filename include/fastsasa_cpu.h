@@ -53,7 +53,7 @@ int fastsasa_cpu_shrake_rupley_mask(int n_atoms,
                                     const double *test_points,
                                     int n_threads,
                                     double *sasa);
-int fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points);
+int fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points, int n_threads);
 /* FP32 counterpart: bit-identical to fastsasa_cpu_shrake_rupley_precision at
  * FASTSASA_PRECISION_FP32, selected by the same policy. */
 int fastsasa_cpu_shrake_rupley_mask_fp32(int n_atoms,

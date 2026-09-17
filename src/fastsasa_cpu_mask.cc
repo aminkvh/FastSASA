@@ -883,11 +883,12 @@ struct Cap {
  *                                  build (about 6 ms at 128 points, built
  *                                  on all cores: the equivalent of ~2.5k
  *                                  atom-evaluations at the ~2.4 us/atom the
- *                                  kernel saves), or immediately if the
- *                                  table already exists.
+ *                                  kernel saves, times the thread count the
+ *                                  reference would have used), or
+ *                                  immediately if the table already exists.
  * Point counts above 255 are always the reference kernel. */
 extern "C" int
-fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points)
+fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points, int n_threads)
 {
     if (n_points > kMaxPoints || n_points <= 0 || n_atoms <= 0) return 0;
     const char *kernel = std::getenv("FASTSASA_CPU_KERNEL");
@@ -896,9 +897,12 @@ fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points)
         if (std::strcmp(kernel, "reference") == 0) return 0;
     }
     if (table_ready(n_points, test_points)) return 1;
-    /* Break-even in atom-evaluations, scaled with the build cost (linear in
-     * n_points at fixed resolution: ~0.045 ms per point at res 64). */
-    const long long break_even = 20LL * static_cast<long long>(n_points);
+    /* Break-even in atom-evaluations: the build (~0.045 ms per point at
+     * res 64, on all cores) must be repaid by the per-atom saving, which
+     * shrinks in wall-clock terms as the reference kernel's threads grow. */
+    int threads = n_threads > 0 ? n_threads : fastsasa_cpu_default_threads();
+    if (threads < 1) threads = 1;
+    const long long break_even = 20LL * static_cast<long long>(n_points) * static_cast<long long>(threads);
     const long long work = g_atom_work.fetch_add(n_atoms, std::memory_order_relaxed) + n_atoms;
     return work >= break_even ? 1 : 0;
 }

@@ -23,7 +23,7 @@ extern "C" int fastsasa_cpu_shrake_rupley_mask(int n_atoms, int n_points,
                                                const double *x, const double *y, const double *z,
                                                const double *expanded_radii, const double *test_points,
                                                int n_threads, double *sasa);
-extern "C" int fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points);
+extern "C" int fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points, int n_threads);
 extern "C" int fastsasa_cpu_shrake_rupley_mask_fp32(int n_atoms, int n_points,
                                                     const double *x, const double *y, const double *z,
                                                     const double *expanded_radii, const double *test_points,
@@ -282,7 +282,7 @@ cpu_shrake_rupley_impl(int n_atoms,
     if (max_radius <= 0.0 || !cell_keys_fit(n_atoms, x, y, z, max_radius)) {
         return FASTSASA_INVALID_ARGUMENT;
     }
-    if (fastsasa_cpu_mask_policy(n_atoms, n_points, test_points)) {
+    if (fastsasa_cpu_mask_policy(n_atoms, n_points, test_points, n_threads)) {
         const int status = fastsasa_cpu_shrake_rupley_mask(n_atoms, n_points, x, y, z,
                                                            expanded_radii, test_points, n_threads, sasa);
         if (status != -100) return status;
@@ -552,7 +552,7 @@ cpu_shrake_rupley_impl_fp32(int n_atoms,
     if (max_radius <= 0.0 || !cell_keys_fit(n_atoms, x, y, z, max_radius)) {
         return FASTSASA_INVALID_ARGUMENT;
     }
-    if (fastsasa_cpu_mask_policy(n_atoms, n_points, test_points)) {
+    if (fastsasa_cpu_mask_policy(n_atoms, n_points, test_points, n_threads)) {
         const int status = fastsasa_cpu_shrake_rupley_mask_fp32(n_atoms, n_points, x, y, z,
                                                                 expanded_radii, test_points, n_threads, sasa);
         if (status != -100) return status;

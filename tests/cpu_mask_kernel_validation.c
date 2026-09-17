@@ -237,7 +237,7 @@ synthetic_cases(void)
         const int st = fastsasa_cpu_shrake_rupley_mask(2, 256, x, y, z, r, points, 1, out);
         if (st != -100) { printf("FAIL 256 points: mask kernel returned %d, expected -100\n", st); ++failures; }
         else printf("ok   256 points declined by the mask kernel (-100)\n");
-        if (fastsasa_cpu_mask_policy(2, 256, points) != 0) { printf("FAIL policy accepted 256 points\n"); ++failures; }
+        if (fastsasa_cpu_mask_policy(2, 256, points, 1) != 0) { printf("FAIL policy accepted 256 points\n"); ++failures; }
         if (fastsasa_cpu_shrake_rupley(2, 256, x, y, z, r, points, 1, out) != FASTSASA_SUCCESS) {
             printf("FAIL reference path failed at 256 points\n"); ++failures;
         }
