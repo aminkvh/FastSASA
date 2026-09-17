@@ -81,21 +81,52 @@ def main() -> int:
     except Exception:
         pass
 
+    def compare(backend: str, label: str, values: np.ndarray, reference: np.ndarray) -> None:
+        differing = int(np.count_nonzero(values != reference))
+        if differing:
+            worst = float(np.max(np.abs(values - reference)))
+            raise SystemExit(
+                f"{backend} FP64 {label}: {differing} of {len(reference)} atoms differ "
+                f"from the CPU reference (max |diff| {worst:.3e})")
+
+    structures = {path: load_structure(args.fastsasa, path) for path in STRUCTURES}
     checked = 0
-    for structure in STRUCTURES:
-        xyz, radii = load_structure(args.fastsasa, structure)
-        for algorithm, resolution in CASES:
-            reference, _ = per_atom(module, "cpu", algorithm, resolution, xyz, radii, args.library)
-            for backend in gpu_backends:
-                values, _ = per_atom(module, backend, algorithm, resolution, xyz, radii, args.library)
-                differing = int(np.count_nonzero(values != reference))
-                if differing:
-                    worst = float(np.max(np.abs(values - reference)))
-                    raise SystemExit(
-                        f"{backend} FP64 {algorithm}{resolution} on {structure}: "
-                        f"{differing} of {len(reference)} atoms differ from the CPU reference "
-                        f"(max |diff| {worst:.3e})")
+    # Every SR kernel each backend can choose: the default policy, then the
+    # mask kernels forced on for structures the policy would route elsewhere.
+    for forced in (False, True):
+        for name in ("FASTSASA_CUDA_SR_KERNEL", "FASTSASA_VK_SR_KERNEL"):
+            if forced:
+                os.environ[name] = "mask"
+            else:
+                os.environ.pop(name, None)
+        for structure, (xyz, radii) in structures.items():
+            for algorithm, resolution in CASES:
+                if forced and algorithm != "SR":
+                    continue
+                reference, _ = per_atom(module, "cpu", algorithm, resolution, xyz, radii, args.library)
+                for backend in gpu_backends:
+                    values, _ = per_atom(module, backend, algorithm, resolution, xyz, radii, args.library)
+                    compare(backend, f"{algorithm}{resolution} on {structure}"
+                            + (" (mask kernel forced)" if forced else ""), values, reference)
+                    checked += 1
+
+    # One context switching between kernels: a small structure (reference
+    # kernel), a large one (mask kernel), more points than the mask kernel
+    # supports, then the mask kernel again with its resources already bound.
+    sequence = [(STRUCTURES[0], 100), (STRUCTURES[2], 100), (STRUCTURES[0], 500), (STRUCTURES[2], 100)]
+    for backend in gpu_backends:
+        os.environ["FASTSASA_BACKEND"] = backend
+        engine = module.SasaEngine(library_path=args.library, precision="fp64")
+        try:
+            for structure, resolution in sequence:
+                xyz, radii = structures[structure]
+                reference, _ = per_atom(module, "cpu", "SR", resolution, xyz, radii, args.library)
+                _, values = engine.sasa(xyz, radii, probe_radius=1.4, n_points=resolution, atom_sasa=True)
+                compare(backend, f"SR{resolution} on {structure} (reused context)",
+                        np.asarray(values).reshape(-1), reference)
                 checked += 1
+        finally:
+            engine.close()
 
     print(f"fastsasa_backend_bit_identity,status,pass,per_atom_cases,{checked},backends,{'+'.join(gpu_backends)}")
     return 0

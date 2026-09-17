@@ -65,9 +65,11 @@ points near a cap boundary go through the exact distance test, in the
 reference kernel's own arithmetic. Results are identical to the reference
 kernels bit for bit (FP64 on every backend; FP32 within its documented
 tolerance), and the kernels are checked against each other in the test
-suite. Point counts above 255 use the reference kernels. To force the
-reference kernel: `FASTSASA_CPU_KERNEL=reference`,
-`FASTSASA_CUDA_SR_KERNEL=reference`, `FASTSASA_VK_SR_KERNEL=reference`.
+suite. Point counts above 255, and small inputs where the reference
+kernels are faster, use the reference kernels. To force one kernel:
+`FASTSASA_CPU_KERNEL`, `FASTSASA_CUDA_SR_KERNEL`, `FASTSASA_VK_SR_KERNEL`
+set to `reference` or `mask`; `FASTSASA_MASK_MIN_CENTERS` (default 2048)
+moves the GPU crossover.
 
 ## Core Options
 

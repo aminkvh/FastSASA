@@ -49,6 +49,22 @@ namespace {
 
 constexpr uint32_t kBinThreads = 128;
 constexpr uint32_t kSrThreads = 64;
+/* Below this many centres per dispatch the point-parallel reference shaders
+ * win (FASTSASA_MASK_MIN_CENTERS overrides it for other devices); below this
+ * many centre-frames per context the table setup does not pay for itself.
+ * Both measured on an RTX 4060 Ti. */
+constexpr uint32_t kMaskMinCenters = 2048u;
+constexpr uint64_t kMaskMinWork = 512u * 1024u;
+
+uint32_t mask_min_centers()
+{
+    const char *value = std::getenv("FASTSASA_MASK_MIN_CENTERS");
+    if (value == nullptr || value[0] == '\0') return kMaskMinCenters;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || parsed > UINT32_MAX) return kMaskMinCenters;
+    return static_cast<uint32_t>(parsed);
+}
 constexpr uint64_t kMaxCells = 16ull * 1024ull * 1024ull;
 constexpr double kPi = 3.14159265358979323846;
 
@@ -266,11 +282,15 @@ struct fastsasa_vk_context {
     VkPipeline sr_mask_pipeline[2][4]{};
     bool mask_sr = false;                 /* device can run the mask shaders */
     bool mask_sr_active = false;          /* the current dispatch uses one */
+    bool mask_sr_ready = false;           /* prepared for the current dispatch */
+    uint64_t mask_work = 0;               /* centre-frames dispatched so far */
+    VkDeviceSize mask_table_upload_bytes = 0; /* staged table not yet copied */
     Buffer mask_params;
     Buffer mask_table;
     Buffer staging_mask_table;
     Buffer mask_pending;
     Buffer mask_pending_slot;
+    Buffer placeholder;                   /* bound where a mask buffer is absent */
     int mask_table_n_points = 0;
     std::vector<double> mask_table_points;
     VkPipeline count_pipeline = VK_NULL_HANDLE;
@@ -744,11 +764,15 @@ void update_descriptors(fastsasa_vk_context *context)
                            &context->atoms_shadow_sorted,
                            &context->mask_params, &context->mask_table,
                            &context->mask_pending, &context->mask_pending_slot};
-    /* the mask buffers may not exist yet; bind a valid placeholder then */
+    /* The mask buffers exist only once a mask dispatch has needed them;
+     * bind a shared placeholder until then (the real buffers are created
+     * with their own memory types later, so they must not be pre-made here). */
     for (uint32_t i = 9; i < 13; ++i) {
         if (buffers[i]->handle == VK_NULL_HANDLE) {
-            ensure_buffer(context, buffers[i], 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ensure_buffer(context, &context->placeholder, 16,
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            buffers[i] = &context->placeholder;
         }
     }
     VkDescriptorBufferInfo infos[13]{};
@@ -766,27 +790,42 @@ void update_descriptors(fastsasa_vk_context *context)
 }
 
 
-/* Mask-shader resources: the direction table (uploaded once per point set,
- * with its own small submission), the parameter block, and per-invocation
- * parking space. Must run before update_descriptors() for a dispatch that
- * will select a mask pipeline. Returns false when the table is unavailable
- * (the caller then falls back to the reference shaders). */
+/* Mask-shader resources: the direction table (staged here, copied inside
+ * the next dispatch), the parameter block, and per-invocation parking
+ * space. Must run before update_descriptors() for every SR dispatch: it
+ * decides whether the dispatch uses the mask shaders (mask_sr_ready).
+ *
+ * One invocation per centre needs enough centres in flight to hide the
+ * serial neighbour walk, so small selections stay on the point-parallel
+ * reference shaders. Preparing the table costs several milliseconds per
+ * context, so the mask shaders also wait until the context has dispatched
+ * enough centre-frames to pay for it, unless the table is already resident.
+ * FASTSASA_VK_SR_KERNEL=mask forces them whenever they are available. */
 bool prepare_mask_resources(fastsasa_vk_context *context,
                             uint32_t point_count,
                             const double *sphere_xyz,
                             uint32_t center_count,
+                            uint32_t frame_count,
                             bool cell_order)
 {
+    context->mask_sr_ready = false;
     if (!context->mask_sr || point_count == 0u || point_count > 255u || sphere_xyz == nullptr) return false;
-    const uint32_t words = (point_count + 63u) / 64u;
-    const VkMemoryPropertyFlags device_memory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    const VkMemoryPropertyFlags host_memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     const bool same_points =
         context->mask_table.handle != VK_NULL_HANDLE &&
         context->mask_table_n_points == static_cast<int>(point_count) &&
         context->mask_table_points.size() == 3u * point_count &&
         std::memcmp(context->mask_table_points.data(), sphere_xyz, sizeof(double) * 3u * point_count) == 0;
+    const char *env = std::getenv("FASTSASA_VK_SR_KERNEL");
+    const bool forced = env != nullptr && std::strcmp(env, "mask") == 0;
+    context->mask_work += static_cast<uint64_t>(center_count) * frame_count;
+    if (!forced) {
+        if (center_count < mask_min_centers()) return false;
+        if (!same_points && context->mask_work < kMaskMinWork) return false;
+    }
+    const uint32_t words = (point_count + 63u) / 64u;
+    const VkMemoryPropertyFlags device_memory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    const VkMemoryPropertyFlags host_memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     fastsasa_cpu_mask_table_view view{};
     void *handle = fastsasa_cpu_mask_table_acquire(static_cast<int>(point_count), sphere_xyz, &view);
     if (handle == nullptr) return false;
@@ -806,23 +845,26 @@ bool prepare_mask_resources(fastsasa_vk_context *context,
         ensure_buffer(context, &context->mask_table, bytes,
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, device_memory);
         std::memcpy(context->staging_mask_table.mapped, view.entry, bytes);
-        check(vkResetCommandBuffer(context->command, 0), "vkResetCommandBuffer");
-        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        check(vkBeginCommandBuffer(context->command, &begin), "vkBeginCommandBuffer");
-        VkBufferCopy copy{0, 0, bytes};
-        vkCmdCopyBuffer(context->command, context->staging_mask_table.handle, context->mask_table.handle, 1, &copy);
-        check(vkEndCommandBuffer(context->command), "vkEndCommandBuffer");
-        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &context->command;
-        check(vkQueueSubmit(context->queue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit");
-        check(vkQueueWaitIdle(context->queue), "vkQueueWaitIdle");
+        /* Copied to the device inside the next dispatch's command buffer. */
+        context->mask_table_upload_bytes = bytes;
         context->mask_table_n_points = static_cast<int>(point_count);
         context->mask_table_points.assign(sphere_xyz, sphere_xyz + 3u * point_count);
     }
     fastsasa_cpu_mask_table_release(handle);
+    context->mask_sr_ready = true;
     return true;
+}
+
+/* Records the pending mask-table upload, if any, at the start of a
+ * dispatch; the cell-list build's transfer-to-compute barrier orders it
+ * before the SR shaders. */
+void record_mask_table_upload(fastsasa_vk_context *context)
+{
+    if (context->mask_table_upload_bytes == 0) return;
+    VkBufferCopy copy{0, 0, context->mask_table_upload_bytes};
+    vkCmdCopyBuffer(context->command, context->staging_mask_table.handle,
+                    context->mask_table.handle, 1, &copy);
+    context->mask_table_upload_bytes = 0;
 }
 
 VkPipeline select_sr_pipeline(fastsasa_vk_context *context,
@@ -830,8 +872,7 @@ VkPipeline select_sr_pipeline(fastsasa_vk_context *context,
                               bool use_fp64)
 {
     context->mask_sr_active = false;
-    if (context->mask_sr && point_count >= 1u && point_count <= 255u &&
-        context->mask_table.handle != VK_NULL_HANDLE) {
+    if (context->mask_sr_ready && context->mask_table.handle != VK_NULL_HANDLE) {
         const uint32_t words = (point_count + 63u) / 64u;
         VkPipeline pipeline = context->sr_mask_pipeline[use_fp64 ? 1 : 0][words - 1u];
         if (pipeline != VK_NULL_HANDLE) {
@@ -1080,7 +1121,7 @@ int calculate(fastsasa_vk_context *context,
         std::memcpy(context->staging_centers.mapped, centers.data(),
                     sizeof(uint32_t) * center_count);
         if (!lee_richards) {
-            prepare_mask_resources(context, point_count, sphere_xyz, center_count,
+            prepare_mask_resources(context, point_count, sphere_xyz, center_count, 1u,
                                    requested_centers == nullptr && center_count == atom_count);
         }
         update_descriptors(context);
@@ -1096,6 +1137,7 @@ int calculate(fastsasa_vk_context *context,
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         check(vkBeginCommandBuffer(context->command, &begin), "vkBeginCommandBuffer");
+        record_mask_table_upload(context);
 
         VkBufferCopy atom_copy{0, 0, sizeof(Vec4T<Real>) * atom_count};
         VkBufferCopy point_copy{0, 0, sizeof(Vec4T<Real>) * points.size()};
@@ -1380,7 +1422,7 @@ int calculate_frames(fastsasa_vk_context *context,
         std::memcpy(context->staging_centers.mapped, centers.data(),
                     sizeof(uint32_t) * center_count);
         if (!lee_richards) {
-            prepare_mask_resources(context, resolution, sphere_xyz, center_count,
+            prepare_mask_resources(context, resolution, sphere_xyz, center_count, frame_count,
                                    requested_centers == nullptr && center_count == atom_count);
         }
         update_descriptors(context);
@@ -1390,6 +1432,7 @@ int calculate_frames(fastsasa_vk_context *context,
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         check(vkBeginCommandBuffer(context->command, &begin), "vkBeginCommandBuffer");
+        record_mask_table_upload(context);
         VkBufferCopy point_copy{0, 0, sizeof(Vec4T<Real>) * points.size()};
         VkBufferCopy center_copy{0, 0, sizeof(uint32_t) * center_count};
         if (!lee_richards) {
@@ -1798,6 +1841,7 @@ extern "C" void fastsasa_vk_context_free(fastsasa_vk_context *context)
     destroy_buffer(context, &context->staging_mask_table);
     destroy_buffer(context, &context->mask_pending);
     destroy_buffer(context, &context->mask_pending_slot);
+    destroy_buffer(context, &context->placeholder);
     for (int pr = 0; pr < 2; ++pr) for (int w = 0; w < 4; ++w) {
         if (context->sr_mask_pipeline[pr][w] != VK_NULL_HANDLE) vkDestroyPipeline(context->device, context->sr_mask_pipeline[pr][w], nullptr);
         if (context->sr_mask_shader[pr][w] != VK_NULL_HANDLE) vkDestroyShaderModule(context->device, context->sr_mask_shader[pr][w], nullptr);

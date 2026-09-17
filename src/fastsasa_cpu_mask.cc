@@ -164,7 +164,10 @@ struct MaskTable {
      * stored as two consecutive rows, so one cap costs one address
      * computation and one contiguous 2*words load. Both bounds are
      * conservative. The full prefix table is only needed while building. */
-    std::vector<std::uint64_t> entry;
+    /* Every element is written by build(); left uninitialized so the
+     * workers take the first-touch page faults in parallel. */
+    std::unique_ptr<std::uint64_t[]> entry;
+    std::size_t entry_count = 0;
 
     static int resolution_from_env()
     {
@@ -191,7 +194,8 @@ struct MaskTable {
         n_bins = res * res;
         points.assign(test_points, test_points + 3 * n);
         delta.assign(static_cast<size_t>(n_bins), 0.0);
-        entry.assign(static_cast<size_t>(n_bins) * static_cast<size_t>(kThresholdBins) * 2u * static_cast<size_t>(words), 0u);
+        entry_count = static_cast<size_t>(n_bins) * static_cast<size_t>(kThresholdBins) * 2u * static_cast<size_t>(words);
+        entry.reset(new std::uint64_t[entry_count]);
         max_delta = 0.0;
 
         /* Bins are independent: build rows of bins in parallel. Each worker
@@ -252,7 +256,7 @@ struct MaskTable {
                     const double va = lo_edge - d_bin;
                     while (kb > 0 && !(scratch[static_cast<size_t>(kb - 1)].first > vb)) --kb;
                     while (ka > 0 && !(scratch[static_cast<size_t>(ka - 1)].first > va)) --ka;
-                    std::uint64_t *e = entry.data() + (static_cast<size_t>(bin) * kThresholdBins + static_cast<size_t>(q)) * 2u * static_cast<size_t>(words);
+                    std::uint64_t *e = entry.get() + (static_cast<size_t>(bin) * kThresholdBins + static_cast<size_t>(q)) * 2u * static_cast<size_t>(words);
                     const std::uint64_t *pb = row + static_cast<size_t>(kb) * words;
                     const std::uint64_t *pa = row + static_cast<size_t>(ka) * words;
                     for (int w = 0; w < words; ++w) {
@@ -287,7 +291,7 @@ struct MaskTable {
         int q = static_cast<int>((t + 1.0) * (0.5 * kThresholdBins));
         if (q < 0) q = 0;
         if (q >= kThresholdBins) q = kThresholdBins - 1;
-        return entry.data() + (static_cast<size_t>(bin) * kThresholdBins + static_cast<size_t>(q)) * 2u * static_cast<size_t>(words);
+        return entry.get() + (static_cast<size_t>(bin) * kThresholdBins + static_cast<size_t>(q)) * 2u * static_cast<size_t>(words);
     }
 };
 
@@ -1037,8 +1041,8 @@ fastsasa_cpu_mask_table_acquire(int n_points, const double *test_points, fastsas
     view->dot_pad = kDotPad;
     view->max_delta = table->max_delta;
     view->delta = table->delta.data();
-    view->entry = table->entry.data();
-    view->entry_count = table->entry.size();
+    view->entry = table->entry.get();
+    view->entry_count = table->entry_count;
     return new std::shared_ptr<const MaskTable>(table);
 }
 

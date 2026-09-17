@@ -9,6 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Centres per launch below which the reference SR kernel beats the mask
+ * kernel (measured on an RTX 4060 Ti); FASTSASA_MASK_MIN_CENTERS overrides. */
+#define FASTSASA_MASK_MIN_CENTERS 2048
+
 /* A macro rather than a file-scope const: MSVC-hosted nvcc rejects host
  * constants referenced from device code. */
 #define FASTSASA_PI 3.141592653589793238462643383279502884
@@ -1087,7 +1091,23 @@ sort_cell_list_policy(int n_atoms,
     return atoms_per_cell >= threshold;
 }
 
-/* FASTSASA_CUDA_SR_KERNEL=mask|reference (default: mask for FP64). */
+/* Centres per launch below which the point-parallel reference kernel beats
+ * the one-lane-per-centre mask kernel; FASTSASA_MASK_MIN_CENTERS overrides
+ * the measured default for other devices. */
+static int
+mask_min_centers(void)
+{
+    const char *value = getenv("FASTSASA_MASK_MIN_CENTERS");
+    char *end = NULL;
+
+    if (value != NULL && value[0] != '\0') {
+        const long parsed = strtol(value, &end, 10);
+        if (end != value && *end == '\0' && parsed >= 0 && parsed <= INT_MAX) return (int)parsed;
+    }
+    return FASTSASA_MASK_MIN_CENTERS;
+}
+
+/* FASTSASA_CUDA_SR_KERNEL=mask|reference (default: mask when eligible). */
 static int
 use_mask_sr(void)
 {
@@ -4116,8 +4136,6 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
                                     ? 1
                                     : use_float_sr());
     const int hybrid_sr = !float_sr && use_sr_fp64_hybrid();
-    /* Mask kernel: FP64 only, up to 255 points, whole-atom centres. */
-    const int mask_sr = use_mask_sr() && input->n_points <= 255;
     const fastsasa_sr_dispatch_policy dispatch = select_sr_dispatch_policy(
         input->n_points,
         input->n_atoms,
@@ -4131,6 +4149,14 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
     const int sr_center_count = compact_active_centers
                                     ? input->n_active_centers
                                     : input->n_atoms;
+    /* Mask kernel: up to 255 points. One lane per centre, so it needs
+     * enough centres in flight to hide its serial per-lane neighbour walk;
+     * below ~2k centres the point-parallel reference kernel is faster
+     * (measured crossover ~3k centres on an RTX 4060 Ti). */
+    const char *mask_env = getenv("FASTSASA_CUDA_SR_KERNEL");
+    const int mask_forced = mask_env != NULL && strcmp(mask_env, "mask") == 0;
+    int mask_sr = use_mask_sr() && input->n_points <= 255 &&
+                  (mask_forced || sr_center_count >= mask_min_centers());
     /* Keep reusable points in context-owned global memory for stream isolation. */
     const int use_const_test_points = 0;
     const int sort_cell_list = dispatch.sort_cell_list;
@@ -4182,17 +4208,24 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
         if (status != FASTSASA_SUCCESS) goto status_fail;
     }
     if (mask_sr) {
+        /* The mask kernel is an accelerator: if its table or parking space
+         * cannot be allocated, the reference kernel takes the launch. */
         const int words = (input->n_points + 63) / 64;
         status = ensure_mask_table(context, input->n_points, input->test_points);
-        if (status != FASTSASA_SUCCESS) goto status_fail;
-        status = ensure_device_capacity((void **)&context->d_mask_pending,
-                                        &context->mask_pending_capacity,
-                                        sizeof(unsigned long long) * (size_t)sr_center_count * FASTSASA_MASK_PENDING * (size_t)words);
-        if (status != FASTSASA_SUCCESS) goto status_fail;
-        status = ensure_device_capacity((void **)&context->d_mask_pending_slot,
-                                        &context->mask_pending_slot_capacity,
-                                        sizeof(int) * (size_t)sr_center_count * FASTSASA_MASK_PENDING);
-        if (status != FASTSASA_SUCCESS) goto status_fail;
+        if (status == FASTSASA_SUCCESS) {
+            status = ensure_device_capacity((void **)&context->d_mask_pending,
+                                            &context->mask_pending_capacity,
+                                            sizeof(unsigned long long) * (size_t)sr_center_count * FASTSASA_MASK_PENDING * (size_t)words);
+        }
+        if (status == FASTSASA_SUCCESS) {
+            status = ensure_device_capacity((void **)&context->d_mask_pending_slot,
+                                            &context->mask_pending_slot_capacity,
+                                            sizeof(int) * (size_t)sr_center_count * FASTSASA_MASK_PENDING);
+        }
+        if (status != FASTSASA_SUCCESS) {
+            mask_sr = 0;
+            status = FASTSASA_SUCCESS;
+        }
     }
     if (aggregate_total) {
         status = ensure_device_capacity((void **)&context->d_total_sasa,
