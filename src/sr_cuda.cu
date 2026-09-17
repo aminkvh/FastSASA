@@ -2727,7 +2727,37 @@ shrake_rupley_cell_kernel(int n_atoms,
  * packing and at 255 points with no slowdown from overflow. */
 #define FASTSASA_MASK_PENDING 32
 
-template <int W>
+/* One boundary point decided exactly. FP64: shrake_rupley_cell_kernel's
+ * expression. FP32: the float kernels' expression on the box-local shadows
+ * (px = xf + tf * rf; dx*dx + dy*dy + dz*dz < r2f), so the mask variant
+ * matches the FP32 kernels' decision rule and error class. */
+template <bool kFloat>
+__device__ __forceinline__ static bool
+mask_point_buried(double xi, double yi, double zi, double ri,
+                  float xif, float yif, float zif, float rif,
+                  const double *__restrict__ test_points, const float *__restrict__ test_points_f,
+                  int p, double xj, double yj, double zj, double rj2,
+                  float xjf, float yjf, float zjf, float rj2f)
+{
+    if (kFloat) {
+        const float px = xif + __ldg(&test_points_f[3 * p]) * rif;
+        const float py = yif + __ldg(&test_points_f[3 * p + 1]) * rif;
+        const float pz = zif + __ldg(&test_points_f[3 * p + 2]) * rif;
+        const float dx = px - xjf;
+        const float dy = py - yjf;
+        const float dz = pz - zjf;
+        return dx * dx + dy * dy + dz * dz < rj2f;
+    }
+    const double qx = fastsasa_dadd(xi, fastsasa_dmul(ri, __ldg(&test_points[3 * p])));
+    const double qy = fastsasa_dadd(yi, fastsasa_dmul(ri, __ldg(&test_points[3 * p + 1])));
+    const double qz = fastsasa_dadd(zi, fastsasa_dmul(ri, __ldg(&test_points[3 * p + 2])));
+    const double dx = qx - xj;
+    const double dy = qy - yj;
+    const double dz = qz - zj;
+    return fastsasa_dadd(fastsasa_dadd(fastsasa_dmul(dx, dx), fastsasa_dmul(dy, dy)), fastsasa_dmul(dz, dz)) < rj2;
+}
+
+template <int W, bool kFloat>
 __global__ static void
 shrake_rupley_cell_mask_kernel(int n_atoms,
                                int n_points,
@@ -2741,6 +2771,8 @@ shrake_rupley_cell_mask_kernel(int n_atoms,
                                const float *__restrict__ yf,
                                const float *__restrict__ zf,
                                const float *__restrict__ radii_f,
+                               const float *__restrict__ radii2_f,      /* FP32 exact tests */
+                               const float *__restrict__ test_points_f,
                                const unsigned long long *__restrict__ table,
                                int table_res,
                                int table_tbins,
@@ -2907,23 +2939,21 @@ shrake_rupley_cell_mask_kernel(int n_atoms,
                         ++n_pending;
                     } else {
                         /* no room to park: decide these points now, exactly */
-                        const double xj = __ldg(&x[other]);
-                        const double yj = __ldg(&y[other]);
-                        const double zj = __ldg(&z[other]);
+                        const double xj = kFloat ? 0.0 : __ldg(&x[other]);
+                        const double yj = kFloat ? 0.0 : __ldg(&y[other]);
+                        const double zj = kFloat ? 0.0 : __ldg(&z[other]);
+                        const float xjf = kFloat ? __ldg(&xf[other]) : 0.0f;
+                        const float yjf = kFloat ? __ldg(&yf[other]) : 0.0f;
+                        const float zjf = kFloat ? __ldg(&zf[other]) : 0.0f;
+                        const float rj2f = kFloat ? __ldg(&radii2_f[other]) : 0.0f;
 #pragma unroll
                         for (int w = 0; w < W; ++w) {
                             unsigned long long a = amb[w];
                             while (a) {
                                 const int bit = __ffsll((long long)a) - 1;
                                 a &= a - 1ull;
-                                const int p = w * 64 + bit;
-                                const double qx = fastsasa_dadd(xi, fastsasa_dmul(ri, __ldg(&test_points[3 * p])));
-                                const double qy = fastsasa_dadd(yi, fastsasa_dmul(ri, __ldg(&test_points[3 * p + 1])));
-                                const double qz = fastsasa_dadd(zi, fastsasa_dmul(ri, __ldg(&test_points[3 * p + 2])));
-                                const double dx = qx - xj;
-                                const double dy = qy - yj;
-                                const double dz_ = qz - zj;
-                                if (fastsasa_dadd(fastsasa_dadd(fastsasa_dmul(dx, dx), fastsasa_dmul(dy, dy)), fastsasa_dmul(dz_, dz_)) < rj2) {
+                                if (mask_point_buried<kFloat>(xi, yi, zi, ri, xif, yif, zif, rif, test_points, test_points_f,
+                                                              w * 64 + bit, xj, yj, zj, rj2, xjf, yjf, zjf, rj2f)) {
                                     visible[w] &= ~(1ull << bit);
                                 }
                             }
@@ -2944,24 +2974,22 @@ shrake_rupley_cell_mask_kernel(int n_atoms,
         /* exact pass over parked bits that are still visible */
         for (int q = 0; q < n_pending; ++q) {
             const int other = my_pending_slot[q];
-            const double xj = __ldg(&x[other]);
-            const double yj = __ldg(&y[other]);
-            const double zj = __ldg(&z[other]);
-            const double rj2 = __ldg(&radii2[other]);
+            const double xj = kFloat ? 0.0 : __ldg(&x[other]);
+            const double yj = kFloat ? 0.0 : __ldg(&y[other]);
+            const double zj = kFloat ? 0.0 : __ldg(&z[other]);
+            const double rj2 = kFloat ? 0.0 : __ldg(&radii2[other]);
+            const float xjf = kFloat ? __ldg(&xf[other]) : 0.0f;
+            const float yjf = kFloat ? __ldg(&yf[other]) : 0.0f;
+            const float zjf = kFloat ? __ldg(&zf[other]) : 0.0f;
+            const float rj2f = kFloat ? __ldg(&radii2_f[other]) : 0.0f;
 #pragma unroll
             for (int w = 0; w < W; ++w) {
                 unsigned long long a = my_pending[q * W + w] & visible[w];
                 while (a) {
                     const int bit = __ffsll((long long)a) - 1;
                     a &= a - 1ull;
-                    const int p = w * 64 + bit;
-                    const double qx = fastsasa_dadd(xi, fastsasa_dmul(ri, __ldg(&test_points[3 * p])));
-                    const double qy = fastsasa_dadd(yi, fastsasa_dmul(ri, __ldg(&test_points[3 * p + 1])));
-                    const double qz = fastsasa_dadd(zi, fastsasa_dmul(ri, __ldg(&test_points[3 * p + 2])));
-                    const double dx = qx - xj;
-                    const double dy = qy - yj;
-                    const double dz = qz - zj;
-                    if (fastsasa_dadd(fastsasa_dadd(fastsasa_dmul(dx, dx), fastsasa_dmul(dy, dy)), fastsasa_dmul(dz, dz)) < rj2) {
+                    if (mask_point_buried<kFloat>(xi, yi, zi, ri, xif, yif, zif, rif, test_points, test_points_f,
+                                                  w * 64 + bit, xj, yj, zj, rj2, xjf, yjf, zjf, rj2f)) {
                         visible[w] &= ~(1ull << bit);
                     }
                 }
@@ -4089,7 +4117,7 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
                                     : use_float_sr());
     const int hybrid_sr = !float_sr && use_sr_fp64_hybrid();
     /* Mask kernel: FP64 only, up to 255 points, whole-atom centres. */
-    const int mask_sr = !float_sr && use_mask_sr() && input->n_points <= 255;
+    const int mask_sr = use_mask_sr() && input->n_points <= 255;
     const fastsasa_sr_dispatch_policy dispatch = select_sr_dispatch_policy(
         input->n_points,
         input->n_atoms,
@@ -4302,6 +4330,11 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
         if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
         square_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii_f, context->d_radii2_f);
         if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
+        if (mask_sr) {
+            /* the mask kernel forms its cap thresholds from the double radii^2 */
+            square_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii, context->d_radii2);
+            if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
+        }
     } else {
         square_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii, context->d_radii2);
         if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
@@ -4402,7 +4435,34 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
         goto cuda_fail;
     }
 
-    if (use_warp_atom_sr) {
+    if (mask_sr) {
+        const int mask_threads = 128;
+        const int mask_blocks = (sr_center_count + mask_threads - 1) / mask_threads;
+        const int W = (input->n_points + 63) / 64;
+#define FASTSASA_LAUNCH_MASK_P(WW, FL) \
+        shrake_rupley_cell_mask_kernel<WW, FL><<<mask_blocks, mask_threads, 0, context->stream>>>( \
+            input->n_atoms, input->n_points, context->d_x, context->d_y, context->d_z, \
+            context->d_radii, context->d_radii2, context->d_test_points, \
+            context->d_xf, context->d_yf, context->d_zf, context->d_radii_f, \
+            context->d_radii2_f, context->d_test_points_f, \
+            context->d_mask_table, context->mask_table_res, context->mask_table_tbins, \
+            context->mask_table_max_delta, context->mask_table_dot_pad, nx, ny, nz, \
+            context->d_atom_cells, context->d_cell_offsets, context->d_cell_atoms, \
+            compact_active_centers ? context->d_active_center_indices : NULL, sr_center_count, \
+            active_center ? context->d_selection_masks : NULL, \
+            active_center ? input->active_center_mask : 0u, \
+            context->d_mask_pending, context->d_mask_pending_slot, \
+            sasa != NULL || aggregate_host ? context->d_sasa : NULL, NULL)
+#define FASTSASA_LAUNCH_MASK(WW) do { if (float_sr) FASTSASA_LAUNCH_MASK_P(WW, true); else FASTSASA_LAUNCH_MASK_P(WW, false); } while (0)
+        switch (W) {
+        case 1: FASTSASA_LAUNCH_MASK(1); break;
+        case 2: FASTSASA_LAUNCH_MASK(2); break;
+        case 3: FASTSASA_LAUNCH_MASK(3); break;
+        default: FASTSASA_LAUNCH_MASK(4); break;
+        }
+#undef FASTSASA_LAUNCH_MASK
+#undef FASTSASA_LAUNCH_MASK_P
+    } else if (use_warp_atom_sr) {
         shrake_rupley_cell_float_warp_ordered_kernel<<<sr_blocks, sr_threads, 0, context->stream>>>(
             input->n_atoms,
             input->n_points,
@@ -4490,30 +4550,6 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
             active_center ? input->active_center_mask : 0u,
             sasa != NULL || aggregate_host ? context->d_sasa : NULL,
             NULL);
-    } else if (mask_sr) {
-        const int mask_threads = 128;
-        const int mask_blocks = (sr_center_count + mask_threads - 1) / mask_threads;
-        const int W = (input->n_points + 63) / 64;
-#define FASTSASA_LAUNCH_MASK(WW) \
-        shrake_rupley_cell_mask_kernel<WW><<<mask_blocks, mask_threads, 0, context->stream>>>( \
-            input->n_atoms, input->n_points, context->d_x, context->d_y, context->d_z, \
-            context->d_radii, context->d_radii2, context->d_test_points, \
-            context->d_xf, context->d_yf, context->d_zf, context->d_radii_f, \
-            context->d_mask_table, context->mask_table_res, context->mask_table_tbins, \
-            context->mask_table_max_delta, context->mask_table_dot_pad, nx, ny, nz, \
-            context->d_atom_cells, context->d_cell_offsets, context->d_cell_atoms, \
-            compact_active_centers ? context->d_active_center_indices : NULL, sr_center_count, \
-            active_center ? context->d_selection_masks : NULL, \
-            active_center ? input->active_center_mask : 0u, \
-            context->d_mask_pending, context->d_mask_pending_slot, \
-            sasa != NULL || aggregate_host ? context->d_sasa : NULL, NULL)
-        switch (W) {
-        case 1: FASTSASA_LAUNCH_MASK(1); break;
-        case 2: FASTSASA_LAUNCH_MASK(2); break;
-        case 3: FASTSASA_LAUNCH_MASK(3); break;
-        default: FASTSASA_LAUNCH_MASK(4); break;
-        }
-#undef FASTSASA_LAUNCH_MASK
     } else if (hybrid_sr) {
         /* Conservative FP32-prefilter uncertainty margin. Coordinates are
          * box-local, so magnitudes are bounded by the grid extent; distances

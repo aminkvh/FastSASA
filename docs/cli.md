@@ -57,45 +57,17 @@ Matching backends use the same algorithm, radii, probe radius, resolution,
 and reduction order. See [Radius Configuration](classifier_config.md) when
 comparing FastSASA with another SASA implementation.
 
-### The CPU Shrake-Rupley kernels
+### Shrake-Rupley kernels
 
-The CPU backend has two FP64 Shrake-Rupley kernels that give the same result
-bit for bit:
-
-- the reference kernel, which tests every sphere point against every
-  overlapping neighbour;
-- a mask-accelerated kernel, which settles most points with precomputed
-  spherical-cap masks (indexed by the neighbour's direction on a 64x64
-  octahedral grid and its cap threshold) and hands only the points near a
-  cap boundary to the reference test, in the reference's own operation
-  order. It is typically 3-4x faster per atom and, unlike approximate
-  bitmask methods, exact and rotation-invariant. Its one-time direction
-  table costs about 6 ms at 128 points (built on all cores) and is cached
-  per process; it supports up to 255 points.
-
-By default the CPU backend switches to the mask kernel once the work in the
-process (atoms times frames) repays that table build: a few thousand
-atom-evaluations, so a single structure of ordinary size, any trajectory,
-and any batch of structures all use it. Override with
-`FASTSASA_CPU_KERNEL=reference` or `FASTSASA_CPU_KERNEL=mask`. The same
-construction serves `--precision fp32` on the CPU, with the boundary tests
-run in the FP32 kernel's float arithmetic, so FP32 output is unchanged and
-gets the same speedup; on the CPU, FP32 is therefore no faster than FP64
-and exists for consistency with the GPU precision modes. The table's
-grid resolution can be tuned with `FASTSASA_CPU_MASK_RESOLUTION` (default
-64; finer grids trade table size for fewer exact tests). Both kernels are
-compared bit for bit in the test suite (`fastsasa_cpu_mask_kernel`).
-
-The CUDA backend runs the same construction for FP64 Shrake-Rupley: one lane
-per atom, the warp scanning its shared neighbourhood cooperatively on the
-box-local float shadows, the certain caps applied from the shared direction
-table, and the boundary points decided with the reference kernel's exact
-FP64 arithmetic, so CUDA FP64 stays bit-identical to the CPU (the
-`fastsasa_backend_bit_identity` test). The kernel itself is 4-5x faster
-than the previous FP64 kernel; per trajectory frame the gain is smaller
-(about 2.5x through the Python API, less through the CLI) because the
-per-frame upload, cell-list build and readback are now comparable to the
-kernel. `FASTSASA_CUDA_SR_KERNEL=reference` selects the previous kernel.
+Every backend runs Shrake-Rupley through a mask-accelerated kernel: most
+sphere points are settled from precomputed spherical-cap masks, and only
+points near a cap boundary go through the exact distance test, in the
+reference kernel's own arithmetic. Results are identical to the reference
+kernels bit for bit (FP64 on every backend; FP32 within its documented
+tolerance), and the kernels are checked against each other in the test
+suite. Point counts above 255 use the reference kernels. To force the
+reference kernel: `FASTSASA_CPU_KERNEL=reference`,
+`FASTSASA_CUDA_SR_KERNEL=reference`, `FASTSASA_VK_SR_KERNEL=reference`.
 
 ## Core Options
 

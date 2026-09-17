@@ -1,0 +1,300 @@
+#version 450
+/*
+ * Mask-accelerated Shrake-Rupley: the Vulkan form of the CPU kernel in
+ * fastsasa_cpu_mask.cc, sharing its direction table (binding 10). One
+ * invocation owns one atom and a 64*W-bit visibility mask in registers
+ * (uvec2 per 64 bits: no 64-bit integer support is assumed). Invocations
+ * take atoms in cell-list order, so a subgroup's atoms share a
+ * neighbourhood; every invocation walks the 5x5x5 cell block around its
+ * subgroup leader's cell (uniform control flow, coalesced candidate
+ * loads), keeping the candidates that overlap its own atom. Cap threshold
+ * and direction bin are single precision; the table's pads cover that.
+ * Certain points are cleared with ANDs; band points still visible are
+ * parked and, after the scan, decided with the exact test of
+ * sr_cell_list.comp (FP64: `precise` double arithmetic in the reference
+ * order, so the exposed count is the CPU reference's bit for bit; FP32:
+ * the float shadow test of the FP32 shader). The host applies the FP64
+ * area formula to the count, as for the other SR shaders.
+ */
+#ifdef FASTSASA_FP64
+#extension GL_ARB_gpu_shader_fp64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#endif
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+#ifndef SR_MASK_WORDS
+#define SR_MASK_WORDS 2
+#endif
+#define SR_MASK_PENDING 32
+#define SR_MASK_LOCAL 64
+
+layout(local_size_x = SR_MASK_LOCAL) in;
+
+#ifdef FASTSASA_FP64
+layout(set = 0, binding = 0, std430) readonly buffer Atoms { dvec4 values[]; } atoms;
+layout(set = 0, binding = 1, std430) readonly buffer SpherePoints { dvec4 values[]; } sphere_points;
+#else
+layout(set = 0, binding = 0, std430) readonly buffer Atoms { vec4 values[]; } atoms;
+layout(set = 0, binding = 1, std430) readonly buffer SpherePoints { vec4 values[]; } sphere_points;
+#endif
+layout(set = 0, binding = 2, std430) readonly buffer CellOffsets { int values[]; } cell_offsets;
+layout(set = 0, binding = 3, std430) readonly buffer CellAtoms { int values[]; } cell_atoms;
+layout(set = 0, binding = 4, std430) readonly buffer Centers { uint values[]; } centers;
+#ifdef FASTSASA_FP64
+layout(set = 0, binding = 5, std430) writeonly buffer Areas { double values[]; } areas;
+#else
+layout(set = 0, binding = 5, std430) writeonly buffer Areas { float values[]; } areas;
+#endif
+/* box-local float shadow in cell order: xyz, expanded radius squared */
+layout(set = 0, binding = 8, std430) readonly buffer AtomsFSorted { vec4 values[]; } atoms_f_sorted;
+/* table parameters: resolution, threshold bins, then max_delta+pad as float */
+layout(set = 0, binding = 9, std430) readonly buffer MaskParams { uint resolution; uint tbins; float lim_pad; uint cell_order; } mask_params;
+/* entry[(bin * tbins + q) * 2 * words + w] as uvec2 (low, high) */
+layout(set = 0, binding = 10, std430) readonly buffer MaskTable { uvec2 values[]; } mask_table;
+/* per-invocation parking space: center * PENDING * words uvec2 + center * PENDING uint */
+layout(set = 0, binding = 11, std430) buffer MaskPending { uvec2 values[]; } pending_words;
+layout(set = 0, binding = 12, std430) buffer MaskPendingSlot { uint values[]; } pending_slot;
+
+layout(push_constant) uniform Parameters {
+    uint atom_count;
+    uint point_count;
+    uint center_count;
+    uint base_index;
+    uint dim_x;
+    uint dim_y;
+    uint dim_z;
+#ifdef FASTSASA_FP64
+    double probe_radius;
+    double cell_size;
+    double min_x;
+    double min_y;
+    double min_z;
+    double margin;
+#else
+    float probe_radius;
+    float cell_size;
+    float min_x;
+    float min_y;
+    float min_z;
+    float margin;
+#endif
+} params;
+
+#ifdef FASTSASA_FP64
+#define Real double
+#define Vec3 dvec3
+#else
+#define Real float
+#define Vec3 vec3
+#endif
+
+uvec2 and_not(uvec2 a, uvec2 b) { return uvec2(a.x & ~b.x, a.y & ~b.y); }
+uvec2 and2(uvec2 a, uvec2 b) { return uvec2(a.x & b.x, a.y & b.y); }
+bool any2(uvec2 a) { return (a.x | a.y) != 0u; }
+
+/* The exact test of sr_cell_list.comp for one point against one neighbour. */
+bool point_buried(Vec3 center, Real expanded_radius, uint p, Vec3 nbr, Real nbr_radius2,
+                  vec3 center_f, float radius_f, vec3 nbr_f, float nbr_radius2_f)
+{
+#ifdef FASTSASA_FP64
+    precise Vec3 point = center + sphere_points.values[p].xyz * expanded_radius;
+    precise Vec3 delta = point - nbr;
+    precise Real distance2 = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+    return distance2 < nbr_radius2;
+#else
+    /* the FP32 shader tests on the shadow: point_f = point - min, dot < r2f */
+    const vec3 point_f = center_f + sphere_points.values[p].xyz * radius_f;
+    const vec3 delta_f = point_f - nbr_f;
+    return dot(delta_f, delta_f) < nbr_radius2_f;
+#endif
+}
+
+void main()
+{
+    const uint output_index = gl_GlobalInvocationID.x + params.base_index;
+    if (output_index >= params.center_count) return;
+    /* Over all atoms, take them in cell-list order so a subgroup's atoms
+     * share a neighbourhood; with a centre selection, in the given order. */
+    const uint atom_index = mask_params.cell_order != 0u ? uint(cell_atoms.values[output_index])
+                                                          : centers.values[output_index];
+    const uint W = uint(SR_MASK_WORDS);
+    const uint n_points = params.point_count;
+
+#ifdef FASTSASA_FP64
+    const dvec4 atom = atoms.values[atom_index];
+    const double expanded_radius = atom.w + params.probe_radius;
+    const dvec3 center = atom.xyz;
+    const vec3 center_f = vec3(atom.xyz - dvec3(params.min_x, params.min_y, params.min_z));
+    const float radius_f = float(expanded_radius);
+    const double radius2 = expanded_radius * expanded_radius;
+#else
+    const vec4 atom = atoms.values[atom_index];
+    const float expanded_radius = atom.w + params.probe_radius;
+    const vec3 center = atom.xyz;
+    const vec3 center_f = atom.xyz - vec3(params.min_x, params.min_y, params.min_z);
+    const float radius_f = expanded_radius;
+    const float radius2 = expanded_radius * expanded_radius;
+#endif
+    const float radius2_f = float(radius2);
+    const float inv_two_r = 1.0 / (2.0 * radius_f);
+    const float res_half = 0.5 * float(mask_params.resolution);
+    const int res_max = int(mask_params.resolution) - 1;
+    const float lim_hi = 1.0 + mask_params.lim_pad;
+    const float lim_lo = -1.0 - mask_params.lim_pad;
+    const uint tbins = mask_params.tbins;
+
+    const Vec3 relative = (center - Vec3(params.min_x, params.min_y, params.min_z)) / params.cell_size;
+    const ivec3 my_cell = clamp(ivec3(floor(relative)), ivec3(0),
+                                ivec3(int(params.dim_x) - 1, int(params.dim_y) - 1, int(params.dim_z) - 1));
+    const ivec3 leader = subgroupBroadcastFirst(my_cell);
+    const bool near_leader = all(lessThanEqual(abs(my_cell - leader), ivec3(1)));
+    const bool all_near = subgroupAll(near_leader);
+    const int span = all_near ? 2 : 1;
+    const ivec3 block = all_near ? leader : my_cell;
+
+    uvec2 visible[SR_MASK_WORDS];
+    for (uint w = 0u; w < W; ++w) visible[w] = uvec2(0xffffffffu);
+    {
+        const uint rest = n_points - 64u * (W - 1u);
+        if (rest < 64u) {
+            visible[W - 1u] = rest >= 32u ? uvec2(0xffffffffu, (1u << (rest - 32u)) - 1u)
+                                          : uvec2((1u << rest) - 1u, 0u);
+        }
+    }
+    const uint pend_base = output_index * uint(SR_MASK_PENDING);
+    uint n_pending = 0u;
+    bool buried_all = false;
+    bool any_visible = true;
+
+    for (int dz = -span; dz <= span && !buried_all; ++dz) {
+        const int iz = block.z + dz;
+        if (iz < 0 || iz >= int(params.dim_z)) continue;
+        for (int dy = -span; dy <= span && !buried_all; ++dy) {
+            const int iy = block.y + dy;
+            if (iy < 0 || iy >= int(params.dim_y)) continue;
+            const int ix0 = max(block.x - span, 0);
+            const int ix1 = min(block.x + span, int(params.dim_x) - 1);
+            const uint first = uint(cell_offsets.values[uint(ix0) + params.dim_x * (uint(iy) + params.dim_y * uint(iz))]);
+            const uint last = uint(cell_offsets.values[uint(ix1) + params.dim_x * (uint(iy) + params.dim_y * uint(iz)) + 1u]);
+            for (uint slot = first; slot < last && !buried_all; ++slot) {
+                const int other = cell_atoms.values[slot];
+                if (uint(other) == atom_index || !any_visible) continue;
+                const vec4 shadow = atoms_f_sorted.values[slot];
+                const vec3 v = shadow.xyz - center_f;
+                const float d2 = dot(v, v);
+                /* conservative overlap prefilter in float (rf + rjf)^2 with pad */
+                const float reach = radius_f + sqrt(shadow.w);
+                if (!(d2 < reach * reach * 1.00001 + 1.0e-6)) continue;
+                if (d2 == 0.0) {
+                    /* coincident centre: every visible point is ambiguous */
+                    if (n_pending < uint(SR_MASK_PENDING)) {
+                        for (uint w = 0u; w < W; ++w) pending_words.values[(pend_base + n_pending) * W + w] = visible[w];
+                        pending_slot.values[pend_base + n_pending] = slot;
+                        ++n_pending;
+                    }
+                    continue;
+                }
+                const float inv_d = inversesqrt(d2);
+                const float t = ((radius2_f - shadow.w) + d2) * inv_two_r * inv_d;
+                if (t >= lim_hi) continue;
+                if (t <= lim_lo) { buried_all = true; break; }
+                const float inv_l1 = 1.0 / (abs(v.x) + abs(v.y) + abs(v.z));
+                const vec3 p = v * inv_l1;
+                vec2 uv = p.z >= 0.0 ? p.xy : vec2((1.0 - abs(p.y)) * (p.x >= 0.0 ? 1.0 : -1.0),
+                                                   (1.0 - abs(p.x)) * (p.y >= 0.0 ? 1.0 : -1.0));
+                const int bx = clamp(int((uv.x + 1.0) * res_half), 0, res_max);
+                const int by = clamp(int((uv.y + 1.0) * res_half), 0, res_max);
+                const int q = clamp(int((t + 1.0) * 0.5 * float(tbins)), 0, int(tbins) - 1);
+                const uint e = (uint(by * int(mask_params.resolution) + bx) * tbins + uint(q)) * 2u * W;
+                bool amb_any = false;
+                bool any = false;
+                uvec2 amb[SR_MASK_WORDS];
+                for (uint w = 0u; w < W; ++w) {
+                    const uvec2 vis = and_not(visible[w], mask_table.values[e + w]);
+                    amb[w] = and2(vis, mask_table.values[e + W + w]);
+                    amb_any = amb_any || any2(amb[w]);
+                    visible[w] = vis;
+                    any = any || any2(vis);
+                }
+                if (amb_any) {
+                    if (n_pending < uint(SR_MASK_PENDING)) {
+                        for (uint w = 0u; w < W; ++w) pending_words.values[(pend_base + n_pending) * W + w] = amb[w];
+                        pending_slot.values[pend_base + n_pending] = slot;
+                        ++n_pending;
+                    } else {
+                        /* no room to park: decide these points now, exactly */
+#ifdef FASTSASA_FP64
+                        const dvec4 nbr = atoms.values[other];
+                        const double nbr_radius = nbr.w + params.probe_radius;
+                        precise double nbr_radius2 = nbr_radius * nbr_radius;
+#else
+                        const vec4 nbr = atoms.values[other];
+                        const float nbr_radius2 = 0.0;
+#endif
+                        for (uint w = 0u; w < W; ++w) {
+                            uvec2 a = amb[w];
+                            for (uint hw = 0u; hw < 2u; ++hw) {
+                                uint bits = hw == 0u ? a.x : a.y;
+                                while (bits != 0u) {
+                                    const int bit = findLSB(bits);
+                                    bits &= bits - 1u;
+                                    const uint pt = w * 64u + hw * 32u + uint(bit);
+                                    if (point_buried(center, expanded_radius, pt, nbr.xyz, nbr_radius2,
+                                                     center_f, radius_f, shadow.xyz, shadow.w)) {
+                                        if (hw == 0u) visible[w].x &= ~(1u << bit); else visible[w].y &= ~(1u << bit);
+                                    }
+                                }
+                            }
+                        }
+                        any = false;
+                        for (uint w = 0u; w < W; ++w) any = any || any2(visible[w]);
+                    }
+                }
+                if (!any) any_visible = false;
+            }
+        }
+    }
+
+    uint exposed = 0u;
+    if (!buried_all && any_visible) {
+        for (uint qi = 0u; qi < n_pending; ++qi) {
+            const uint slot = pending_slot.values[pend_base + qi];
+            const int other = cell_atoms.values[slot];
+            const vec4 shadow = atoms_f_sorted.values[slot];
+#ifdef FASTSASA_FP64
+            const dvec4 nbr = atoms.values[other];
+            const double nbr_radius = nbr.w + params.probe_radius;
+            precise double nbr_radius2 = nbr_radius * nbr_radius;
+#else
+            const vec4 nbr = atoms.values[other];
+            const float nbr_radius2 = 0.0;
+#endif
+            for (uint w = 0u; w < W; ++w) {
+                const uvec2 a = and2(pending_words.values[(pend_base + qi) * W + w], visible[w]);
+                for (uint hw = 0u; hw < 2u; ++hw) {
+                    uint bits = hw == 0u ? a.x : a.y;
+                    while (bits != 0u) {
+                        const int bit = findLSB(bits);
+                        bits &= bits - 1u;
+                        const uint pt = w * 64u + hw * 32u + uint(bit);
+                        if (point_buried(center, expanded_radius, pt, nbr.xyz, nbr_radius2,
+                                         center_f, radius_f, shadow.xyz, shadow.w)) {
+                            if (hw == 0u) visible[w].x &= ~(1u << bit); else visible[w].y &= ~(1u << bit);
+                        }
+                    }
+                }
+            }
+        }
+        for (uint w = 0u; w < W; ++w) exposed += uint(bitCount(visible[w].x)) + uint(bitCount(visible[w].y));
+    }
+    /* In cell order the output slot for this atom is its own index (the
+     * host reads areas[center] with centers[center] == center). */
+    const uint out_slot = mask_params.cell_order != 0u ? atom_index : output_index;
+#ifdef FASTSASA_FP64
+    areas.values[out_slot] = double(exposed);
+#else
+    areas.values[out_slot] = float(exposed);
+#endif
+}

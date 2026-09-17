@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 
 STRUCTURES = ["tests/data/1ubq.pdb", "tests/data/3bkr.pdb", "tests/data/2isk.pdb"]
-CASES = [("SR", 100), ("SR", 500), ("LR", 10), ("LR", 20)]
+CASES = [("SR", 64), ("SR", 100), ("SR", 255), ("SR", 500), ("LR", 10), ("LR", 20)]
 ATOM_LINE = re.compile(r"(-?\d+\.\d{3})\s*(-?\d+\.\d{3})\s*(-?\d+\.\d{3})\s+(\d+\.\d{2})\s+(-?\d+\.\d{2})")
 
 

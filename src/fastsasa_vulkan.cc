@@ -38,6 +38,14 @@ namespace {
 #include "fastsasa_vk_lee_richards_cell_fp64_spv.h"
 #include "fastsasa_vk_lee_richards_reduce_fp64_spv.h"
 #include "fastsasa_vk_sr_exposed_points_fp64_64_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w1_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w1_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w2_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w2_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w3_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w3_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w4_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w4_spv.h"
 
 constexpr uint32_t kBinThreads = 128;
 constexpr uint32_t kSrThreads = 64;
@@ -253,6 +261,18 @@ struct fastsasa_vk_context {
     VkShaderModule lr_fp64_shader = VK_NULL_HANDLE;
     VkShaderModule lr_reduce_fp64_shader = VK_NULL_HANDLE;
     VkShaderModule sr_exposed_points_fp64_shader = VK_NULL_HANDLE;
+    /* mask-accelerated SR: [fp32/fp64][words-1] */
+    VkShaderModule sr_mask_shader[2][4]{};
+    VkPipeline sr_mask_pipeline[2][4]{};
+    bool mask_sr = false;                 /* device can run the mask shaders */
+    bool mask_sr_active = false;          /* the current dispatch uses one */
+    Buffer mask_params;
+    Buffer mask_table;
+    Buffer staging_mask_table;
+    Buffer mask_pending;
+    Buffer mask_pending_slot;
+    int mask_table_n_points = 0;
+    std::vector<double> mask_table_points;
     VkPipeline count_pipeline = VK_NULL_HANDLE;
     VkPipeline scan_pipeline = VK_NULL_HANDLE;
     VkPipeline fill_pipeline = VK_NULL_HANDLE;
@@ -540,6 +560,18 @@ void initialize(fastsasa_vk_context *context, int device_index)
                                context->properties.limits.maxComputeWorkGroupInvocations >= 256u &&
                                context->properties.limits.maxComputeWorkGroupSize[0] >= 256u;
     }
+    {
+        const VkSubgroupFeatureFlags needed = VK_SUBGROUP_FEATURE_BASIC_BIT |
+                                              VK_SUBGROUP_FEATURE_VOTE_BIT |
+                                              VK_SUBGROUP_FEATURE_BALLOT_BIT;
+        context->mask_sr = (subgroup.supportedOperations & needed) == needed &&
+                           (subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
+                           subgroup.subgroupSize >= 4u &&
+                           context->properties.limits.maxComputeWorkGroupInvocations >= 64u;
+        if (const char *value = std::getenv("FASTSASA_VK_SR_KERNEL")) {
+            if (std::strcmp(value, "reference") == 0) context->mask_sr = false;
+        }
+    }
     if (context->properties.limits.maxPushConstantsSize < sizeof(ParametersT<double>) ||
         context->properties.limits.maxComputeWorkGroupInvocations < kBinThreads ||
         context->properties.limits.maxComputeWorkGroupSize[0] < kBinThreads) {
@@ -560,8 +592,8 @@ void initialize(fastsasa_vk_context *context, int device_index)
           "vkCreateDevice");
     vkGetDeviceQueue(context->device, context->queue_family, 0, &context->queue);
 
-    VkDescriptorSetLayoutBinding bindings[9]{};
-    for (uint32_t i = 0; i < 9; ++i) {
+    VkDescriptorSetLayoutBinding bindings[13]{};
+    for (uint32_t i = 0; i < 13; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
@@ -569,7 +601,7 @@ void initialize(fastsasa_vk_context *context, int device_index)
     }
     VkDescriptorSetLayoutCreateInfo descriptor_info{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    descriptor_info.bindingCount = 9;
+    descriptor_info.bindingCount = 13;
     descriptor_info.pBindings = bindings;
     check(vkCreateDescriptorSetLayout(context->device, &descriptor_info, nullptr,
                                       &context->descriptor_layout),
@@ -612,6 +644,16 @@ void initialize(fastsasa_vk_context *context, int device_index)
     context->gather_pipeline = make_pipeline(context, context->gather_shader);
     context->sr32_pipeline = make_pipeline(context, context->sr32_shader);
     context->sr64_pipeline = make_pipeline(context, context->sr64_shader);
+    if (context->mask_sr) {
+        const unsigned char *fp32_blobs[4] = {fastsasa_vk_sr_mask_fp32_w1_spv, fastsasa_vk_sr_mask_fp32_w2_spv,
+                                              fastsasa_vk_sr_mask_fp32_w3_spv, fastsasa_vk_sr_mask_fp32_w4_spv};
+        const unsigned int fp32_lens[4] = {fastsasa_vk_sr_mask_fp32_w1_spv_len, fastsasa_vk_sr_mask_fp32_w2_spv_len,
+                                           fastsasa_vk_sr_mask_fp32_w3_spv_len, fastsasa_vk_sr_mask_fp32_w4_spv_len};
+        for (int w = 0; w < 4; ++w) {
+            context->sr_mask_shader[0][w] = make_shader(context, fp32_blobs[w], fp32_lens[w]);
+            context->sr_mask_pipeline[0][w] = make_pipeline(context, context->sr_mask_shader[0][w]);
+        }
+    }
     if (context->subgroup_sr) context->sr_sg_pipeline = make_pipeline(context, context->sr_sg_shader);
     context->lr_pipeline = make_pipeline(context, context->lr_shader);
     context->lr_reduce_pipeline = make_pipeline(context, context->lr_reduce_shader);
@@ -650,11 +692,21 @@ void initialize(fastsasa_vk_context *context, int device_index)
         context->sr_exposed_points_fp64_shader = make_shader(
             context, fastsasa_vk_sr_exposed_points_fp64_64_spv,
             fastsasa_vk_sr_exposed_points_fp64_64_spv_len);
+        if (context->mask_sr) {
+            const unsigned char *fp64_blobs[4] = {fastsasa_vk_sr_mask_fp64_w1_spv, fastsasa_vk_sr_mask_fp64_w2_spv,
+                                                  fastsasa_vk_sr_mask_fp64_w3_spv, fastsasa_vk_sr_mask_fp64_w4_spv};
+            const unsigned int fp64_lens[4] = {fastsasa_vk_sr_mask_fp64_w1_spv_len, fastsasa_vk_sr_mask_fp64_w2_spv_len,
+                                               fastsasa_vk_sr_mask_fp64_w3_spv_len, fastsasa_vk_sr_mask_fp64_w4_spv_len};
+            for (int w = 0; w < 4; ++w) {
+                context->sr_mask_shader[1][w] = make_shader(context, fp64_blobs[w], fp64_lens[w]);
+                context->sr_mask_pipeline[1][w] = make_pipeline(context, context->sr_mask_shader[1][w]);
+            }
+        }
         context->sr_exposed_points_fp64_pipeline = make_pipeline(
             context, context->sr_exposed_points_fp64_shader);
     }
 
-    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9};
+    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 13};
     VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pool_info.maxSets = 1;
     pool_info.poolSizeCount = 1;
@@ -686,13 +738,22 @@ void initialize(fastsasa_vk_context *context, int device_index)
 
 void update_descriptors(fastsasa_vk_context *context)
 {
-    Buffer *buffers[9] = {&context->atoms, &context->points, &context->heads,
-                          &context->next, &context->centers, &context->areas,
-                          &context->atoms_shadow, &context->cell_counts,
-                          &context->atoms_shadow_sorted};
-    VkDescriptorBufferInfo infos[9]{};
-    VkWriteDescriptorSet writes[9]{};
-    for (uint32_t i = 0; i < 9; ++i) {
+    Buffer *buffers[13] = {&context->atoms, &context->points, &context->heads,
+                           &context->next, &context->centers, &context->areas,
+                           &context->atoms_shadow, &context->cell_counts,
+                           &context->atoms_shadow_sorted,
+                           &context->mask_params, &context->mask_table,
+                           &context->mask_pending, &context->mask_pending_slot};
+    /* the mask buffers may not exist yet; bind a valid placeholder then */
+    for (uint32_t i = 9; i < 13; ++i) {
+        if (buffers[i]->handle == VK_NULL_HANDLE) {
+            ensure_buffer(context, buffers[i], 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        }
+    }
+    VkDescriptorBufferInfo infos[13]{};
+    VkWriteDescriptorSet writes[13]{};
+    for (uint32_t i = 0; i < 13; ++i) {
         infos[i] = {buffers[i]->handle, 0, buffers[i]->capacity};
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = context->descriptor_set;
@@ -701,13 +762,85 @@ void update_descriptors(fastsasa_vk_context *context)
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &infos[i];
     }
-    vkUpdateDescriptorSets(context->device, 9, writes, 0, nullptr);
+    vkUpdateDescriptorSets(context->device, 13, writes, 0, nullptr);
+}
+
+
+/* Mask-shader resources: the direction table (uploaded once per point set,
+ * with its own small submission), the parameter block, and per-invocation
+ * parking space. Must run before update_descriptors() for a dispatch that
+ * will select a mask pipeline. Returns false when the table is unavailable
+ * (the caller then falls back to the reference shaders). */
+bool prepare_mask_resources(fastsasa_vk_context *context,
+                            uint32_t point_count,
+                            const double *sphere_xyz,
+                            uint32_t center_count,
+                            bool cell_order)
+{
+    if (!context->mask_sr || point_count == 0u || point_count > 255u || sphere_xyz == nullptr) return false;
+    const uint32_t words = (point_count + 63u) / 64u;
+    const VkMemoryPropertyFlags device_memory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    const VkMemoryPropertyFlags host_memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const bool same_points =
+        context->mask_table.handle != VK_NULL_HANDLE &&
+        context->mask_table_n_points == static_cast<int>(point_count) &&
+        context->mask_table_points.size() == 3u * point_count &&
+        std::memcmp(context->mask_table_points.data(), sphere_xyz, sizeof(double) * 3u * point_count) == 0;
+    fastsasa_cpu_mask_table_view view{};
+    void *handle = fastsasa_cpu_mask_table_acquire(static_cast<int>(point_count), sphere_xyz, &view);
+    if (handle == nullptr) return false;
+    struct MaskParams { uint32_t resolution, tbins; float lim_pad; uint32_t cell_order; };
+    MaskParams params{static_cast<uint32_t>(view.resolution), static_cast<uint32_t>(view.threshold_bins),
+                      static_cast<float>(view.max_delta + view.dot_pad), cell_order ? 1u : 0u};
+    ensure_buffer(context, &context->mask_params, sizeof(MaskParams),
+                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, host_memory);
+    std::memcpy(context->mask_params.mapped, &params, sizeof(params));
+    ensure_buffer(context, &context->mask_pending, sizeof(uint64_t) * 32u * words * center_count,
+                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, device_memory);
+    ensure_buffer(context, &context->mask_pending_slot, sizeof(uint32_t) * 32u * center_count,
+                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, device_memory);
+    if (!same_points) {
+        const VkDeviceSize bytes = sizeof(uint64_t) * view.entry_count;
+        ensure_buffer(context, &context->staging_mask_table, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, host_memory);
+        ensure_buffer(context, &context->mask_table, bytes,
+                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, device_memory);
+        std::memcpy(context->staging_mask_table.mapped, view.entry, bytes);
+        check(vkResetCommandBuffer(context->command, 0), "vkResetCommandBuffer");
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(vkBeginCommandBuffer(context->command, &begin), "vkBeginCommandBuffer");
+        VkBufferCopy copy{0, 0, bytes};
+        vkCmdCopyBuffer(context->command, context->staging_mask_table.handle, context->mask_table.handle, 1, &copy);
+        check(vkEndCommandBuffer(context->command), "vkEndCommandBuffer");
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &context->command;
+        check(vkQueueSubmit(context->queue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit");
+        check(vkQueueWaitIdle(context->queue), "vkQueueWaitIdle");
+        context->mask_table_n_points = static_cast<int>(point_count);
+        context->mask_table_points.assign(sphere_xyz, sphere_xyz + 3u * point_count);
+    }
+    fastsasa_cpu_mask_table_release(handle);
+    return true;
 }
 
 VkPipeline select_sr_pipeline(fastsasa_vk_context *context,
                               uint32_t point_count,
                               bool use_fp64)
 {
+    context->mask_sr_active = false;
+    if (context->mask_sr && point_count >= 1u && point_count <= 255u &&
+        context->mask_table.handle != VK_NULL_HANDLE) {
+        const uint32_t words = (point_count + 63u) / 64u;
+        VkPipeline pipeline = context->sr_mask_pipeline[use_fp64 ? 1 : 0][words - 1u];
+        if (pipeline != VK_NULL_HANDLE) {
+            context->mask_sr_active = true;
+            context->sr_workgroup_size = 64u;
+            context->sr_atoms_per_group = 64u;   /* one atom per invocation */
+            return pipeline;
+        }
+    }
     context->sr_workgroup_size =
         context->subgroup_size > 0 && context->subgroup_size <= 32 && point_count <= 32
             ? 32u
@@ -946,6 +1079,10 @@ int calculate(fastsasa_vk_context *context,
                     sizeof(Vec4T<Real>) * points.size());
         std::memcpy(context->staging_centers.mapped, centers.data(),
                     sizeof(uint32_t) * center_count);
+        if (!lee_richards) {
+            prepare_mask_resources(context, point_count, sphere_xyz, center_count,
+                                   requested_centers == nullptr && center_count == atom_count);
+        }
         update_descriptors(context);
 
         const ParametersT<Real> parameters{
@@ -1242,6 +1379,10 @@ int calculate_frames(fastsasa_vk_context *context,
                     sizeof(Vec4T<Real>) * points.size());
         std::memcpy(context->staging_centers.mapped, centers.data(),
                     sizeof(uint32_t) * center_count);
+        if (!lee_richards) {
+            prepare_mask_resources(context, resolution, sphere_xyz, center_count,
+                                   requested_centers == nullptr && center_count == atom_count);
+        }
         update_descriptors(context);
 
         const auto profile_t1 = std::chrono::steady_clock::now();
@@ -1652,6 +1793,15 @@ extern "C" void fastsasa_vk_context_free(fastsasa_vk_context *context)
     if (context == nullptr) return;
     if (context->device != VK_NULL_HANDLE) vkDeviceWaitIdle(context->device);
     destroy_buffer(context, &context->staging_atoms_shadow);
+    destroy_buffer(context, &context->mask_params);
+    destroy_buffer(context, &context->mask_table);
+    destroy_buffer(context, &context->staging_mask_table);
+    destroy_buffer(context, &context->mask_pending);
+    destroy_buffer(context, &context->mask_pending_slot);
+    for (int pr = 0; pr < 2; ++pr) for (int w = 0; w < 4; ++w) {
+        if (context->sr_mask_pipeline[pr][w] != VK_NULL_HANDLE) vkDestroyPipeline(context->device, context->sr_mask_pipeline[pr][w], nullptr);
+        if (context->sr_mask_shader[pr][w] != VK_NULL_HANDLE) vkDestroyShaderModule(context->device, context->sr_mask_shader[pr][w], nullptr);
+    }
     destroy_buffer(context, &context->atoms_shadow);
     destroy_buffer(context, &context->staging_exposed_points);
     destroy_buffer(context, &context->exposed_points);
