@@ -106,6 +106,7 @@ class _Parameters(ctypes.Structure):
         ("probe_radius", ctypes.c_double),
         ("n_points", ctypes.c_int),
         ("algorithm", ctypes.c_int),
+        ("precision", ctypes.c_int),   # FASTSASA_PRECISION_FP64 = 0
     ]
 
 
@@ -119,6 +120,9 @@ def _uptr(arr):
 
 def _load_fastsasa_lib(library_path):
     lib = ctypes.CDLL(library_path)
+    lib.fastsasa_sizeof_parameters.restype = ctypes.c_size_t
+    if lib.fastsasa_sizeof_parameters() != ctypes.sizeof(_Parameters):
+        raise RuntimeError("fastsasa_parameters layout mismatch: update _Parameters")
     lib.fastsasa_cpu_calc_trajectory_soa.argtypes = [
         ctypes.POINTER(_Topology), ctypes.POINTER(_SoAFrames), ctypes.POINTER(_Parameters),
         ctypes.c_int, ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double),
