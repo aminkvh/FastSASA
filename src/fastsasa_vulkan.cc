@@ -51,9 +51,11 @@ namespace {
 constexpr uint32_t kBinThreads = 128;
 constexpr uint32_t kSrThreads = 64;
 /* Below this many centres per dispatch the point-parallel reference shaders
- * win (FASTSASA_MASK_MIN_CENTERS overrides it for other devices); below this
- * many centre-frames per context the table setup does not pay for itself.
- * Both measured on an RTX 4060 Ti. */
+ * win (FASTSASA_MASK_MIN_CENTERS overrides it); below this many centre-frames
+ * per context the table setup does not pay for itself. Both measured on an
+ * RTX 4060 Ti. Above them, which FP64 shader is faster depends on the device
+ * (on an RTX A5000 the FP64 mask shaders are slower), so each context times
+ * both once and keeps the faster; see mask_tuning. */
 constexpr uint32_t kMaskMinCenters = 2048u;
 constexpr uint64_t kMaskMinWork = 512u * 1024u;
 
@@ -212,6 +214,15 @@ VkPhysicalDevice select_device(VkInstance instance,
             /* FastSASA requires Vulkan 1.1 device behavior; probing 1.0-only
              * ICDs with 1.1 queries can crash old drivers. */
             if (properties.apiVersion < VK_API_VERSION_1_1) break;
+            /* Automatic selection never lands on a software rasterizer
+             * (llvmpipe, SwiftShader): the threaded CPU backend is several
+             * times faster on the same cores. An explicit Vulkan request
+             * still accepts it. */
+            if (requested_index == FASTSASA_VK_AUTO_HARDWARE &&
+                properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+                ++compute_index;
+                break;
+            }
             if (requested_index == compute_index) {
                 *queue_family = family;
                 *selected_properties = properties;
@@ -236,6 +247,10 @@ VkPhysicalDevice select_device(VkInstance instance,
         throw std::runtime_error("requested Vulkan compute device index is unavailable");
     }
     if (fallback == VK_NULL_HANDLE) {
+        if (requested_index == FASTSASA_VK_AUTO_HARDWARE && compute_index > 0) {
+            throw std::runtime_error("only a software Vulkan device is available (skipped in automatic mode; "
+                                     "use --backend vulkan to force it)");
+        }
         throw std::runtime_error("no Vulkan 1.1 compute queue found");
     }
     *queue_family = fallback_family;
@@ -286,6 +301,24 @@ struct fastsasa_vk_context {
     bool mask_sr_active = false;          /* the current dispatch uses one */
     bool mask_sr_ready = false;           /* prepared for the current dispatch */
     uint64_t mask_work = 0;               /* centre-frames dispatched so far */
+    /* Run-time FP64 choice between the mask and reference SR shaders, per
+     * (points, centre-count octave): the first eligible
+     * dispatch warms the mask path, the next two time reference then mask
+     * under a host timer, then the faster (per frame) is kept. Both give
+     * identical results, so the choice only affects speed. */
+    struct MaskTuning {
+        uint32_t key = 0;
+        int trials = 0;
+        double best_mask = 0.0;
+        double best_reference = 0.0;
+        int decision = -1;                /* -1 tuning, 0 reference, 1 mask */
+    };
+    std::vector<MaskTuning> mask_tuning;
+    int mask_trial = -1;                  /* mask_tuning index timed by this dispatch */
+    bool mask_trial_is_mask = false;
+    /* Measured Lee-Richards slice throughput (workgroups per second), FP32
+     * and FP64, used to size submissions; 0 until the first measurement. */
+    double lr_groups_per_second[2] = {0.0, 0.0};
     VkDeviceSize mask_table_upload_bytes = 0; /* staged table not yet copied */
     Buffer mask_params;
     Buffer mask_table;
@@ -337,6 +370,34 @@ struct fastsasa_vk_context {
 
 namespace {
 
+/* A dispatch the driver kills and then recovers from (an amdgpu ring
+ * timeout on a long Lee-Richards dispatch, for example) can still report
+ * VK_SUCCESS, with the results never copied back. The readback buffer is
+ * therefore filled with all-ones bytes before every submit, a bit pattern no
+ * result has (the NaN marker for CPU recompute is the canonical quiet NaN),
+ * and any survivor fails the call instead of returning stale or zero areas. */
+void poison_readback(Buffer *buffer,
+                     VkDeviceSize bytes)
+{
+    std::memset(buffer->mapped, 0xFF, static_cast<size_t>(bytes));
+}
+
+template <typename Real>
+void require_readback(const Real *values,
+                      size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        unsigned char bytes[sizeof(Real)];
+        std::memcpy(bytes, &values[i], sizeof(Real));
+        bool all_ones = true;
+        for (unsigned char byte : bytes) all_ones = all_ones && byte == 0xFFu;
+        if (all_ones) {
+            throw std::runtime_error("the GPU did not finish the calculation (driver timeout or device reset); "
+                                     "no results were returned");
+        }
+    }
+}
+
 void check_storage_range(const fastsasa_vk_context *context,
                          VkDeviceSize bytes,
                          const char *name)
@@ -355,14 +416,16 @@ template <typename Real>
 void dispatch_chunked(fastsasa_vk_context *context,
                       ParametersT<Real> parameters,
                       uint64_t total_groups,
-                      uint32_t indices_per_group)
+                      uint32_t indices_per_group,
+                      uint64_t first_group = 0)
 {
     const uint64_t group_limit =
         context->properties.limits.maxComputeWorkGroupCount[0];
-    uint64_t issued = 0;
-    while (issued < total_groups) {
+    const uint64_t end_group = first_group + total_groups;
+    uint64_t issued = first_group;
+    while (issued < end_group) {
         const uint32_t groups = static_cast<uint32_t>(
-            std::min<uint64_t>(total_groups - issued, group_limit));
+            std::min<uint64_t>(end_group - issued, group_limit));
         parameters.base_index =
             static_cast<uint32_t>(issued * indices_per_group);
         vkCmdPushConstants(context->command, context->pipeline_layout,
@@ -809,14 +872,66 @@ void update_descriptors(fastsasa_vk_context *context)
  * context, so the mask shaders also wait until the context has dispatched
  * enough centre-frames to pay for it, unless the table is already resident.
  * FASTSASA_VK_SR_KERNEL=mask forces them whenever they are available. */
+bool mask_tuning_enabled()
+{
+    const char *value = std::getenv("FASTSASA_VK_MASK_TUNE");
+    return value == nullptr || value[0] == '\0' || std::strcmp(value, "0") != 0;
+}
+
+/* Whether this dispatch should use the mask shaders, and whether it is a
+ * timed trial (context->mask_trial). Only FP64 is tuned: there the two
+ * shader families are bit-identical, so a timing-based choice can never
+ * change a result. The FP32 families round differently in the last digits,
+ * so FP32 keeps the fixed, reproducible rule (mask above the gates, where it
+ * was faster on every device measured). */
+bool mask_tuning_choose(fastsasa_vk_context *context,
+                        bool use_fp64,
+                        uint32_t point_count,
+                        uint32_t center_count)
+{
+    if (!use_fp64) return true;
+    uint32_t octave = 0;
+    while ((center_count >> octave) > 1u) ++octave;
+    const uint32_t key = point_count | (octave << 9);
+    size_t index = 0;
+    while (index < context->mask_tuning.size() && context->mask_tuning[index].key != key) ++index;
+    if (index == context->mask_tuning.size()) {
+        context->mask_tuning.emplace_back();
+        context->mask_tuning.back().key = key;
+    }
+    fastsasa_vk_context::MaskTuning &tuning = context->mask_tuning[index];
+    if (tuning.decision >= 0) return tuning.decision == 1;
+    const int trial = tuning.trials++;
+    if (trial == 0) return true;          /* warm-up: table upload, first use */
+    context->mask_trial = static_cast<int>(index);
+    context->mask_trial_is_mask = trial % 2 == 0;
+    return context->mask_trial_is_mask;
+}
+
+/* Records a timed trial; frame_count normalizes batched dispatches. */
+void mask_tuning_record(fastsasa_vk_context *context,
+                        double seconds,
+                        uint32_t frame_count)
+{
+    if (context->mask_trial < 0) return;
+    fastsasa_vk_context::MaskTuning &tuning = context->mask_tuning[static_cast<size_t>(context->mask_trial)];
+    const double per_frame = seconds / static_cast<double>(frame_count > 0u ? frame_count : 1u);
+    double &best = context->mask_trial_is_mask ? tuning.best_mask : tuning.best_reference;
+    if (best == 0.0 || per_frame < best) best = per_frame;
+    context->mask_trial = -1;
+    if (tuning.trials >= 3) tuning.decision = tuning.best_mask < tuning.best_reference ? 1 : 0;
+}
+
 bool prepare_mask_resources(fastsasa_vk_context *context,
                             uint32_t point_count,
                             const double *sphere_xyz,
                             uint32_t center_count,
                             uint32_t frame_count,
-                            bool cell_order)
+                            bool cell_order,
+                            bool use_fp64)
 {
     context->mask_sr_ready = false;
+    context->mask_trial = -1;
     if (!context->mask_sr || point_count == 0u || point_count > 255u || sphere_xyz == nullptr) return false;
     const bool same_points =
         context->mask_table.handle != VK_NULL_HANDLE &&
@@ -829,6 +944,9 @@ bool prepare_mask_resources(fastsasa_vk_context *context,
     if (!forced) {
         if (center_count < mask_min_centers()) return false;
         if (!same_points && context->mask_work < kMaskMinWork) return false;
+        if (mask_tuning_enabled() && !mask_tuning_choose(context, use_fp64, point_count, center_count)) {
+            return false;
+        }
     }
     const uint32_t words = (point_count + 63u) / 64u;
     const VkMemoryPropertyFlags device_memory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -919,9 +1037,10 @@ VkPipeline select_sr_pipeline(fastsasa_vk_context *context,
 }
 
 /*
- * FP64 Lee-Richards slices that need more arcs than the shader's local
- * buffer are written as NaN; those atoms are recomputed here with the CPU
- * reference itself, so the Vulkan result stays bit-identical to it.
+ * Lee-Richards slices that need more arcs than the shader's local buffer
+ * are written as NaN, as are slices of a submission the driver stopped (the
+ * slice buffer is prefilled with NaN); those atoms are recomputed here with
+ * the CPU reference itself, so FP64 results stay bit-identical to it.
  */
 static void
 recompute_nan_lee_richards(const double *xyz,
@@ -933,33 +1052,101 @@ recompute_nan_lee_richards(const double *xyz,
                            uint32_t center_count,
                            double *sasa)
 {
-    std::vector<double> x, y, z, expanded;
+    std::vector<int> pending_slots, pending_atoms;
+    std::vector<double> x, y, z, expanded, areas;
 
     for (uint32_t center = 0; center < center_count; ++center) {
-        double area = 0.0;
-
         if (!std::isnan(sasa[center])) continue;
-        if (x.empty()) {
-            x.resize(atom_count);
-            y.resize(atom_count);
-            z.resize(atom_count);
-            expanded.resize(atom_count);
-            for (uint32_t atom = 0; atom < atom_count; ++atom) {
-                x[atom] = xyz[3u * atom];
-                y[atom] = xyz[3u * atom + 1u];
-                z[atom] = xyz[3u * atom + 2u];
-                expanded[atom] = radii[atom] + probe_radius;
-            }
+        pending_slots.push_back(static_cast<int>(center));
+        pending_atoms.push_back(static_cast<int>(centers[center]));
+    }
+    if (pending_atoms.empty()) return;
+    x.resize(atom_count);
+    y.resize(atom_count);
+    z.resize(atom_count);
+    expanded.resize(atom_count);
+    for (uint32_t atom = 0; atom < atom_count; ++atom) {
+        x[atom] = xyz[3u * atom];
+        y[atom] = xyz[3u * atom + 1u];
+        z[atom] = xyz[3u * atom + 2u];
+        expanded[atom] = radii[atom] + probe_radius;
+    }
+    areas.resize(pending_atoms.size());
+    if (fastsasa_cpu_lee_richards_centers(static_cast<int>(atom_count), static_cast<int>(slice_count),
+                                          x.data(), y.data(), z.data(), expanded.data(), 0,
+                                          pending_atoms.data(), static_cast<int>(pending_atoms.size()),
+                                          areas.data()) != 0) {
+        throw std::runtime_error("host Lee-Richards recompute failed");
+    }
+    for (size_t i = 0; i < pending_slots.size(); ++i) sasa[pending_slots[i]] = areas[i];
+}
+
+/* Target GPU time per submission for Lee-Richards slices, well below the
+ * driver watchdogs (amdgpu resets a ring after about 2-10 s and reports no
+ * error), and the smallest first submission when nothing has been measured. */
+constexpr double kLrSubmitSeconds = 0.1;
+constexpr uint64_t kLrFirstSubmitGroups = 256;
+
+/* Records the Lee-Richards slice dispatch into the open command buffer, but
+ * splits it over several queue submissions when one would run long: each
+ * submission is sized from the throughput measured on this device, and every
+ * one but the last is submitted and waited for here, leaving the command
+ * buffer open after the final part. Fast GPUs end up with one or two
+ * submissions per frame; slow ones (integrated GPUs in FP64) stay under the
+ * watchdog. Results do not depend on the split. */
+template <typename Real>
+void record_lee_richards_slices(fastsasa_vk_context *context,
+                                const ParametersT<Real> &parameters,
+                                uint64_t total_groups,
+                                bool use_fp64)
+{
+    double &rate = context->lr_groups_per_second[use_fp64 ? 1 : 0];
+    uint64_t done = 0;
+
+    for (;;) {
+        uint64_t groups = total_groups - done;
+        if (rate > 0.0) {
+            groups = std::min<uint64_t>(groups, std::max<uint64_t>(
+                kLrFirstSubmitGroups, static_cast<uint64_t>(rate * kLrSubmitSeconds)));
+        } else {
+            groups = std::min<uint64_t>(groups, kLrFirstSubmitGroups);
         }
-        if (fastsasa_cpu_lee_richards_atom(static_cast<int>(atom_count),
-                                         static_cast<int>(slice_count),
-                                         x.data(), y.data(), z.data(),
-                                         expanded.data(),
-                                         static_cast<int>(centers[center]),
-                                         &area) != 0) {
-            throw std::runtime_error("host Lee-Richards recompute failed");
-        }
-        sasa[center] = area;
+        dispatch_chunked(context, parameters, groups, kSrThreads, done);
+        done += groups;
+        if (done >= total_groups) return;
+
+        check(vkEndCommandBuffer(context->command), "vkEndCommandBuffer");
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &context->command;
+        const auto start = std::chrono::steady_clock::now();
+        check(vkQueueSubmit(context->queue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit");
+        check(vkQueueWaitIdle(context->queue), "vkQueueWaitIdle");
+        const double seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        /* The first submission also carries the uploads and the cell list,
+         * so this rate errs low, which only makes later parts shorter. A
+         * part too short to time grows the next one sixteenfold. */
+        const double measured = static_cast<double>(groups) / std::max(seconds, 1.0e-6);
+        rate = seconds >= 1.0e-3 ? measured : std::max(rate, 16.0 * groups / kLrSubmitSeconds);
+
+        check(vkResetCommandBuffer(context->command, 0), "vkResetCommandBuffer");
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(vkBeginCommandBuffer(context->command, &begin), "vkBeginCommandBuffer");
+        /* Make the earlier submissions' buffer writes (cell list, slices)
+         * visible to this one. */
+        VkMemoryBarrier carry{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        carry.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        carry.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(context->command,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &carry, 0, nullptr, 0, nullptr);
+        vkCmdBindPipeline(context->command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          use_fp64 ? context->lr_fp64_pipeline : context->lr_pipeline);
+        vkCmdBindDescriptorSets(context->command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                context->pipeline_layout, 0, 1,
+                                &context->descriptor_set, 0, nullptr);
     }
 }
 
@@ -1134,7 +1321,7 @@ int calculate(fastsasa_vk_context *context,
                     sizeof(uint32_t) * center_count);
         if (!lee_richards) {
             prepare_mask_resources(context, point_count, sphere_xyz, center_count, 1u,
-                                   requested_centers == nullptr && center_count == atom_count);
+                                   requested_centers == nullptr && center_count == atom_count, use_fp64);
         }
         update_descriptors(context);
         const auto pt2 = std::chrono::steady_clock::now();
@@ -1189,12 +1376,23 @@ int calculate(fastsasa_vk_context *context,
         stamp(2);
 
         if (lee_richards) {
+            /* Every slice starts as all-ones bits (NaN in FP32 and FP64), so
+             * a slice whose submission never ran (a driver reset that still
+             * reports success) cannot pass as a real area: its atom is
+             * recomputed on the host (or the readback check fails the call). */
+            vkCmdFillBuffer(context->command, context->points.handle, 0, VK_WHOLE_SIZE, 0xFFFFFFFFu);
+            VkMemoryBarrier fill_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            fill_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            fill_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(context->command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fill_barrier,
+                                 0, nullptr, 0, nullptr);
             vkCmdBindPipeline(context->command, VK_PIPELINE_BIND_POINT_COMPUTE,
                               use_fp64 ? context->lr_fp64_pipeline
                                        : context->lr_pipeline);
             const uint64_t slices = static_cast<uint64_t>(center_count) * point_count;
-            dispatch_chunked(context, parameters,
-                             (slices + kSrThreads - 1u) / kSrThreads, kSrThreads);
+            record_lee_richards_slices(context, parameters, (slices + kSrThreads - 1u) / kSrThreads,
+                                       use_fp64);
             VkMemoryBarrier slice_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             slice_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             slice_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1239,10 +1437,12 @@ int calculate(fastsasa_vk_context *context,
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &context->command;
         const auto pt3 = std::chrono::steady_clock::now();
+        poison_readback(&context->staging_areas, sizeof(Real) * center_count);
         check(vkQueueSubmit(context->queue, 1, &submit, VK_NULL_HANDLE),
               "vkQueueSubmit");
         check(vkQueueWaitIdle(context->queue), "vkQueueWaitIdle");
         const auto pt4 = std::chrono::steady_clock::now();
+        mask_tuning_record(context, std::chrono::duration<double>(pt4 - pt2).count(), 1u);
         if (gpu_profile) {
             uint64_t ticks[5]{};
             if (vkGetQueryPoolResults(context->device, context->profile_pool, 0, 5, sizeof(ticks), ticks,
@@ -1254,6 +1454,7 @@ int calculate(fastsasa_vk_context *context,
             }
         }
         const Real *areas = static_cast<const Real *>(context->staging_areas.mapped);
+        require_readback(areas, center_count);
         for (uint32_t center = 0; center < center_count; ++center) {
             sasa[center] = lee_richards
                 ? static_cast<double>(areas[center])
@@ -1261,7 +1462,7 @@ int calculate(fastsasa_vk_context *context,
                                    radii[centers[center]], probe_radius,
                                    point_count);
         }
-        if (lee_richards && use_fp64) {
+        if (lee_richards) {
             recompute_nan_lee_richards(xyz, radii, atom_count, point_count, probe_radius,
                                        centers.data(), center_count, sasa);
         }
@@ -1299,6 +1500,20 @@ int calculate_frames(fastsasa_vk_context *context,
         (!lee_richards && sphere_xyz == nullptr)) {
         if (context != nullptr) context->error = "invalid frame arguments";
         return 1;
+    }
+    if (lee_richards) {
+        /* Lee-Richards frames run one at a time so each can be split into
+         * short submissions (see record_lee_richards_slices); the work per
+         * frame dwarfs what batching would save. */
+        for (uint32_t frame = 0; frame < frame_count; ++frame) {
+            if (calculate<Real>(context, frame_xyz + 3ull * static_cast<size_t>(frame) * atom_count,
+                                radii, atom_count, sphere_xyz, resolution, probe_radius,
+                                requested_centers, center_count,
+                                frame_sasa + static_cast<size_t>(frame) * center_count, true) != 0) {
+                return 1;
+            }
+        }
+        return 0;
     }
     try {
         const auto profile_t0 = std::chrono::steady_clock::now();
@@ -1483,7 +1698,7 @@ int calculate_frames(fastsasa_vk_context *context,
                     sizeof(uint32_t) * center_count);
         if (!lee_richards) {
             prepare_mask_resources(context, resolution, sphere_xyz, center_count, frame_count,
-                                   requested_centers == nullptr && center_count == atom_count);
+                                   requested_centers == nullptr && center_count == atom_count, use_fp64);
         }
         update_descriptors(context);
 
@@ -1572,12 +1787,16 @@ int calculate_frames(fastsasa_vk_context *context,
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &context->command;
+        poison_readback(&context->staging_areas,
+                        sizeof(Real) * static_cast<VkDeviceSize>(frame_count) * center_count);
         check(vkQueueSubmit(context->queue, 1, &submit, VK_NULL_HANDLE),
               "vkQueueSubmit");
         check(vkQueueWaitIdle(context->queue), "vkQueueWaitIdle");
         const auto profile_t2 = std::chrono::steady_clock::now();
+        mask_tuning_record(context, std::chrono::duration<double>(profile_t2 - profile_t1).count(), frame_count);
         const Real *areas = static_cast<const Real *>(context->staging_areas.mapped);
         const size_t result_count = static_cast<size_t>(frame_count) * center_count;
+        require_readback(areas, result_count);
         for (size_t result = 0; result < result_count; ++result) {
             frame_sasa[result] = lee_richards
                 ? static_cast<double>(areas[result])
@@ -1585,7 +1804,7 @@ int calculate_frames(fastsasa_vk_context *context,
                                    radii[centers[result % center_count]],
                                    probe_radius, resolution);
         }
-        if (lee_richards && use_fp64) {
+        if (lee_richards) {
             for (uint32_t frame = 0; frame < frame_count; ++frame) {
                 recompute_nan_lee_richards(
                     frame_xyz + 3ull * static_cast<size_t>(frame) * atom_count,

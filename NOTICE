@@ -1,47 +1,69 @@
 FastSASA Notices
-==============
+================
 
 FastSASA is a GPU-accelerated SASA implementation with Vulkan, CUDA, and
-threaded CPU backends. Its kernels, shaders, CPU fallback, trajectory
-engine, parsers, and command-line implementation are FastSASA-owned.
+threaded CPU backends. It builds on FreeSASA (Mitternacht S. FreeSASA: An open
+source C library for solvent accessible surface area calculations.
+F1000Research 2016, 5:189): FastSASA reproduces FreeSASA's formulation of
+the Shrake-Rupley and Lee-Richards calculations so that results agree with it,
+and it reuses FreeSASA data, output formats, and test fixtures as listed below.
+FastSASA binaries do not link libfreesasa.
 
-Bundled radius table
----------------------
+FreeSASA
+--------
 
-The standard residue/atom mappings in `share/protor.config`, and the same base
-mappings reused by `share/protor_glycans.config`, derive from the generated
-ProtOr configuration distributed by FreeSASA (Mitternacht S. FreeSASA: An
-open source C library for solvent accessible surface area calculations.
-F1000Research 2016, 5:189). The underlying ProtOr radii are from Tsai J,
-Taylor R, Chothia C, Gerstein M. J Mol Biol. 1999;290:253-266. The glycan
-mappings in
-`share/protor_glycans.config` are a FastSASA opt-in extension; that file is not
-an unmodified upstream file.
-The per-residue maximum-ASA reference table used for relative SASA
-(`--format rsa`, in `tools/fastsasa_cli.cc`) is FreeSASA's own ProtOr
-reference values, reproduced in FastSASA-native source rather than as a
-separate config file. FastSASA does not compile, link, or vendor the
-FreeSASA CPU implementation itself. It contains only the attributed reference
-data described above.
+Copyright (c) 2016 Simon Mitternacht. Distributed under the MIT License; the
+full text is kept in `licenses/FreeSASA-radii-table-MIT.txt` and must be
+included with source and binary redistributions that contain this material.
 
-Copyright (c) 2016 Simon Mitternacht
+Material from FreeSASA 2.1.3 in this repository:
 
-Distributed under the MIT License; the full text is kept in
-`licenses/FreeSASA-radii-table-MIT.txt` and must be included with source
-and binary redistributions that contain this material.
+- Radius table. The standard residue/atom mappings in `share/protor.config`
+  (also compiled into the library), and the same base mappings reused by
+  `share/protor_glycans.config`, are the generated ProtOr configuration
+  distributed by FreeSASA. The underlying ProtOr radii are from Tsai J,
+  Taylor R, Chothia C, Gerstein M. J Mol Biol. 1999;290:253-266. The glycan
+  mappings in `share/protor_glycans.config` are a FastSASA opt-in extension;
+  that file is not an unmodified upstream file.
+- Relative SASA references. The per-residue maximum-ASA values used for
+  relative SASA (`--format rsa`, in `tools/fastsasa_cli.cc`) are FreeSASA's
+  ProtOr reference values.
+- Output formats. The RSA, PDB (B-factor/REMARK), log, residue, and sequence
+  outputs and their messages in `tools/fastsasa_cli.cc` reproduce FreeSASA's
+  formats for drop-in compatibility.
+- Lee-Richards arc routine. The CPU, CUDA, and Vulkan Lee-Richards kernels
+  follow FreeSASA's `sasa_lr.c`: the same contact tests in the same order and
+  the same arc wrapping (including its `inf`/`sup` naming).
+- Tables and reference values. The backbone atom list in
+  `tools/fastsasa_cli.cc`, the mmCIF column table in `src/gemmi_topology.cc`,
+  and the 1UBQ reference values in `tests/cli_validation.py` come from
+  FreeSASA.
+- Test fixtures. The structure files in `tests/data/` (other than the 1UBQ
+  XTC/DCD trajectories noted below) are FreeSASA 2.1.3's test fixtures,
+  unmodified.
+
+The benchmark tooling in `tools/manuscript_benchmark_2026_freesasa_driver/`
+downloads FreeSASA 2.1.3, applies a small patch (a NULL-pointer check for
+isolated atoms), and links it, for comparisons only; it is not part of the
+FastSASA library or binaries.
 
 FreeBSD msun / musl (acos, atan, atan2)
 ---------------------------------------
 
-`src/fastsasa_exact_math.h` contains double-precision acos, atan and atan2
-routines derived from the FreeBSD msun sources (e_acos.c, s_atan.c,
-e_atan2.c) as distributed by musl. They are compiled for both the CPU
-reference and the CUDA FP64 kernels so both produce bit-identical results.
+`src/fastsasa_exact_math.h` (CPU reference and CUDA FP64 kernels) and
+`shaders/vulkan/lee_richards_cell.comp` (Vulkan FP64 Lee-Richards shader,
+embedded as SPIR-V in every Vulkan-enabled binary) contain double-precision
+acos, atan and atan2 routines derived from the FreeBSD msun sources
+(e_acos.c, s_atan.c, e_atan2.c) as distributed by musl. All backends run the
+same operation sequence, so their FP64 results are bit-identical.
 
 Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
 Developed at SunPro/SunSoft, a Sun Microsystems, Inc. business.
 Permission to use, copy, modify, and distribute this software is freely
-granted, provided that this notice is preserved.
+granted, provided that this notice is preserved. (`licenses/SunPro.txt`)
+
+musl is Copyright (c) 2005-2020 Rich Felker, et al., distributed under the
+MIT License (`licenses/musl-MIT.txt`).
 
 Gemmi
 -----
@@ -68,12 +90,25 @@ load the Vulkan runtime dynamically. volk is distributed under the MIT
 license; the full text is kept in `licenses/volk-MIT.md` in FastSASA release
 packages and `third-party/volk/LICENSE.md` in the development checkout.
 
+xdrfile (XTC reader)
+--------------------
+
+`third-party/xdrfile/` vendors the xdrfile library (Copyright (c) 2009-2014,
+Erik Lindahl & David van der Spoel; BSD 2-Clause License) as distributed with
+MDTraj, for the built-in XTC reader. It includes a modified version of the Sun
+XDR routines with Sun's original legend. The full texts are in
+`licenses/xdrfile-BSD-2-Clause.txt` and `third-party/xdrfile/LICENSE.txt`.
+FastSASA adds one accessor, `xdrfile_get_fp()`, and bounds checks that reject
+corrupt frames; nothing else is changed.
+
 Validation fixtures
 -------------------
 
-The repository includes small PDB/mmCIF validation fixtures for parser,
-selection, and numerical regression tests. Keep their original metadata intact
-when redistributing source archives.
+The PDB/mmCIF files in `tests/data/` are FreeSASA's test fixtures (see the
+FreeSASA section above); the structures themselves are public PDB entries.
+`tests/data/1ubq_5frames.*` and `tests/data/1ubq_4atoms.*` are small
+FastSASA-generated XTC/DCD trajectories derived from 1UBQ.
+Keep their original metadata intact when redistributing source archives.
 
 CUDA
 ----

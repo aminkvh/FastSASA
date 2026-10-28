@@ -31,7 +31,73 @@ _VDW_RADII = {
     "CL": 1.75,
     "BR": 1.85,
     "I": 1.98,
+    "NA": 2.27,
+    "MG": 1.73,
+    "K": 2.75,
+    "CA": 2.31,
+    "FE": 1.80,
+    "ZN": 1.39,
 }
+
+# Standard atomic weights for element_from_mass(); mirrors
+# fastsasa_element_from_mass() in src/fastsasa_radius.c.
+_ATOMIC_WEIGHTS = {
+    "C": 12.011, "N": 14.007, "O": 15.999, "F": 18.998, "NA": 22.990,
+    "MG": 24.305, "P": 30.974, "S": 32.06, "CL": 35.45, "K": 39.098,
+    "CA": 40.078, "MN": 54.938, "FE": 55.845, "CO": 58.933, "NI": 58.693,
+    "CU": 63.546, "ZN": 65.38, "SE": 78.971, "BR": 79.904, "I": 126.904,
+}
+_HYDROGEN_MASS_LIMIT = 4.5
+_MASS_TOLERANCE = 0.1
+# Hydrogen mass repartitioning moves this much mass from a heavy atom to each
+# bonded hydrogen.
+_HMR_SHIFT = 2.016
+_MAX_HMR_HYDROGENS = 3
+
+
+def _name_element(atom_name):
+    """Element guessed from an atom name, as fastsasa_infer_element() does."""
+
+    name = str(atom_name or "")
+    for index, ch in enumerate(name):
+        if ch.isalpha():
+            second = name[index + 1] if index + 1 < len(name) and name[index + 1].isalpha() else ""
+            pair = (ch + second).upper()
+            if pair in ("CL", "BR", "NA", "MG", "FE", "ZN", "CA"):
+                return pair
+            return ch.upper()
+    return ""
+
+
+def element_from_mass(mass, atom_name=None):
+    """Return the element symbol for a topology mass, or ``None``.
+
+    Masses below 4.5 are hydrogen, including repartitioned hydrogens (HMR).
+    Heavy atoms that gave mass to their hydrogens are matched too, with the
+    atom name deciding between candidate elements. Force-field topologies
+    (PSF) store atom types, not elements, so the mass is the reliable source
+    of the element.
+    """
+
+    mass = float(mass)
+    if not mass >= 0.9:
+        return None
+    if mass < _HYDROGEN_MASS_LIMIT:
+        return "H"
+    named = _name_element(atom_name)
+    first = named[:1]
+    exact = shifted = None
+    for k in range(_MAX_HMR_HYDROGENS + 1):
+        for element, weight in _ATOMIC_WEIGHTS.items():
+            if abs(mass - (weight - k * _HMR_SHIFT)) >= _MASS_TOLERANCE:
+                continue
+            if element in (named, first):
+                return element
+            if k == 0 and exact is None:
+                exact = element
+            if k > 0 and shifted is None:
+                shifted = element
+    return exact if exact is not None else shifted
 
 
 def _optional_topology_attribute(value, name):
@@ -46,7 +112,7 @@ def _optional_topology_attribute(value, name):
 
 
 # Common MD force-field residue names (protonation states, tautomers,
-# disulfide-bonded cysteine) mapped to the standard residue they
+# disulfide-bonded cysteine, CHARMM nucleotides) mapped to the standard residue they
 # parameterize. Mirrors fastsasa_canonical_residue() in src/fastsasa_radius.c;
 # tests/python_feature_unit.py checks the two tables agree.
 RESIDUE_NAME_ALIASES = {
@@ -54,7 +120,45 @@ RESIDUE_NAME_ALIASES = {
     "HSD": "HIS", "HSE": "HIS", "HSP": "HIS",
     "CYX": "CYS", "CYM": "CYS",
     "ASH": "ASP", "GLH": "GLU", "LYN": "LYS", "ARN": "ARG",
+    "ADE": "A", "CYT": "C", "GUA": "G", "URA": "U", "THY": "DT",
 }
+
+
+# CHARMM/GROMACS atom names that differ from the PDB names in the radius
+# tables: (residue or None for any amino acid, atom) -> (residue to look up
+# or None for the same residue, atom to look up). Mirrors
+# fastsasa_canonical_atom() in src/fastsasa_radius.c.
+ATOM_NAME_ALIASES = {
+    ("ILE", "CD"): (None, "CD1"),
+    (None, "OT1"): (None, "O"), (None, "OT2"): (None, "OXT"),
+    (None, "OC1"): (None, "O"), (None, "OC2"): (None, "OXT"),
+    (None, "CAY"): ("ACE", "CH3"), (None, "CY"): ("ACE", "C"), (None, "OY"): ("ACE", "O"),
+    (None, "NT"): ("NH2", "N"), (None, "CAT"): ("ACE", "CH3"),
+    ("A", "O1P"): (None, "OP1"), ("A", "O2P"): (None, "OP2"),
+    ("C", "O1P"): (None, "OP1"), ("C", "O2P"): (None, "OP2"),
+    ("G", "O1P"): (None, "OP1"), ("G", "O2P"): (None, "OP2"),
+    ("U", "O1P"): (None, "OP1"), ("U", "O2P"): (None, "OP2"),
+    ("DT", "O1P"): (None, "OP1"), ("DT", "O2P"): (None, "OP2"), ("DT", "C5M"): (None, "C7"),
+}
+_AMINO_ACIDS = frozenset((
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE", "LEU",
+    "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL", "SEC", "PYL",
+))
+
+
+def canonical_atom_name(residue_name, atom_name):
+    """Return ``(residue, atom)`` to look up for a CHARMM/GROMACS atom name
+    (``ILE CD`` -> ``ILE CD1``), or ``None`` when the name has no alias.
+    Terminal-patch names apply only to amino acids."""
+
+    residue = canonical_residue_name(residue_name)
+    atom = str(atom_name).strip().upper()
+    alias = ATOM_NAME_ALIASES.get((residue, atom))
+    if alias is None and residue in _AMINO_ACIDS:
+        alias = ATOM_NAME_ALIASES.get((None, atom))
+    if alias is None:
+        return None
+    return (alias[0] or residue, alias[1])
 
 
 def canonical_residue_name(residue_name):
@@ -69,7 +173,8 @@ class RadiusConfig:
     """Simple residue/atom-name radius table loaded from a classifier config.
 
     Lookups try the exact residue/atom pair first, then the atom under the
-    canonical residue name for MD variants (see ``RESIDUE_NAME_ALIASES``).
+    canonical residue name for MD variants (see ``RESIDUE_NAME_ALIASES``),
+    then the CHARMM/GROMACS atom-name alias (see ``ATOM_NAME_ALIASES``).
     """
 
     def __init__(self, type_radii, atom_types):
@@ -83,6 +188,10 @@ class RadiusConfig:
             canonical = canonical_residue_name(key[0])
             if canonical != key[0]:
                 atom_type = self.atom_types.get((canonical, key[1]))
+        if atom_type is None:
+            alias = canonical_atom_name(*key)
+            if alias is not None:
+                atom_type = self.atom_types.get(alias)
 
         if atom_type is not None and atom_type in self.type_radii:
             return self.type_radii[atom_type]
@@ -315,6 +424,26 @@ def sasa_rdkit_mol(mol, conf_id=-1, radii=None, smarts=None, residue_sasa=False,
     return result
 
 
+def _mdanalysis_elements(selection):
+    """Element symbols for an AtomGroup: the topology's elements when present,
+    else from the masses (PSF and other force-field topologies, whose types
+    are not elements), else the first letter of the atom name."""
+
+    elements = _optional_topology_attribute(selection, "elements")
+    if elements is not None and all(str(element).strip() for element in elements):
+        return list(elements)
+    masses = _optional_topology_attribute(selection, "masses")
+    names = [atom.name for atom in selection]
+    symbols = []
+    for index, name in enumerate(names):
+        symbol = element_from_mass(masses[index], names[index]) if masses is not None else None
+        if symbol is None:
+            letters = [char for char in str(name) if char.isalpha()]
+            symbol = letters[0].upper() if letters else ""
+        symbols.append(symbol)
+    return symbols
+
+
 def mdanalysis_selection_arrays(selection, radius_config=None):
     """Return ``(positions, radii)`` arrays from an MDAnalysis AtomGroup."""
 
@@ -325,15 +454,9 @@ def mdanalysis_selection_arrays(selection, radius_config=None):
         if residue_names is None:
             residue_names = [atom.resname for atom in selection]
         atom_names = [atom.name for atom in selection]
-        elements = _optional_topology_attribute(selection, "elements")
-        if elements is None:
-            elements = atom_names
-        radii = radius_config.radii(residue_names, atom_names, elements)
+        radii = radius_config.radii(residue_names, atom_names, _mdanalysis_elements(selection))
     elif radii is None or len(radii) != len(selection):
-        symbols = _optional_topology_attribute(selection, "elements")
-        if symbols is None:
-            symbols = [atom.name for atom in selection]
-        radii = element_radii(symbols)
+        radii = element_radii(_mdanalysis_elements(selection))
     return np.ascontiguousarray(positions), np.ascontiguousarray(radii, dtype=np.float64)
 
 

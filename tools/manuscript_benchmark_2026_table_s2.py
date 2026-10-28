@@ -1,171 +1,134 @@
 #!/usr/bin/env python3
-"""Build Table S2 (public trajectory benchmark corpus) from the raw timing
-CSVs produced by tools/manuscript_benchmark_2026.py, in both Markdown and
-CSV form.
+"""Build Table S2 (trajectory benchmark) and Table 1 (speedup decomposition).
 
-The table covers the two published trajectory benchmark datasets: Cx46 and
-GABA_A betaAbetaAgamma, both protein-only (no solvent/ions/membrane -- see
-system_selection in manuscript_benchmark_2026.py's DATASETS dict). Only
-datasets actually measured under this methodology get a row; a row with a
-real citation next to a wall of "not measured" cells would read as if the
-dataset was benchmarked and simply didn't produce a number.
-
-The final column is the maximum per-frame relative difference in total
-SASA between the CUDA and Vulkan FP32 results and the FastSASA CPU FP64
-reference.
+Reads the raw timing CSVs written by `manuscript_benchmark_2026.py
+orchestrate` for the four datasets (Cx46 and GABA_A, each with all protein
+atoms and with protein heavy atoms), the FP32 deviations written by
+`manuscript_benchmark_2026_supplement.py fp32`, and the hardware record from
+`manuscript_benchmark_2026_supplement.py hardware`. Throughput cells are the
+median frames/s over the timed repeats with the interquartile range in
+brackets. Writes table_s2.{md,csv} and table_1_decomposition.md next to the
+results.
 """
 
 import csv
 import json
 import os
-import statistics as stats
+
+import numpy as np
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RESULTS = os.path.join(REPO_ROOT, "benchmark_corpus/results/manuscript_2026")
 
-NOT_MEASURED = "not measured"
-
-DATASET_METADATA = {
-    "cx46": {
-        "dataset_citation": "Cx46 hemichannel (Yue et al. 2021), Zenodo 10.5281/zenodo.4625961",
-        "molecular_system": "Connexin-46 hemichannel, 12 protomers, protein only (no ions)",
-        "format": "PSF/DCD",
-        "measured": True,
-    },
-    "gabaa_baba": {
-        "dataset_citation": "GABA_A receptor, βαβαγ stoichiometry (Akbari Ahangar & Li 2026), Zenodo 10.5281/zenodo.20705736",
-        "molecular_system": "GABA_A receptor pentamer (βαβαγ), protein only (no membrane/water/ions)",
-        "format": "PSF/DCD",
-        "measured": True,
-    },
+DATASETS = {
+    "cx46": ("Cx46 gap-junction channel (docked, 12 connexin subunits; Yue et al. 2021, "
+             "Zenodo 10.5281/zenodo.4625961)", "all protein atoms, with H", "AP1"),
+    "cx46_heavy": ("Cx46 gap-junction channel", "protein heavy atoms (default)", "AP1"),
+    "gabaa_baba": ("GABA_A receptor, βαβαγ (Akbari Ahangar & Li 2026, "
+                   "Zenodo 10.5281/zenodo.20705736)", "all protein atoms, with H", "PROA"),
+    "gabaa_baba_heavy": ("GABA_A receptor, βαβαγ", "protein heavy atoms (default)", "PROA"),
 }
-
-# cmd_numeric() in manuscript_benchmark_2026.py always names its checks the
-# same way regardless of dataset -- these keys are not dataset-specific.
-FP32_COMPARISON_KEYS = {
-    "complete": {"cuda": "cuda_fp32_vs_cpu_fp64", "vulkan": "vulkan_fp32_vs_cpu_fp64"},
-    "selected": {"cuda": "selected_cuda_fp32_vs_cpu_fp64", "vulkan": "selected_vulkan_fp32_vs_cpu_fp64"},
-}
-
-COLUMNS = [
-    "Dataset (citation/DOI)", "Molecular system", "Topology/trajectory format",
-    "Total atoms", "Selected atoms", "Frames", "Benchmark type",
-    "FreeSASA 1-thread FP64 (frames/s)", "FreeSASA 15-thread FP64 (frames/s)",
-    "FastSASA CPU 1-thread FP64 (frames/s)", "FastSASA CPU 15-thread FP64 (frames/s)",
-    "FastSASA Vulkan FP64 (frames/s)", "FastSASA CUDA FP64 (frames/s)",
-    "FastSASA Vulkan FP32 (frames/s)", "FastSASA CUDA FP32 (frames/s)",
-    "Max numerical diff from FP64 CPU ref",
+CONFIGS = [
+    ("freesasa", "1", "fp64", "FreeSASA 1T"),
+    ("freesasa", "15", "fp64", "FreeSASA 15T"),
+    ("fastsasa-cpu", "1", "fp64", "FastSASA CPU 1T"),
+    ("fastsasa-cpu", "15", "fp64", "FastSASA CPU 15T"),
+    ("fastsasa-cuda", "0", "fp64", "CUDA FP64"),
+    ("fastsasa-cuda", "0", "fp32", "CUDA FP32"),
+    ("fastsasa-vulkan", "0", "fp64", "Vulkan FP64"),
+    ("fastsasa-vulkan", "0", "fp32", "Vulkan FP32"),
 ]
+PANELS = ("complete", "selected")
 
 
-def median_fps(rows, tool, threads, precision, panel):
-    values = [float(r["frames_per_second"]) for r in rows
-              if r["tool"] == tool and int(r["threads"]) == threads
-              and r["precision"] == precision and r["panel"] == panel]
-    return stats.median(values) if values else None
+def load_runs(dataset):
+    runs, totals = {}, {}
+    with open(os.path.join(RESULTS, dataset, "figure1_raw_timings.csv"), newline="") as fh:
+        for row in csv.DictReader(fh):
+            key = (row["tool"], row["threads"], row["precision"], row["panel"])
+            runs.setdefault(key, []).append(float(row["frames_per_second"]))
+            totals[key] = row["total_sasa_last_repeat"]
+    return runs, totals
 
 
-def fmt(value, digits=1):
-    return NOT_MEASURED if value is None else f"{value:.{digits}f}"
+def fp64_identical(totals, panel):
+    """FastSASA CPU, CUDA and Vulkan FP64 give the same total (as printed)."""
+    values = {v for (tool, _, precision, p), v in totals.items()
+              if p == panel and precision == "fp64" and tool.startswith("fastsasa")}
+    return len(values) == 1
 
 
-def build_dataset_rows(dataset_key):
-    out_dir = os.path.join(REPO_ROOT, f"benchmark_corpus/results/manuscript_2026/{dataset_key}")
-    csv_path = os.path.join(out_dir, "figure1_raw_timings.csv")
-    numeric_path = os.path.join(out_dir, "numerical_checks.json")
+def freesasa_relative(totals, panel):
+    reference = float(totals[("fastsasa-cpu", "15", "fp64", panel)])
+    return max(abs(float(v) - reference) / reference
+               for (tool, _, _, p), v in totals.items() if p == panel and tool == "freesasa")
 
-    with open(csv_path, newline="") as fh:
-        rows = list(csv.DictReader(fh))
 
-    with open(numeric_path) as fh:
-        numeric = json.load(fh)
-    diff_by_key = {c["comparison"]: c for c in numeric["checks"]}
-    # Selected-atom panel runs through a different code path (the
-    # active-center optimization, see manuscript_benchmark_2026.py) than the
-    # complete-system panel, and its relative error is measurably larger
-    # (smaller per-frame sum -> less cancellation across atoms) -- each
-    # panel therefore gets its own max-relative-diff, not a shared value.
-    max_rel_diff_by_panel = {
-        "complete": max(
-            diff_by_key[FP32_COMPARISON_KEYS["complete"]["cuda"]]["max_relative_diff"],
-            diff_by_key[FP32_COMPARISON_KEYS["complete"]["vulkan"]]["max_relative_diff"],
-        ),
-        "selected": max(
-            diff_by_key[FP32_COMPARISON_KEYS["selected"]["cuda"]]["max_relative_diff"],
-            diff_by_key[FP32_COMPARISON_KEYS["selected"]["vulkan"]]["max_relative_diff"],
-        ),
-    }
+def fp32_max_relative(dataset, panel):
+    path = os.path.join(RESULTS, "supplement", f"fp32_{dataset}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        rows = json.load(fh)["rows"]
+    return max(r["max_relative"] for r in rows if r["panel"] == panel)
 
-    import numpy as np
-    prepared = np.load(os.path.join(out_dir, "prepared_inputs.npz"))
-    n_atoms = int(prepared["n_atoms"])
-    n_selected = int(prepared["n_selected"])
-    n_frames = int(prepared["n_frames"])
 
-    table_rows = []
-    for panel, benchmark_type, selected_col in (
-        ("complete", "complete-system", NOT_MEASURED),
-        ("selected", "selected-atom", str(n_selected)),
-    ):
-        table_rows.append([
-            DATASET_METADATA[dataset_key]["dataset_citation"],
-            DATASET_METADATA[dataset_key]["molecular_system"],
-            DATASET_METADATA[dataset_key]["format"],
-            str(n_atoms),
-            selected_col,
-            str(n_frames),
-            benchmark_type,
-            fmt(median_fps(rows, "freesasa", 1, "fp64", panel)),
-            fmt(median_fps(rows, "freesasa", 15, "fp64", panel)),
-            fmt(median_fps(rows, "fastsasa-cpu", 1, "fp64", panel)),
-            fmt(median_fps(rows, "fastsasa-cpu", 15, "fp64", panel)),
-            fmt(median_fps(rows, "fastsasa-vulkan", 0, "fp64", panel)),
-            fmt(median_fps(rows, "fastsasa-cuda", 0, "fp64", panel)),
-            fmt(median_fps(rows, "fastsasa-vulkan", 0, "fp32", panel)),
-            fmt(median_fps(rows, "fastsasa-cuda", 0, "fp32", panel)),
-            f"{max_rel_diff_by_panel[panel]:.2e} (max relative, FP32 vs FP64 CPU, per-frame)",
-        ])
-    return table_rows
+def cell(values):
+    median, q1, q3 = np.median(values), np.percentile(values, 25), np.percentile(values, 75)
+    return f"{median:,.1f} [{q1:,.1f}–{q3:,.1f}]"
 
 
 def main():
-    all_rows = []
-    skipped = []
-    for dataset_key in DATASET_METADATA:
-        out_dir = os.path.join(REPO_ROOT, f"benchmark_corpus/results/manuscript_2026/{dataset_key}")
-        if not os.path.exists(os.path.join(out_dir, "figure1_raw_timings.csv")):
-            skipped.append(dataset_key)
-            continue
-        all_rows.extend(build_dataset_rows(dataset_key))
-    if skipped:
-        print(f"skipped (no figure1_raw_timings.csv yet): {', '.join(skipped)}")
+    with open(os.path.join(RESULTS, "supplement", "hardware.json")) as fh:
+        hardware = json.load(fh)
+    header = ["System", "Atom set", "Atoms", "Panel", "Frames"] + [c[3] for c in CONFIGS] + [
+        "FastSASA FP64 identical (CPU/CUDA/Vulkan)", "FreeSASA vs FastSASA (relative)",
+        "FP32 max relative difference"]
+    table, decomposition = [], []
+    for dataset, (system, atom_set, segment) in DATASETS.items():
+        prepared = np.load(os.path.join(RESULTS, dataset, "prepared_inputs.npz"))
+        runs, totals = load_runs(dataset)
+        median = {k: float(np.median(v)) for k, v in runs.items()}
+        for panel in PANELS:
+            atoms = (f"{int(prepared['n_atoms']):,}" if panel == "complete"
+                     else f"{int(prepared['n_selected']):,} of {int(prepared['n_atoms']):,} ({segment})")
+            fp32 = fp32_max_relative(dataset, panel)
+            table.append([system, atom_set, atoms, panel, str(int(prepared["n_frames"]))]
+                         + [cell(runs[(t, n, p, panel)]) for t, n, p, _ in CONFIGS]
+                         + ["yes" if fp64_identical(totals, panel) else "NO",
+                            f"{freesasa_relative(totals, panel):.0e}",
+                            "not measured" if fp32 is None else f"{fp32:.1e}"])
+            f1, f15 = median[("freesasa", "1", "fp64", panel)], median[("freesasa", "15", "fp64", panel)]
+            c1, c15 = median[("fastsasa-cpu", "1", "fp64", panel)], median[("fastsasa-cpu", "15", "fp64", panel)]
+            gpu = median[("fastsasa-cuda", "0", "fp64", panel)]
+            decomposition.append(f"| {system.split(' (')[0]} | {atom_set} | {panel} | {c1 / f1:.1f}× | "
+                                 f"{c15 / c1:.1f}× | {gpu / c15:.1f}× | {gpu / f1:.0f}× | "
+                                 f"{c15 / f15:.1f}× | {gpu / f15:.0f}× |")
+        cpu_gain = median[("fastsasa-cpu", "15", "fp64", "selected")] / median[("fastsasa-cpu", "15", "fp64", "complete")]
+        gpu_gain = median[("fastsasa-cuda", "0", "fp64", "selected")] / median[("fastsasa-cuda", "0", "fp64", "complete")]
+        decomposition.append(f"| {system.split(' (')[0]} | {atom_set} | reduced work (selected / "
+                             f"complete) | CPU 15T {cpu_gain:.1f}× | CUDA {gpu_gain:.1f}× | | | | |")
 
-    out_dir = os.path.join(REPO_ROOT, "benchmark_corpus/results/manuscript_2026")
-    os.makedirs(out_dir, exist_ok=True)
-
-    csv_path = os.path.join(out_dir, "table_s2.csv")
-    with open(csv_path, "w", newline="") as fh:
+    note = (f"Shrake–Rupley, 100 points, 1.4 Å probe, ProtOr radii. Compute-only frames/s, "
+            f"median [interquartile range] over 5 timed repeats after a warm-up. Hardware: "
+            f"{hardware['cpu']} (15 worker threads), {hardware['gpu']}; {hardware['os']}. "
+            f"The selected panel computes SASA for the selection only, with every system atom "
+            f"occluding; FreeSASA has no such mode and computes the whole system.")
+    with open(os.path.join(RESULTS, "table_s2.csv"), "w", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(COLUMNS)
-        writer.writerows(all_rows)
-    print(f"wrote {csv_path}")
-
-    md_path = os.path.join(out_dir, "table_s2.md")
-    with open(md_path, "w") as fh:
-        fh.write("# Table S2. Public trajectory benchmark corpus\n\n")
-        fh.write("Shrake-Rupley, 100 points/atom, 1.4 Å probe. Compute-only trajectory-engine "
-                 "throughput (frames/s, median of 3 timed repeats after warm-up); this is the "
-                 "same compute-only measurement as Figure 1, not an end-to-end/VMD workflow "
-                 "number -- see the report for why those are not combined in one column. "
-                 "Only benchmarked datasets appear here -- see DATASET_PROVENANCE.md section 3 "
-                 "for public trajectories that were identified or partly downloaded but not yet "
-                 "run through this methodology (MeTrEx, CBH1); they are intentionally "
-                 "not listed as rows with \"not measured\" cells, since that would read as "
-                 "measured-but-blank rather than not-yet-run.\n\n")
-        fh.write("| " + " | ".join(COLUMNS) + " |\n")
-        fh.write("|" + "|".join(["---"] * len(COLUMNS)) + "|\n")
-        for row in all_rows:
+        writer.writerow(header)
+        writer.writerows(table)
+    with open(os.path.join(RESULTS, "table_s2.md"), "w") as fh:
+        fh.write("# Table S2. Trajectory benchmark\n\n" + note + "\n\n")
+        fh.write("| " + " | ".join(header) + " |\n|" + "|".join(["---"] * len(header)) + "|\n")
+        for row in table:
             fh.write("| " + " | ".join(row) + " |\n")
-    print(f"wrote {md_path}")
+    with open(os.path.join(RESULTS, "table_1_decomposition.md"), "w") as fh:
+        fh.write("# Table 1. Speedup decomposition (FP64, medians from Table S2)\n\n")
+        fh.write("| System | Atom set | Panel | Algorithm (CPU 1T / FreeSASA 1T) | Threads (CPU 15T / 1T) "
+                 "| GPU (CUDA / CPU 15T) | CUDA / FreeSASA 1T | CPU 15T / FreeSASA 15T | CUDA / FreeSASA 15T |\n")
+        fh.write("|---|---|---|---|---|---|---|---|---|\n" + "\n".join(decomposition) + "\n")
+    print(f"wrote {RESULTS}/table_s2.md, table_s2.csv, table_1_decomposition.md")
 
 
 if __name__ == "__main__":

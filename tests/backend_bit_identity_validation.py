@@ -55,6 +55,17 @@ def per_atom(module, backend: str, algorithm: str, resolution: int,
     return np.asarray(atom).reshape(-1), float(np.asarray(total).reshape(-1)[0])
 
 
+def arc_overflow_system() -> tuple[np.ndarray, np.ndarray]:
+    """A central atom inside a ring of 100 atoms in one plane: every slice
+    through the ring needs more arcs than the GPU slice buffer (64) holds,
+    so the GPU flags those atoms and the host recomputes them."""
+    angles = np.linspace(0.0, 2.0 * np.pi, 100, endpoint=False)
+    ring = np.stack([3.0 * np.cos(angles), 3.0 * np.sin(angles), np.zeros_like(angles)], axis=1)
+    xyz = np.vstack([[0.0, 0.0, 0.0], ring, [[0.0, 0.0, 6.0]]])
+    radii = np.concatenate([[1.8], np.full(100, 1.0), [1.5]])
+    return xyz, radii
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", required=True)
@@ -127,6 +138,26 @@ def main() -> int:
                 checked += 1
         finally:
             engine.close()
+
+    # Lee-Richards arc overflow: FP64 stays bit-identical; FP32 recomputes
+    # the flagged atoms too and stays within FP32 error.
+    xyz, radii = arc_overflow_system()
+    for slices in (10, 20):
+        reference, reference_total = per_atom(module, "cpu", "LR", slices, xyz, radii, args.library)
+        for backend in gpu_backends:
+            values, _ = per_atom(module, backend, "LR", slices, xyz, radii, args.library)
+            compare(backend, f"LR{slices} on the arc-overflow ring", values, reference)
+            os.environ["FASTSASA_BACKEND"] = backend
+            engine = module.SasaEngine(library_path=args.library, precision="fp32")
+            try:
+                total, atom = engine.lee_richards(xyz, radii, probe_radius=1.4, n_slices=slices, atom_sasa=True)
+            finally:
+                engine.close()
+            atom = np.asarray(atom).reshape(-1)
+            worst = float(np.max(np.abs(atom - reference)))
+            if not np.all(np.isfinite(atom)) or worst > 1e-3 * float(np.max(reference)):
+                raise SystemExit(f"{backend} FP32 LR{slices} on the arc-overflow ring: max |diff| {worst:.3e}")
+            checked += 2
 
     print(f"fastsasa_backend_bit_identity,status,pass,per_atom_cases,{checked},backends,{'+'.join(gpu_backends)}")
     return 0

@@ -614,7 +614,9 @@ fastsasa_context_create(fastsasa_context **output)
 
 #ifdef FASTSASA_HAVE_VULKAN
     if (backend_is(request, "auto") || backend_is(request, "vulkan")) {
-        if (fastsasa_vk_context_create(&context->vulkan, -1) == 0) {
+        const int device_index = backend_is(request, "auto") ? FASTSASA_VK_AUTO_HARDWARE : -1;
+
+        if (fastsasa_vk_context_create(&context->vulkan, device_index) == 0) {
             context->backend = FASTSASA_BACKEND_VULKAN;
             *output = context;
             set_api_error("");

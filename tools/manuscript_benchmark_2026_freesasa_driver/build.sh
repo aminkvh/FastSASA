@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds a persistent, in-process FreeSASA trajectory driver for the
 # manuscript benchmark. FreeSASA has no CLI/Python path that reuses one
-# process across many frames without hitting the NULL-pointer defect
+# process across many frames without hitting the out-of-bounds read
 # documented in freesasa_isolated_atom_nullptr_fix.patch (isolated ions in
 # the Cx46 system have zero SASA neighbors, which crashes upstream
 # FreeSASA's Shrake-Rupley neighbor walk). This script builds a patched
@@ -24,8 +24,12 @@ fi
 
 cd freesasa
 git submodule update --init --recursive 2>/dev/null || true
-patch -p1 --forward -N < "$SCRIPT_DIR/freesasa_isolated_atom_nullptr_fix.patch" || \
-    echo "patch already applied (or applied manually) -- continuing"
+PATCH="$SCRIPT_DIR/freesasa_isolated_atom_nullptr_fix.patch"
+if patch -p1 -R --dry-run -s < "$PATCH" >/dev/null 2>&1; then
+    echo "patch already applied -- continuing"
+else
+    patch -p1 --forward < "$PATCH"
+fi
 
 autoreconf -i 2>/dev/null || true
 CFLAGS="-O2 -g" ./configure --disable-json --disable-xml

@@ -327,7 +327,7 @@ the selected atoms. See the
   `precision` argument (`FASTSASA_PRECISION_FP64` or `FASTSASA_PRECISION_FP32`)
 - `fastsasa_cpu_lee_richards(...)` — fp64 only, no fp32 variant
 
-The CPU functions use FastSASA-owned cell-list implementations. Passing
+The CPU functions use FastSASA's own cell-list implementations. Passing
 `n_threads=0` selects `max(1, detected CPU threads - 1)`. The CLI uses that
 automatic worker count unless `--threads N` is supplied. Input and output
 arrays stay `double` regardless of precision; fp32 only changes the internal

@@ -5,8 +5,8 @@
 Each (tool, thread-count, precision, panel) configuration is measured in its
 own subprocess. That is standard benchmarking hygiene on its own, but for
 FreeSASA it is also a hard requirement: upstream FreeSASA 2.1.3/2.2.1's
-Shrake-Rupley implementation has a NULL-pointer defect in sr_atom_area()
-(src/sasa_sr.c) that crashes on atoms with zero SASA-relevant neighbors --
+Shrake-Rupley implementation reads out of bounds in sr_atom_area()
+(src/sasa_sr.c), which can crash, on atoms with zero SASA-relevant neighbors --
 which includes the isolated counter-ions present in the Cx46 system used
 here. See tools/manuscript_benchmark_2026_freesasa_driver/ for the
 AddressSanitizer trace, the one-line fix, and a persistent C driver built
@@ -43,7 +43,7 @@ N_POINTS = 100
 ALGORITHM_SR = 0
 N_THREADS_LOW = 1
 N_THREADS_HIGH = 15
-REPEATS = 3
+REPEATS = 5
 
 DATASETS = {
     # "system_selection" restricts the whole loaded system (both panels) to
@@ -53,7 +53,7 @@ DATASETS = {
     # HSD/HSE) is used, not a hand-rolled segid/resname list, so it's the
     # same selector for every dataset here.
     "cx46": {
-        "name": "Cx46 hemichannel (Zenodo 10.5281/zenodo.4625961)",
+        "name": "Cx46 gap-junction channel (Zenodo 10.5281/zenodo.4625961)",
         "topology": os.path.join(REPO_ROOT, "benchmark_corpus/trajectories/cx46_hemichannel/Cx46_Ace_ProtIon.psf"),
         "trajectory": os.path.join(REPO_ROOT, "benchmark_corpus/trajectories/cx46_hemichannel/Cx46_Ace_ProtIon_01.dcd"),
         "system_selection": "protein",
@@ -69,6 +69,7 @@ DATASETS = {
     # glycosylated variants.
     "gabaa_baba": {
         "name": "GABA-A receptor, betaAbetaAgamma stoichiometry (Zenodo 10.5281/zenodo.20705736)",
+        # betaAbetaAgamma files from the record (SHA-256 in DATASET_PROVENANCE.md).
         "topology": os.path.join(REPO_ROOT, "benchmark_corpus/trajectories/gabaa_pore_facing/step5_assembly.hmr.psf"),
         "trajectory": os.path.join(REPO_ROOT, "benchmark_corpus/trajectories/gabaa_pore_facing/sim_1.dcd"),
         "system_selection": "protein",
@@ -77,6 +78,19 @@ DATASETS = {
         "out_dir": os.path.join(REPO_ROOT, "benchmark_corpus/results/manuscript_2026/gabaa_baba"),
     },
 }
+
+
+# Default FastSASA configuration: heavy atoms only, built-in ProtOr radii with
+# FastSASA's CHARMM name mapping (what `fastsasa trajectory --filter protein`
+# computes). The datasets above keep the submitted configuration (explicit
+# hydrogens, radii from FreeSASA's classifier) for comparison with Table S2.
+for _key in list(DATASETS):
+    DATASETS[f"{_key}_heavy"] = dict(
+        DATASETS[_key],
+        name=DATASETS[_key]["name"] + ", heavy atoms",
+        atom_set="heavy",
+        out_dir=DATASETS[_key]["out_dir"] + "_heavy",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +184,11 @@ def cmd_prepare(args):
 
     u = mda.Universe(ds["topology"], ds["trajectory"])
     atoms = u.select_atoms(ds["system_selection"]) if ds.get("system_selection") else u.atoms
+    if ds.get("atom_set") == "heavy":
+        from fastsasa_adapters import _mdanalysis_elements, load_radius_config
+
+        heavy = np.array([element != "H" for element in _mdanalysis_elements(atoms)])
+        atoms = atoms[heavy]
     n_atoms = len(atoms)
     n_frames = len(u.trajectory)
 
@@ -223,6 +242,10 @@ def cmd_prepare(args):
 
     assert struct.nAtoms() == n_atoms
     radii = np.array([struct.radius(i) for i in range(n_atoms)], dtype=np.float64)
+    if ds.get("atom_set") == "heavy":
+        config = load_radius_config()
+        radii = np.asarray(config.radii(list(atoms.resnames), list(atoms.names),
+                                        _mdanalysis_elements(atoms)), dtype=np.float64)
     n_zero_radius = int(np.sum(radii <= 0.0))
 
     # sel is intersected with the (possibly system_selection-filtered) atoms
@@ -246,6 +269,8 @@ def cmd_prepare(args):
         n_frames=n_frames,
         n_selected=len(sel),
         n_zero_radius=n_zero_radius,
+        # Contiguous residue index per atom, for per-residue analyses.
+        residue_ids=np.unique(atoms.resindices, return_inverse=True)[1].astype(np.int32),
     )
 
     # Flat binaries for the FreeSASA C driver (tools/manuscript_benchmark_2026_freesasa_driver).
@@ -367,11 +392,12 @@ def _run_fastsasa_cpu(coords, radii, selection_mask, threads, panel):
         mask_c = np.ascontiguousarray(selection_mask, dtype=np.uint32)
 
         def frame_loop():
-            total = np.zeros(n_frames, dtype=np.float64)
             selection_out = np.zeros(n_frames, dtype=np.float64)
+            # total=NULL, as in the GPU selected panel: only the selected
+            # atoms are computed and the rest occlude (like-for-like work).
             status = lib.fastsasa_cpu_calc_trajectory_soa_selection(
                 ctypes.byref(topo), ctypes.byref(frames), _uptr(mask_c), 1,
-                ctypes.byref(params), threads, _dptr(total), _dptr(selection_out),
+                ctypes.byref(params), threads, None, _dptr(selection_out),
             )
             assert status == 0, f"fastsasa_cpu_calc_trajectory_soa_selection failed: {status}"
             return float(selection_out.sum())
@@ -526,8 +552,9 @@ def _configurations():
         configs.append(dict(tool="freesasa", threads=N_THREADS_HIGH, precision="fp64", panel=panel))
         configs.append(dict(tool="fastsasa-cpu", threads=N_THREADS_LOW, precision="fp64", panel=panel))
         configs.append(dict(tool="fastsasa-cpu", threads=N_THREADS_HIGH, precision="fp64", panel=panel))
-        configs.append(dict(tool="fastsasa-cuda", threads=0, precision="fp64", panel=panel))
-        configs.append(dict(tool="fastsasa-vulkan", threads=0, precision="fp64", panel=panel))
+        for precision in ("fp64", "fp32"):
+            configs.append(dict(tool="fastsasa-cuda", threads=0, precision=precision, panel=panel))
+            configs.append(dict(tool="fastsasa-vulkan", threads=0, precision=precision, panel=panel))
     return configs
 
 

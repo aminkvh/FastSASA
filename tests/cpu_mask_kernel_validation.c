@@ -5,8 +5,9 @@
  * large coordinate offsets, rotations, touching pairs, single atoms, dense
  * random packings, and every mask width (1 to 4 words, i.e. up to 255
  * points), at both FP64 and FP32 (each mask variant against its own
- * reference kernel). Also checks the automatic policy and the
- * unsupported-input path.
+ * reference kernel). Also checks the automatic policy, the
+ * unsupported-input path, and that computing only selected centres gives
+ * the same per-atom values as the full calculation.
  */
 #include "fastsasa.h"
 #include "fastsasa_cpu.h"
@@ -108,6 +109,113 @@ compare(const char *name, int n_atoms, int n_points,
     compare_precision(name, n_atoms, n_points, x, y, z, expanded, n_threads, FASTSASA_PRECISION_FP32);
 }
 
+/* Selected centres (every third atom, plus the last) against the full
+ * calculation, for one kernel (FASTSASA_CPU_KERNEL value) and precision:
+ * the selected atoms must match bit for bit and the rest must be zero. */
+static void
+compare_centers(const char *name, int n_atoms, int n_points,
+                const double *x, const double *y, const double *z, const double *expanded,
+                int n_threads, int precision, const char *kernel)
+{
+    double *points = fibonacci_points(n_points);
+    double *full = (double *)calloc((size_t)n_atoms, sizeof(double));
+    double *part = (double *)malloc(sizeof(double) * (size_t)n_atoms);
+    int *centers = (int *)malloc(sizeof(int) * (size_t)n_atoms);
+    int n_centers = 0;
+    int bad = -1;
+    int sf, sp;
+
+    for (int a = 0; a < n_atoms; ++a) {
+        part[a] = -1.0;
+        if (a % 3 == 0 || a == n_atoms - 1) centers[n_centers++] = a;
+    }
+#if defined(_WIN32)
+    _putenv_s("FASTSASA_CPU_KERNEL", kernel);
+#else
+    setenv("FASTSASA_CPU_KERNEL", kernel, 1);
+#endif
+    sf = fastsasa_cpu_shrake_rupley_precision(n_atoms, n_points, x, y, z, expanded, points, n_threads, precision, full);
+    sp = fastsasa_cpu_shrake_rupley_centers(n_atoms, n_points, x, y, z, expanded, points, n_threads, precision,
+                                            centers, n_centers, part);
+#if defined(_WIN32)
+    _putenv_s("FASTSASA_CPU_KERNEL", "");
+#else
+    unsetenv("FASTSASA_CPU_KERNEL");
+#endif
+    if (sf != FASTSASA_SUCCESS || sp != FASTSASA_SUCCESS) {
+        printf("FAIL %-40s centres status full=%d centres=%d\n", name, sf, sp);
+        ++failures;
+    } else {
+        for (int a = 0, k = 0; a < n_atoms && bad < 0; ++a) {
+            const int is_center = k < n_centers && centers[k] == a;
+            const double expected = is_center ? full[a] : 0.0;
+
+            if (is_center) ++k;
+            if (memcmp(&expected, &part[a], sizeof(double)) != 0) bad = a;
+        }
+        if (bad >= 0) {
+            printf("FAIL %-40s centres %s %s atom %d: full %.17g centres %.17g\n", name, kernel,
+                   precision == FASTSASA_PRECISION_FP32 ? "fp32" : "fp64", bad, full[bad], part[bad]);
+            ++failures;
+        } else {
+            printf("ok   %-40s centres %d/%d %s %s %3d points\n", name, n_centers, n_atoms, kernel,
+                   precision == FASTSASA_PRECISION_FP32 ? "fp32" : "fp64", n_points);
+        }
+    }
+    free(points);
+    free(full);
+    free(part);
+    free(centers);
+}
+
+/* Lee-Richards on a subset of atoms (the GPU arc-overflow recompute) must
+ * match the full CPU calculation bit for bit. */
+static void
+compare_lr_centers(const char *name, int n_atoms,
+                   const double *x, const double *y, const double *z, const double *expanded)
+{
+    double *full = (double *)malloc(sizeof(double) * (size_t)n_atoms);
+    double *areas = (double *)malloc(sizeof(double) * (size_t)n_atoms);
+    int *centers = (int *)malloc(sizeof(int) * (size_t)n_atoms);
+    int n_centers = 0;
+
+    if (full == NULL || areas == NULL || centers == NULL) {
+        ++failures;
+        free(full); free(areas); free(centers);
+        return;
+    }
+    for (int a = n_atoms - 1; a >= 0; a -= 3) centers[n_centers++] = a;
+    if (fastsasa_cpu_lee_richards(n_atoms, 20, x, y, z, expanded, 4, full) != 0 ||
+        fastsasa_cpu_lee_richards_centers(n_atoms, 20, x, y, z, expanded, 3, centers, n_centers, areas) != 0) {
+        fprintf(stderr, "%s: Lee-Richards centres call failed\n", name);
+        ++failures;
+    } else {
+        for (int i = 0; i < n_centers; ++i) {
+            if (memcmp(&areas[i], &full[centers[i]], sizeof(double)) != 0) {
+                fprintf(stderr, "%s: LR centre %d (atom %d) %.17g != %.17g\n",
+                        name, i, centers[i], areas[i], full[centers[i]]);
+                ++failures;
+                break;
+            }
+        }
+    }
+    free(full); free(areas); free(centers);
+}
+
+static void
+center_cases(const char *name, int n_atoms,
+             const double *x, const double *y, const double *z, const double *expanded)
+{
+    const char *kernels[] = {"reference", "mask"};
+    const int precisions[] = {FASTSASA_PRECISION_FP64, FASTSASA_PRECISION_FP32};
+    const int n_points_list[] = {100, 255, 300};
+
+    for (size_t k = 0; k < 2; ++k)
+        for (size_t p = 0; p < 2; ++p)
+            for (size_t n = 0; n < 3; ++n)
+                compare_centers(name, n_atoms, n_points_list[n], x, y, z, expanded, 4, precisions[p], kernels[k]);
+}
+
 static double
 default_radius(const char *residue, const char *atom, const char *element, void *userdata)
 {
@@ -175,6 +283,9 @@ structure_cases(const char *path)
         snprintf(name, sizeof(name), "%s mirrored", path);
         compare(name, n, 128, tx, ty, tz, expanded, 1);
     }
+    snprintf(name, sizeof(name), "%s", path);
+    center_cases(name, n, topology.x, topology.y, topology.z, expanded);
+    compare_lr_centers(name, n, topology.x, topology.y, topology.z, expanded);
     /* varied radii */
     for (int a = 0; a < n; ++a) expanded[a] = 1.0 + 3.0 * ((a * 7919) % 1000) / 1000.0;
     snprintf(name, sizeof(name), "%s radii 1..4", path);
@@ -228,6 +339,7 @@ synthetic_cases(void)
         }
         compare("dense random packing", N, 128, x, y, z, r, 1);
         compare("dense random packing x8 threads", N, 100, x, y, z, r, 8);
+        center_cases("dense random packing", N, x, y, z, r);
     }
     {
         /* unsupported point count: mask kernel declines, reference works */

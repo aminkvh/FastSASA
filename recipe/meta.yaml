@@ -1,5 +1,5 @@
 {% set name = "fastsasa" %}
-{% set version = "0.1.0rc19" %}
+{% set version = "1.0.0" %}
 
 package:
   name: {{ name|lower }}
@@ -58,7 +58,7 @@ test:
 about:
   home: https://github.com/aminkvh/fastsasa
   summary: GPU-accelerated Shrake-Rupley and Lee-Richards SASA calculations (Vulkan, CUDA, CPU)
-  license: MIT AND MPL-2.0
+  license: MIT AND MPL-2.0 AND SunPro AND BSD-2-Clause AND BSD-3-Clause
   license_file:
     - LICENSE
     - NOTICE
@@ -67,6 +67,9 @@ about:
     - licenses/Gemmi-third-party-notices.txt
     - licenses/TAO-PEGTL-MIT.txt
     - licenses/volk-MIT.md
+    - licenses/SunPro.txt
+    - licenses/musl-MIT.txt
+    - licenses/xdrfile-BSD-2-Clause.txt
   doc_url: https://github.com/aminkvh/fastsasa/tree/main/docs
 
 extra:

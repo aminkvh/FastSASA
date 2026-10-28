@@ -10,6 +10,10 @@ extern "C" {
 typedef struct fastsasa_vk_context fastsasa_vk_context;
 
 /* device_index < 0 selects a discrete GPU when available. */
+/* device_index: a compute-device index, -1 for the first discrete GPU (else
+ * the first device), or FASTSASA_VK_AUTO_HARDWARE for the same choice
+ * without software (CPU-type) devices, used by automatic backend selection. */
+#define FASTSASA_VK_AUTO_HARDWARE (-2)
 int fastsasa_vk_context_create(fastsasa_vk_context **context, int device_index);
 /* Returns this thread's most recent fastsasa_vk_context_create failure reason. */
 const char *fastsasa_vk_create_error(void);

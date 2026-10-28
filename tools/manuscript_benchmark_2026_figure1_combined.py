@@ -11,7 +11,7 @@ Usage:
     python3 tools/manuscript_benchmark_2026_figure1_combined.py --dataset cx46 \\
         --panel-a-title "A. Complete-system SASA (35,172 atoms)" \\
         --panel-b-title "B. Selected-protomer SASA\\n(segid AP1, 1,530 atoms, full-system occlusion)" \\
-        --system-label "Cx46 hemichannel" \\
+        --system-label "Cx46 gap-junction channel" \\
         --system-desc "Identical 35,172-atom system, 250 frames, and segid-AP1 (1,530-atom) selection for every method shown."
 """
 
@@ -73,7 +73,7 @@ def main():
     parser.add_argument("--out-dir", default=None, help="override output directory (default: same as --dataset's)")
     parser.add_argument("--panel-a-title", default="A. Complete-system SASA (35,172 atoms)")
     parser.add_argument("--panel-b-title", default="B. Selected-protomer SASA\nsegid AP1, 1,530 atoms, full-system occlusion")
-    parser.add_argument("--system-label", default="Cx46 hemichannel")
+    parser.add_argument("--system-label", default="Cx46 gap-junction channel")
     parser.add_argument("--system-desc", default="Identical 35,172-atom system, 250 frames, "
                                                    "and segid-AP1 (1,530-atom) selection for every method shown.")
     args = parser.parse_args()

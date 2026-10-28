@@ -310,6 +310,218 @@ def _validate_residue_aliases(fastsasa: Path, tmp_path: Path) -> None:
             raise SystemExit(f"HIS -> HIE changed {column}: {results[0][column]} vs {results[1][column]}")
 
 
+# A CHARMM-named peptide: ACE cap (CAY/CY/OY), HSD, ILE CD, C-terminal
+# OT1/OT2, one hydrogen with a repartitioned mass, and force-field type names
+# that are not elements (CT3, HA3, NR1, ...). Fields: segment, resid,
+# residue, atom, PSF type, mass, element.
+_CHARMM_PEPTIDE = (
+    ("PROA", 1, "GLY", "CAY", "CT3", 12.011, "C"), ("PROA", 1, "GLY", "HY1", "HA3", 1.008, "H"),
+    ("PROA", 1, "GLY", "HY2", "HA3", 1.008, "H"), ("PROA", 1, "GLY", "CY", "C", 12.011, "C"),
+    ("PROA", 1, "GLY", "OY", "O", 15.999, "O"), ("PROA", 1, "GLY", "N", "NH1", 14.007, "N"),
+    ("PROA", 1, "GLY", "HN", "H", 1.008, "H"), ("PROA", 1, "GLY", "CA", "CT2", 12.011, "C"),
+    ("PROA", 1, "GLY", "HA1", "HB2", 1.008, "H"), ("PROA", 1, "GLY", "C", "C", 12.011, "C"),
+    ("PROA", 1, "GLY", "O", "O", 15.999, "O"), ("PROA", 2, "HSD", "N", "NH1", 14.007, "N"),
+    ("PROA", 2, "HSD", "CA", "CT1", 12.011, "C"), ("PROA", 2, "HSD", "CB", "CT2", 12.011, "C"),
+    ("PROA", 2, "HSD", "ND1", "NR1", 14.007, "N"), ("PROA", 2, "HSD", "HD1", "H", 1.008, "H"),
+    ("PROA", 2, "HSD", "CG", "CPH1", 12.011, "C"), ("PROA", 2, "HSD", "CE1", "CPH2", 12.011, "C"),
+    ("PROA", 2, "HSD", "NE2", "NR2", 14.007, "N"), ("PROA", 2, "HSD", "CD2", "CPH1", 12.011, "C"),
+    ("PROA", 2, "HSD", "C", "C", 12.011, "C"), ("PROA", 2, "HSD", "O", "O", 15.999, "O"),
+    ("PROA", 3, "ILE", "N", "NH1", 14.007, "N"), ("PROA", 3, "ILE", "CA", "CT1", 12.011, "C"),
+    ("PROA", 3, "ILE", "CB", "CT1", 12.011, "C"), ("PROA", 3, "ILE", "CG2", "CT3", 12.011, "C"),
+    ("PROA", 3, "ILE", "CG1", "CT2", 12.011, "C"), ("PROA", 3, "ILE", "CD", "CT3", 12.011, "C"),
+    ("PROA", 3, "ILE", "HD1", "HA3", 3.024, "H"), ("PROA", 3, "ILE", "C", "C", 12.011, "C"),
+    ("PROA", 3, "ILE", "O", "O", 15.999, "O"), ("PROA", 4, "LEU", "N", "NH1", 14.007, "N"),
+    ("PROA", 4, "LEU", "CA", "CT1", 12.011, "C"), ("PROA", 4, "LEU", "CB", "CT2", 12.011, "C"),
+    ("PROA", 4, "LEU", "CG", "CT1", 12.011, "C"), ("PROA", 4, "LEU", "CD1", "CT3", 12.011, "C"),
+    ("PROA", 4, "LEU", "CD2", "CT3", 12.011, "C"), ("PROA", 4, "LEU", "C", "CC", 12.011, "C"),
+    ("PROA", 4, "LEU", "OT1", "OC", 15.9994, "O"), ("PROA", 4, "LEU", "OT2", "OC", 15.9994, "O"),
+)
+# Atoms the ProtOr table does not cover: ions and an unknown ligand atom.
+_CHARMM_EXTRAS = (
+    ("ION", 5, "SOD", "SOD", "SOD", 22.98977, "NA"), ("ION", 6, "CLA", "CLA", "CLA", 35.45, "CL"),
+    ("LIG", 7, "LIG", "XX1", "CG2R61", 12.011, "C"),
+)
+
+
+def _charmm_coordinates(n_atoms: int) -> list[tuple[float, float, float]]:
+    return [(1.9 * (i % 4), 1.9 * ((i // 4) % 4), 1.9 * (i // 16)) for i in range(n_atoms)]
+
+
+def _write_charmm_inputs(tmp_path: Path, stem: str, atoms) -> tuple[Path, Path, Path]:
+    coordinates = _charmm_coordinates(len(atoms))
+    psf_lines = ["PSF", "", "       1 !NTITLE", " REMARKS FastSASA CHARMM validation", "",
+                 f"{len(atoms):8d} !NATOM"]
+    pdb_lines = []
+    for index, ((segment, resid, residue, name, atom_type, mass, element), xyz) in enumerate(
+            zip(atoms, coordinates), start=1):
+        psf_lines.append(f"{index:8d} {segment:<4s} {resid:<4d} {residue:<4s} {name:<4s} {atom_type:<6s}"
+                         f"  0.000000 {mass:13.4f}           0")
+        pdb_name = name if len(name) == 4 else f" {name:<3s}"
+        pdb_lines.append(f"ATOM  {index:5d} {pdb_name} {residue:<4s}X{resid:4d}    "
+                         f"{xyz[0]:8.3f}{xyz[1]:8.3f}{xyz[2]:8.3f}  1.00  0.00      {segment:<4s}{element:>2s}")
+    psf = tmp_path / f"{stem}.psf"
+    pdb = tmp_path / f"{stem}.pdb"
+    dcd = tmp_path / f"{stem}.dcd"
+    psf.write_text("\n".join(psf_lines + ["", "       0 !NBOND", ""]) + "\n")
+    pdb.write_text("\n".join(pdb_lines + ["END"]) + "\n")
+    _write_dcd(dcd, coordinates)
+    return psf, pdb, dcd
+
+
+def _validate_charmm_psf(fastsasa: Path, tmp_path: Path) -> None:
+    # PSF type columns hold force-field types, not elements: elements must come
+    # from the mass, CHARMM atom names must resolve to the ProtOr names, and
+    # the PSF and PDB readers must then agree atom for atom.
+    def summary(topology: Path, trajectory: Path, *extra: str) -> tuple[dict[str, str], str]:
+        proc = _run(fastsasa, "trajectory", "--topology", str(topology), "--trajectory", str(trajectory),
+                    "--cpu", "--threads", "1", "--frames", "0", "--summary", "--classes", *extra)
+        return _summary_row(proc), proc.stderr
+
+    psf, pdb, dcd = _write_charmm_inputs(tmp_path, "charmm_peptide", _CHARMM_PEPTIDE)
+    n_heavy = sum(1 for atom in _CHARMM_PEPTIDE if atom[6] != "H")
+    for extra, expected_atoms in (((), n_heavy), (("--hydrogen",), len(_CHARMM_PEPTIDE))):
+        psf_row, psf_err = summary(psf, dcd, *extra)
+        pdb_row, pdb_err = summary(pdb, dcd, *extra)
+        if int(psf_row["atoms"]) != expected_atoms or int(pdb_row["atoms"]) != expected_atoms:
+            raise SystemExit(f"CHARMM {extra}: expected {expected_atoms} atoms, PSF {psf_row['atoms']}, "
+                             f"PDB {pdb_row['atoms']}")
+        for column in ("total_sasa_sum", "polar_sasa_sum", "apolar_sasa_sum"):
+            if psf_row[column] != pdb_row[column]:
+                raise SystemExit(f"CHARMM {extra}: PSF and PDB disagree on {column}: "
+                                 f"{psf_row[column]} vs {pdb_row[column]}")
+        if not extra:
+            if float(psf_row["unknown_sasa_sum"]) != 0.0 or "radius table" in psf_err + pdb_err:
+                raise SystemExit("CHARMM peptide heavy atoms were not all found in the ProtOr table:\n"
+                                 f"{psf_row}\n{psf_err}{pdb_err}")
+
+    psf, pdb, dcd = _write_charmm_inputs(tmp_path, "charmm_extras", _CHARMM_PEPTIDE + _CHARMM_EXTRAS)
+    psf_row, psf_err = summary(psf, dcd, "--hetatm")
+    pdb_row, pdb_err = summary(pdb, dcd, "--hetatm")
+    if psf_row["total_sasa_sum"] != pdb_row["total_sasa_sum"]:
+        raise SystemExit(f"CHARMM extras: PSF {psf_row['total_sasa_sum']} vs PDB {pdb_row['total_sasa_sum']}")
+    for stderr in (psf_err, pdb_err):
+        if "radius table" not in stderr or "LIG XX1" not in stderr or "SOD SOD" not in stderr:
+            raise SystemExit(f"atoms outside the radius table were not reported:\n{stderr}")
+
+
+def _validate_cpu_selected_centers(fastsasa: Path, tmp_path: Path) -> None:
+    # Selection runs compute surface points only for the selected atoms; the
+    # CPU result must be identical to computing every atom.
+    topology = Path("tests/data/1ubq.pdb")
+    trajectory = tmp_path / "selected_centers.dcd"
+    coordinates = _pdb_coordinates(topology)
+    _write_dcd(trajectory, coordinates, [(x + 0.3, y, z) if i % 5 == 0 else (x, y, z)
+                                         for i, (x, y, z) in enumerate(coordinates)])
+    outputs = []
+    for enabled in ("0", "1"):
+        environment = dict(os.environ, FASTSASA_SELECTED_CENTER=enabled)
+        proc = subprocess.run([str(fastsasa), "trajectory", "--topology", str(topology), "--trajectory",
+                               str(trajectory), "--cpu", "--frames", ":", "--select", "first, resi 1-10",
+                               "--select", "core, resn LEU+ILE+VAL"],
+                              env=environment, text=True, capture_output=True, check=False)
+        rows = _frame_rows(proc)
+        outputs.append([(row["frame"], row["selection"], row["selection_sasa"]) for row in rows])
+    if outputs[0] != outputs[1] or len(outputs[0]) != 4:
+        raise SystemExit(f"CPU selected-centre results differ from the full calculation:\n{outputs}")
+    # A selection matching no atom reports zero, as the full calculation does.
+    proc = _run(fastsasa, "trajectory", "--topology", str(topology), "--trajectory", str(trajectory),
+                "--cpu", "--frames", "0", "--select", "none, segid NOPE")
+    rows = _frame_rows(proc)
+    if len(rows) != 1 or float(rows[0]["selection_sasa"]) != 0.0:
+        raise SystemExit(f"empty selection did not report zero:\n{proc.stdout}{proc.stderr}")
+
+
+def _validate_automatic_backend(fastsasa: Path, tmp_path: Path) -> None:
+    # Automatic mode runs single structures on the CPU (a GPU context costs
+    # more than the whole calculation) and never picks a software Vulkan
+    # device; explicit requests are unchanged.
+    import json
+
+    environment = {key: value for key, value in os.environ.items() if key != "FASTSASA_BACKEND"}
+    proc = subprocess.run([str(fastsasa), "--format", "json", "tests/data/1ubq.pdb"], env=environment,
+                          text=True, capture_output=True, check=False)
+    if proc.returncode != 0 or json.loads(proc.stdout)["parameters"]["backend"] != "cpu":
+        raise SystemExit(f"automatic backend for a single structure is not the CPU:\n{proc.stdout}{proc.stderr}")
+
+    icds = sorted(Path("/usr/share/vulkan/icd.d").glob("lvp_icd*.json")) if Path("/usr/share/vulkan/icd.d").is_dir() else []
+    if not icds:
+        return
+    topology = Path("tests/data/1ubq.pdb")
+    trajectory = tmp_path / "software_vulkan.dcd"
+    _write_dcd(trajectory, _pdb_coordinates(topology))
+    environment.update(VK_DRIVER_FILES=str(icds[0]), FASTSASA_TEST_DISABLE_CUDA="1")
+    proc = subprocess.run([str(fastsasa), "trajectory", "--topology", str(topology), "--trajectory", str(trajectory),
+                           "--summary"], env=environment, text=True, capture_output=True, check=False)
+    if proc.returncode != 0 or "using threaded CPU" not in proc.stderr:
+        raise SystemExit(f"automatic mode used the software Vulkan device:\n{proc.stderr}")
+
+
+def _validate_native_xtc(fastsasa: Path, tmp_path: Path) -> None:
+    # The built-in XTC reader (vendored xdrfile) must give the same per-frame
+    # SASA as a DCD holding the decoded coordinates (written by MDAnalysis),
+    # for the compressed (> 9 atoms) and raw (<= 9 atoms) frame layouts, and
+    # with frame selection.
+    for stem, topology in (("1ubq_5frames", "1ubq.pdb"), ("1ubq_4atoms", "1ubq_4atoms.pdb")):
+        for frames in (":", "-1", "1:4:2"):
+            rows = []
+            for suffix in ("xtc", "dcd"):
+                proc = _run(fastsasa, "trajectory", "--topology", f"tests/data/{topology}",
+                            "--trajectory", f"tests/data/{stem}.{suffix}", "--cpu", "--frames", frames)
+                rows.append([(row["frame"], row["total_sasa"]) for row in _frame_rows(proc)])
+            if not rows[0] or rows[0] != rows[1]:
+                raise SystemExit(f"{stem} --frames {frames}: XTC {rows[0]} differs from DCD {rows[1]}")
+
+    # A file cut off inside its last frame lists only the complete frames, and
+    # asking for a missing frame is an error, not an empty result.
+    source = Path("tests/data/1ubq_5frames.xtc").read_bytes()
+    truncated = tmp_path / "truncated.xtc"
+    truncated.write_bytes(source[:-100])
+    proc = _run(fastsasa, "trajectory", "--topology", "tests/data/1ubq.pdb", "--trajectory", str(truncated),
+                "--cpu", "--frames", ":")
+    if [row["frame"] for row in _frame_rows(proc)] != ["0", "1", "2", "3"]:
+        raise SystemExit(f"truncated XTC frames:\n{proc.stdout}{proc.stderr}")
+    proc = subprocess.run([str(fastsasa), "trajectory", "--topology", "tests/data/1ubq.pdb", "--trajectory",
+                           str(truncated), "--cpu", "--frames", "4"], text=True, capture_output=True, check=False)
+    if proc.returncode == 0:
+        raise SystemExit(f"missing XTC frame 4 was accepted:\n{proc.stdout}{proc.stderr}")
+
+    # A compressed block larger than the decoder's buffer (a corrupt or
+    # crafted file) is rejected before any decoding.
+    header = bytearray(source[:92])
+    header[88:92] = (4_000_000).to_bytes(4, "big")
+    corrupt = tmp_path / "corrupt.xtc"
+    corrupt.write_bytes(bytes(header) + bytes(4_000_000))
+    proc = subprocess.run([str(fastsasa), "trajectory", "--topology", "tests/data/1ubq.pdb", "--trajectory",
+                           str(corrupt), "--cpu", "--frames", ":"], text=True, capture_output=True, check=False)
+    if proc.returncode == 0 or proc.returncode < 0 or proc.returncode >= 128:
+        raise SystemExit(f"corrupt XTC: exit {proc.returncode}\n{proc.stderr}")
+
+    # An empty coordinate range (maxint < minint) must be an error, not a
+    # division by zero inside the decoder.
+    empty_range = bytearray(source)
+    min_z = int.from_bytes(empty_range[68:72], "big", signed=True)
+    empty_range[80:84] = (min_z - 1).to_bytes(4, "big", signed=True)
+    corrupt.write_bytes(bytes(empty_range))
+    proc = subprocess.run([str(fastsasa), "trajectory", "--topology", "tests/data/1ubq.pdb", "--trajectory",
+                           str(corrupt), "--cpu", "--frames", "0"], text=True, capture_output=True, check=False)
+    if proc.returncode == 0 or proc.returncode < 0 or proc.returncode >= 128:
+        raise SystemExit(f"XTC with an empty coordinate range: exit {proc.returncode}\n{proc.stderr}")
+
+
+def _validate_radii_without_source_tree(fastsasa: Path, tmp_path: Path) -> None:
+    # The default ProtOr table must not depend on the working directory.
+    structure = Path("tests/data/1ubq.pdb").resolve()
+    fastsasa = fastsasa.resolve()
+    in_tree = subprocess.run([str(fastsasa), str(structure)], text=True, capture_output=True, check=False)
+    elsewhere = subprocess.run([str(fastsasa), str(structure)], text=True, capture_output=True, check=False,
+                               cwd=tmp_path)
+    if in_tree.returncode != 0 or elsewhere.returncode != 0:
+        raise SystemExit(f"1ubq run failed:\n{in_tree.stderr}{elsewhere.stderr}")
+    if in_tree.stdout != elsewhere.stdout or "guessing element" in elsewhere.stderr:
+        raise SystemExit("radii changed with the working directory:\n"
+                         f"{in_tree.stdout}\n---\n{elsewhere.stdout}\n{elsewhere.stderr}")
+
+
 def _write_mmcif(path: Path) -> None:
     path.write_text(
         "data_policy\n"
@@ -505,6 +717,11 @@ def main() -> int:
         _validate_surface_resolution(args.fastsasa, tmp_path)
         _validate_cpu_precision(args.fastsasa, tmp_path)
         _validate_residue_aliases(args.fastsasa, tmp_path)
+        _validate_charmm_psf(args.fastsasa, tmp_path)
+        _validate_cpu_selected_centers(args.fastsasa, tmp_path)
+        _validate_automatic_backend(args.fastsasa, tmp_path)
+        _validate_native_xtc(args.fastsasa, tmp_path)
+        _validate_radii_without_source_tree(args.fastsasa, tmp_path)
 
     print("fastsasa_trajectory_cli_dispatch_validation,status,pass")
     return 0

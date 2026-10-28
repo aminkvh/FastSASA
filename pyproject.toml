@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastsasa"
-version = "0.1.0rc20"
+version = "1.0.0"
 description = "GPU-accelerated Shrake-Rupley and Lee-Richards SASA calculations (Vulkan, CUDA, CPU)"
 readme = "README.md"
 requires-python = ">=3.9"
-license = "MIT AND MPL-2.0"
+license = "MIT AND MPL-2.0 AND SunPro AND BSD-2-Clause AND BSD-3-Clause"
 license-files = ["LICENSE", "licenses/*.txt", "licenses/*.md", "third-party/gemmi/LICENSE.txt", "third-party/volk/LICENSE.md"]
 authors = [
   {name = "Amin Akbari Ahangar"}

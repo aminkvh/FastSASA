@@ -21,6 +21,9 @@
  *   Developed at SunPro/SunSoft, a Sun Microsystems, Inc. business.
  *   Permission to use, copy, modify, and distribute this software is freely
  *   granted, provided that this notice is preserved.
+ *
+ * musl is Copyright (c) 2005-2020 Rich Felker, et al., MIT license
+ * (licenses/musl-MIT.txt).
  */
 #ifndef FASTSASA_EXACT_MATH_H
 #define FASTSASA_EXACT_MATH_H

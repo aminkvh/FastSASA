@@ -40,6 +40,26 @@ int fastsasa_cpu_shrake_rupley_precision(int n_atoms,
                                        int precision,
                                        double *sasa);
 
+/*
+ * Shrake-Rupley for the listed centre atoms only, with every atom still
+ * acting as an occluder; the other entries of sasa are set to zero. The
+ * computed values equal fastsasa_cpu_shrake_rupley_precision's bit for bit,
+ * at a cost proportional to n_centers. Used for selection analysis where
+ * the rest of the system is context only.
+ */
+int fastsasa_cpu_shrake_rupley_centers(int n_atoms,
+                                       int n_points,
+                                       const double *x,
+                                       const double *y,
+                                       const double *z,
+                                       const double *expanded_radii,
+                                       const double *test_points,
+                                       int n_threads,
+                                       int precision,
+                                       const int *centers,
+                                       int n_centers,
+                                       double *sasa);
+
 /* Mask-accelerated exact Shrake-Rupley (FP64 only, n_points <= 255). Same
  * result as fastsasa_cpu_shrake_rupley bit for bit; typically 3-4x faster on
  * the CPU. The one-time direction table (~43 ms at 128 points) is cached per
@@ -128,6 +148,22 @@ int fastsasa_cpu_lee_richards_atom(int n_atoms,
                                  const double *expanded_radii,
                                  int atom,
                                  double *area);
+
+/*
+ * Lee-Richards areas of the listed atoms only (areas[i] for centers[i]),
+ * using the threaded cell-list path; bit-identical to the full calculation.
+ * The GPU backends use it to recompute atoms that overflow their arc buffers.
+ */
+int fastsasa_cpu_lee_richards_centers(int n_atoms,
+                                      int n_slices,
+                                      const double *x,
+                                      const double *y,
+                                      const double *z,
+                                      const double *expanded_radii,
+                                      int n_threads,
+                                      const int *centers,
+                                      int n_centers,
+                                      double *areas);
 
 int fastsasa_cpu_calc_trajectory_soa(const fastsasa_topology *topology,
                                    const fastsasa_soa_frames *frames,

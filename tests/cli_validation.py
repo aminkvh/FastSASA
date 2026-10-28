@@ -238,8 +238,8 @@ def main() -> int:
     sr_cpu = run_json(args.fastsasa, args.data_dir, "--cpu", "--shrake-rupley", "--format", "json", pdb)
     sr_cpu_parallel = run_json(args.fastsasa, args.data_dir, "--cpu", "--shrake-rupley", "--threads", "4", "--format", "json", pdb)
     assert_close("SR CPU serial vs threaded", total(sr_cpu), total(sr_cpu_parallel), 1e-9)
-    # Independent regression values from the established 1UBQ fixture with
-    # ProtOr radii and the matching default resolutions.
+    # FreeSASA 2.1.3's 1UBQ regression values (its tests/data fixture, ProtOr
+    # radii, default resolutions); FastSASA must reproduce them.
     assert_close("SR external 1UBQ reference", total(sr_cpu), 4834.716265, 5e-6)
 
     lr_cpu = run_json(args.fastsasa, args.data_dir, "--cpu", "--lee-richards", "--resolution", "20", "--format", "json", pdb)

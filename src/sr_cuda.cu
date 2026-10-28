@@ -2256,7 +2256,8 @@ lr_exposed_arc_length_local_cell_float(int atom,
                                        int nz,
                                        const int *atom_cells,
                                        const int *cell_offsets,
-                                       const int *cell_atoms)
+                                       const int *cell_atoms,
+                                       int flag_overflow)
 {
     const float two_pi = 2.0f * (float)FASTSASA_PI;
     const int center_cell = atom_cells[atom];
@@ -2304,6 +2305,7 @@ lr_exposed_arc_length_local_cell_float(int atom,
                                                    &b1);
             if (arcs < 0) return 0.0f;
             if (arcs >= 1 && !lr_insert_arc_sorted_float(a0, b0, arc_begin, arc_end, &n_arcs)) {
+                if (flag_overflow) return -1.0f;
                 return lr_exposed_arc_length_streaming_cell_float(atom,
                                                                  slice_z,
                                                                  ri_prime,
@@ -2323,6 +2325,7 @@ lr_exposed_arc_length_local_cell_float(int atom,
                                                                  cell_atoms);
             }
             if (arcs == 2 && !lr_insert_arc_sorted_float(a1, b1, arc_begin, arc_end, &n_arcs)) {
+                if (flag_overflow) return -1.0f;
                 return lr_exposed_arc_length_streaming_cell_float(atom,
                                                                  slice_z,
                                                                  ri_prime,
@@ -2370,7 +2373,8 @@ lee_richards_cell_slice_float_kernel(int n_atoms,
                                      const int *atom_cells,
                                      const int *cell_offsets,
                                      const int *cell_atoms,
-                                     double *sasa)
+                                     double *sasa,
+                                     int *overflow_flags)
 {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = n_atoms * n_slices;
@@ -2410,8 +2414,12 @@ lee_richards_cell_slice_float_kernel(int n_atoms,
                                                          nz,
                                                          atom_cells,
                                                          cell_offsets,
-                                                         cell_atoms);
-    if (exposed_arc > 0.0f) {
+                                                         cell_atoms,
+                                                         1);
+    if (exposed_arc < 0.0f) {
+        /* More arcs than the local buffer: the host recomputes the atom. */
+        overflow_flags[atom] = 1;
+    } else if (exposed_arc > 0.0f) {
         const double atom_slice_area = (double)delta * (double)ri * (double)exposed_arc;
         atomic_add_double(&sasa[atom], atom_slice_area);
     }
@@ -2470,7 +2478,8 @@ lee_richards_cell_slice_float_accum_kernel(int n_atoms,
                                                          nz,
                                                          atom_cells,
                                                          cell_offsets,
-                                                         cell_atoms);
+                                                         cell_atoms,
+                                                         0);
     if (exposed_arc > 0.0f) {
         atomicAdd(&sasa[atom], delta * ri * exposed_arc);
     }
@@ -4785,8 +4794,9 @@ validate_lr_input(const fastsasa_device_sr_input *input,
 /*
  * Atoms whose slice needed more than FASTSASA_LR_ARC_CAPACITY arcs on the
  * device are recomputed with the CPU reference implementation itself, so
- * the result stays bit-identical without a device-side fallback. This is
- * rare (it needs more than 32 neighbours cutting one slice circle).
+ * the result stays bit-identical without a device-side fallback. It needs
+ * more than 32 neighbours cutting one slice circle: rare for heavy atoms,
+ * common with explicit hydrogens.
  */
 static int
 lr_recompute_overflow_atoms(fastsasa_device_context *context,
@@ -4828,11 +4838,25 @@ lr_recompute_overflow_atoms(fastsasa_device_context *context,
         y = split + n_atoms;
         z = split + 2 * n_atoms;
     }
-    for (int atom = 0; atom < n_atoms && status == FASTSASA_SUCCESS; ++atom) {
-        if (flags[atom]) {
-            status = fastsasa_cpu_lee_richards_atom(n_atoms, input->n_points, x, y, z,
-                                                  input->radii, atom, &sasa[atom]);
+    {
+        /* Compact the flagged atoms in place and recompute them together
+         * with the threaded cell-list path; explicit hydrogens can flag a
+         * large share of the system. */
+        double *areas = (double *)malloc(sizeof(double) * (size_t)n_overflow);
+        int count = 0;
+
+        if (areas == NULL) {
+            free(split);
+            free(flags);
+            return FASTSASA_MEMORY_ERROR;
         }
+        for (int atom = 0; atom < n_atoms; ++atom) {
+            if (flags[atom]) flags[count++] = atom;
+        }
+        status = fastsasa_cpu_lee_richards_centers(n_atoms, input->n_points, x, y, z, input->radii, 0,
+                                                   flags, count, areas);
+        for (int i = 0; status == FASTSASA_SUCCESS && i < count; ++i) sasa[flags[i]] = areas[i];
+        free(areas);
     }
     free(split);
     free(flags);
@@ -5052,6 +5076,16 @@ fastsasa_device_context_lee_richards(fastsasa_device_context *context,
             context->d_sasa_f,
             context->d_sasa);
     } else if (float_lr) {
+        status = ensure_device_capacity((void **)&context->d_lr_overflow,
+                                        &context->lr_overflow_capacity,
+                                        sizeof(int) * (size_t)input->n_atoms);
+        if (status != FASTSASA_SUCCESS) return status;
+        if (cuda_status(cudaMemsetAsync(context->d_lr_overflow, 0,
+                                        sizeof(int) * (size_t)input->n_atoms,
+                                        context->stream)) != FASTSASA_SUCCESS) {
+            goto cuda_fail;
+        }
+        lr_overflow_checked = 1;
         lee_richards_cell_slice_float_kernel<<<lr_blocks, prep_threads, 0, context->stream>>>(
             input->n_atoms,
             input->n_points,
@@ -5065,7 +5099,8 @@ fastsasa_device_context_lee_richards(fastsasa_device_context *context,
             context->d_atom_cells,
             context->d_cell_offsets,
             context->d_cell_atoms,
-            context->d_sasa);
+            context->d_sasa,
+            context->d_lr_overflow);
     } else {
         {
             const double eps32 = 5.9604644775390625e-8; /* 2^-24 */

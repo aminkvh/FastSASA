@@ -16,3 +16,5 @@ __pycache__/
 *.py[cod]
 /tools/manuscript_benchmark_2026_freesasa_driver/freesasa_calc_coord_driver
 /tools/manuscript_benchmark_2026_freesasa_driver/build/
+.*.xtc_offsets.npz
+.*.xtc_offsets.lock

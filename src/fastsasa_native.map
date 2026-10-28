@@ -12,8 +12,10 @@
         fastsasa_cpu_exposed_points;
         fastsasa_cpu_lee_richards;
         fastsasa_cpu_lee_richards_atom;
+        fastsasa_cpu_lee_richards_centers;
         fastsasa_cpu_shrake_rupley;
         fastsasa_cpu_shrake_rupley_precision;
+        fastsasa_cpu_shrake_rupley_centers;
         fastsasa_cpu_shrake_rupley_mask;
         fastsasa_cpu_shrake_rupley_mask_fp32;
         fastsasa_cpu_mask_table_acquire;
@@ -32,6 +34,7 @@
         fastsasa_context_shrake_rupley_cell_list;
         fastsasa_context_shrake_rupley_exposed_points_cell_list;
         fastsasa_canonical_residue;
+        fastsasa_canonical_atom;
         fastsasa_context_shrake_rupley_cell_list_async;
         fastsasa_context_shrake_rupley_cell_list_total;
         fastsasa_context_shrake_rupley_cell_list_total_async;
@@ -45,7 +48,9 @@
         fastsasa_host_alloc;
         fastsasa_host_free;
         fastsasa_default_config_candidate;
+        fastsasa_default_config_text;
         fastsasa_element_class;
+        fastsasa_element_from_mass;
         fastsasa_element_radius;
         fastsasa_infer_element;
         fastsasa_last_error;

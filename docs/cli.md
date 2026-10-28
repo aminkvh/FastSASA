@@ -13,18 +13,23 @@ to `PATH` or prefix the commands accordingly.
 
 ## Choosing a Backend and Precision
 
-FastSASA has three compute backends. By default it picks the first one that is
-compiled in and available at runtime, in this order:
+FastSASA has three compute backends. For trajectories it picks the first one
+that is compiled in and available at runtime, in this order:
 
 1. CUDA (NVIDIA GPUs)
-2. Vulkan (NVIDIA, AMD, and Intel GPUs)
+2. Vulkan (NVIDIA, AMD, and Intel GPUs; software renderers such as llvmpipe
+   are skipped)
 3. Native threaded CPU
+
+For a single structure, `auto` uses the threaded CPU backend: one structure
+finishes in milliseconds, faster than a GPU can be initialized. Use
+`--backend cuda` or `--backend vulkan` to run a structure on a GPU anyway.
 
 You can pin a backend explicitly:
 
 | Option | Meaning |
 | --- | --- |
-| `--backend auto\|vulkan\|cuda\|cpu` | select the compute backend; `auto` is the default order above |
+| `--backend auto\|vulkan\|cuda\|cpu` | select the compute backend; `auto` follows the rules above |
 | `--cpu` | shorthand for `--backend cpu` |
 | `--no-cpu-fallback` | fail instead of falling back to CPU (structure command) |
 
@@ -39,7 +44,9 @@ CUDA FP64 Shrake-Rupley and Lee-Richards results are bit-identical to the
 CPU reference, atom for atom (both use non-contracted arithmetic in the
 CPU's operation order and the same acos/atan2 implementation, and totals,
 residue sums, and selection sums are formed on the host in a fixed order on
-every backend). `--precision fp32` trades that guarantee for speed. Observed
+every backend). This holds on every Vulkan driver, including ones whose
+own FP64 division and square root are not correctly rounded: the shaders
+round these operations themselves. `--precision fp32` trades that guarantee for speed. Observed
 maximum relative error against the FP64 reference is around 1e-5 for
 structure totals; on trajectory per-frame totals it is typically below 4e-5
 for whole-system sums and up to a few times 1e-4 for small selection sums
@@ -48,6 +55,11 @@ for whole-system sums and up to a few times 1e-4 for small selection sums
 Vulkan FP64 requires the device feature `shaderFloat64`. On a Vulkan device
 without it, requesting FP64 fails with a clear error; either add
 `--precision fp32` or let `--backend auto` fall back to the CPU path.
+
+On slower GPUs, such as integrated graphics, Vulkan Lee-Richards work is
+sent to the GPU in short pieces so the driver does not reset it. If the
+driver still stops part of the work, the affected atoms are recomputed on
+the CPU or FastSASA stops with an error; it never returns incomplete results.
 
 `--backend cpu --precision fp32` is also supported, for Shrake-Rupley only;
 CPU Lee-Richards is fp64-only and prints a warning (computing at fp64) if
@@ -101,9 +113,8 @@ moves the GPU crossover.
 ## Radius Assignment
 
 FastSASA assigns atom radii from a user-provided `--config-file`, then
-`FASTSASA_DEFAULT_CONFIG` when set, then the bundled `share/protor.config`
-table, with an element-radius fallback (and a warning) for unknown
-residue/atom pairs. See
+`FASTSASA_DEFAULT_CONFIG` when set, then its built-in ProtOr table, with an
+element-radius fallback (and a warning) for unknown residue/atom pairs. See
 [Radius Configuration](classifier_config.md) for the full assignment order,
 the warning format, the `--unknown skip|halt` policies, and the config file
 format.
@@ -154,7 +165,7 @@ fastsasa --format json structure.pdb
 fastsasa --format xml structure.pdb
 ```
 
-CIF output keeps the source mmCIF text and appends FastSASA-owned
+CIF output keeps the source mmCIF text and appends FastSASA's own
 `_FastSASA_*` result categories.
 
 ## Advanced Structure Input
@@ -225,7 +236,7 @@ Options:
 | `--precision fp64\|fp32` | arithmetic precision, default `fp64` |
 | `--output FILE`, `-o FILE` | write trajectory CSV output to a file instead of stdout |
 | `--summary` | output total SASA summary |
-| `--residue` | output residue SASA per frame |
+| `--residue` | output SASA per frame for each residue that has calculated atoms |
 | `--config-file FILE`, `-c FILE` | load a radius configuration |
 | `--hydrogen`, `-Y` | include hydrogen atoms in the calculation |
 | `--hetatm`, `-H` | include PDB/mmCIF HETATM records in the calculation |

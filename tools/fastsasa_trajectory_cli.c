@@ -26,6 +26,8 @@ typedef struct radius_config {
     double *radii;
     int *classes;
     int n;
+    char name[64];
+    char source[256];
 } radius_config;
 
 enum {
@@ -180,83 +182,136 @@ radius_config_add(radius_config *config,
     return 1;
 }
 
+typedef struct radius_config_parser {
+    char section[32];
+    char type_names[256][64];
+    double type_radii[256];
+    int type_classes[256];
+    int n_types;
+} radius_config_parser;
+
+/* One line of a FreeSASA-style `types:`/`atoms:` table. Returns 0 only when
+ * memory runs out. */
+static int
+radius_config_parse_line(radius_config_parser *parser,
+                         radius_config *config,
+                         char *line)
+{
+    char *hash = strchr(line, '#');
+    char first[64], second[64], third[64];
+
+    if (hash != NULL) *hash = '\0';
+    first[0] = '\0';
+    second[0] = '\0';
+    third[0] = '\0';
+    if (sscanf(line, "%63s", first) != 1) return 1;
+    if (strcmp(first, "types:") == 0) {
+        snprintf(parser->section, sizeof(parser->section), "%s", "types");
+        return 1;
+    }
+    if (strcmp(first, "atoms:") == 0) {
+        snprintf(parser->section, sizeof(parser->section), "%s", "atoms");
+        return 1;
+    }
+    if (strcmp(first, "name:") == 0) {
+        if (sscanf(line, "%63s %63s", first, config->name) != 2) config->name[0] = '\0';
+        parser->section[0] = '\0';
+        return 1;
+    }
+    if (first[strlen(first) - 1u] == ':') {
+        parser->section[0] = '\0';
+        return 1;
+    }
+    if (strcmp(parser->section, "types") == 0 && parser->n_types < 256 &&
+        sscanf(line, "%63s %lf %63s", first, &parser->type_radii[parser->n_types], second) >= 2) {
+        snprintf(parser->type_names[parser->n_types], sizeof(parser->type_names[0]), "%s", first);
+        upper_inplace(parser->type_names[parser->n_types]);
+        parser->type_classes[parser->n_types] = class_from_text(second);
+        ++parser->n_types;
+    } else if (strcmp(parser->section, "atoms") == 0 &&
+               sscanf(line, "%63s %63s %63s", first, second, third) == 3) {
+        double radius = -1.0;
+        int atom_class = FASTSASA_CLASS_UNKNOWN;
+
+        upper_inplace(third);
+        for (int i = 0; i < parser->n_types; ++i) {
+            if (strcmp(parser->type_names[i], third) == 0) {
+                radius = parser->type_radii[i];
+                atom_class = parser->type_classes[i];
+                break;
+            }
+        }
+        if (radius > 0.0 && !radius_config_add(config, first, second, radius, atom_class)) return 0;
+    }
+    return 1;
+}
+
 static int
 load_radius_config(const char *path,
                    radius_config *config)
 {
     FILE *file = fopen(path, "r");
     char line[512];
-    char section[32] = "";
-    char type_names[256][64];
-    double type_radii[256];
-    int type_classes[256];
-    int n_types = 0;
+    radius_config_parser *parser;
+    int ok = 1;
 
     if (file == NULL) return 0;
-    memset(config, 0, sizeof(*config));
-    while (fgets(line, sizeof(line), file) != NULL) {
-        char *hash = strchr(line, '#');
-        char first[64], second[64], third[64];
-
-        if (hash != NULL) *hash = '\0';
-        first[0] = '\0';
-        second[0] = '\0';
-        third[0] = '\0';
-        if (sscanf(line, "%63s", first) != 1) continue;
-        if (strcmp(first, "types:") == 0) {
-            snprintf(section, sizeof(section), "%s", "types");
-            continue;
-        }
-        if (strcmp(first, "atoms:") == 0) {
-            snprintf(section, sizeof(section), "%s", "atoms");
-            continue;
-        }
-        if (first[strlen(first) - 1u] == ':') {
-            section[0] = '\0';
-            continue;
-        }
-        if (strcmp(section, "types") == 0 && n_types < 256 &&
-            sscanf(line, "%63s %lf %63s", first, &type_radii[n_types], second) >= 2) {
-            snprintf(type_names[n_types], sizeof(type_names[n_types]), "%s", first);
-            upper_inplace(type_names[n_types]);
-            type_classes[n_types] = class_from_text(second);
-            ++n_types;
-        } else if (strcmp(section, "atoms") == 0 &&
-                   sscanf(line, "%63s %63s %63s", first, second, third) == 3) {
-            double radius = -1.0;
-            int atom_class = FASTSASA_CLASS_UNKNOWN;
-
-            upper_inplace(third);
-            for (int i = 0; i < n_types; ++i) {
-                if (strcmp(type_names[i], third) == 0) {
-                    radius = type_radii[i];
-                    atom_class = type_classes[i];
-                    break;
-                }
-            }
-            if (radius > 0.0 && !radius_config_add(config, first, second, radius, atom_class)) {
-                fclose(file);
-                return 0;
-            }
-        }
+    parser = (radius_config_parser *)calloc(1u, sizeof(*parser));
+    if (parser == NULL) {
+        fclose(file);
+        return 0;
     }
+    memset(config, 0, sizeof(*config));
+    while (ok && fgets(line, sizeof(line), file) != NULL) ok = radius_config_parse_line(parser, config, line);
     fclose(file);
-    return 1;
+    free(parser);
+    snprintf(config->source, sizeof(config->source), "%s", path);
+    return ok;
 }
 
+/* The built-in ProtOr table (share/protor.config compiled into the library). */
+static int
+load_builtin_radius_config(radius_config *config)
+{
+    size_t length = 0u;
+    const char *text = fastsasa_default_config_text(&length);
+    radius_config_parser *parser = (radius_config_parser *)calloc(1u, sizeof(*parser));
+    size_t begin = 0u;
+    int ok = 1;
+
+    if (parser == NULL) return 0;
+    memset(config, 0, sizeof(*config));
+    while (ok && begin < length) {
+        char line[512];
+        size_t end = begin;
+        size_t n;
+
+        while (end < length && text[end] != '\n') ++end;
+        n = end - begin < sizeof(line) - 1u ? end - begin : sizeof(line) - 1u;
+        memcpy(line, text + begin, n);
+        line[n] = '\0';
+        ok = radius_config_parse_line(parser, config, line);
+        begin = end + 1u;
+    }
+    free(parser);
+    snprintf(config->source, sizeof(config->source), "%s", "built-in");
+    return ok;
+}
+
+/* FASTSASA_DEFAULT_CONFIG names a replacement default table; otherwise the
+ * built-in ProtOr table is used. */
 static int
 load_default_radius_config(radius_config *config)
 {
     const char *env_path = getenv("FASTSASA_DEFAULT_CONFIG");
 
-    if (env_path != NULL && env_path[0] != '\0' && load_radius_config(env_path, config)) return 1;
-    for (size_t i = 0;; ++i) {
-        const char *candidate = fastsasa_default_config_candidate(i);
-
-        if (candidate == NULL) break;
-        if (load_radius_config(candidate, config)) return 1;
+    if (env_path != NULL && env_path[0] != '\0') {
+        if (load_radius_config(env_path, config)) return 1;
+        fprintf(stderr, "FastSASA: warning: cannot read FASTSASA_DEFAULT_CONFIG=%s; using the built-in ProtOr table\n",
+                env_path);
+        radius_config_free(config);
     }
-    return 0;
+    return load_builtin_radius_config(config);
 }
 
 static int
@@ -275,7 +330,8 @@ config_index_for_key(const radius_config *config,
 }
 
 /* Exact residue:atom entry first; then the same atom under the canonical
- * residue name for MD variants (HIE -> HIS, CYX -> CYS, ...). */
+ * residue name for MD variants (HIE -> HIS, CYX -> CYS, ...); then the
+ * CHARMM/GROMACS atom-name alias (ILE CD -> CD1, OT1 -> O, ...). */
 static int
 config_lookup(const radius_config *config,
               const char *residue,
@@ -283,13 +339,19 @@ config_lookup(const radius_config *config,
 {
     int index;
     const char *canonical;
+    const char *alias_residue = NULL;
+    const char *alias_atom = NULL;
 
     if (config == NULL) return -1;
     index = config_index_for_key(config, residue, atom);
     if (index >= 0) return index;
     canonical = fastsasa_canonical_residue(residue);
-    if (canonical == NULL) return -1;
-    return config_index_for_key(config, canonical, atom);
+    if (canonical != NULL) {
+        index = config_index_for_key(config, canonical, atom);
+        if (index >= 0) return index;
+    }
+    if (!fastsasa_canonical_atom(residue, atom, &alias_residue, &alias_atom)) return -1;
+    return config_index_for_key(config, alias_residue != NULL ? alias_residue : residue, alias_atom);
 }
 
 static double
@@ -485,7 +547,13 @@ read_psf_topology(const char *path,
             fastsasa_topology_free(topology);
             return 0;
         }
-        fastsasa_infer_element(element, sizeof(element), atom_name, atom_type);
+        /* The PSF type column holds force-field types (CT3, HA3, CA for an
+         * aromatic carbon), not elements, so the element comes from the
+         * mass, then from the atom name. */
+        (void)atom_type;
+        if (!fastsasa_element_from_mass(element, sizeof(element), mass, atom_name)) {
+            fastsasa_infer_element(element, sizeof(element), atom_name, "");
+        }
         radius = configured_radius(residue_name, atom_name, element, config);
         if (radius <= 0.0) radius = fastsasa_element_radius(element);
         if (radius <= 0.0) radius = 1.70;
@@ -882,6 +950,52 @@ build_filter_indices(const selection_plan *plan,
     return 1;
 }
 
+/* One warning per run for calculated atoms the radius table does not list:
+ * their radii come from the element (Bondi), and their polar/apolar class is
+ * unknown. Lists the first few distinct residue/atom names. */
+static void
+warn_unlisted_atoms(const fastsasa_owned_topology *topology,
+                    const radius_config *config,
+                    const int *indices,
+                    int n_indices)
+{
+    enum { kMaxListed = 8 };
+    char listed[kMaxListed][96];
+    int n_listed = 0;
+    int n_unlisted = 0;
+    int n_more = 0;
+
+    for (int i = 0; i < n_indices; ++i) {
+        const int atom = indices != NULL ? indices[i] : i;
+        const char *residue = topology->residue_names[atom];
+        const char *name = topology->atom_names[atom];
+        char entry[96];
+        int seen = 0;
+
+        if (config_lookup(config, residue, name) >= 0) continue;
+        ++n_unlisted;
+        const char *element = topology->elements != NULL ? topology->elements[atom] : NULL;
+
+        snprintf(entry, sizeof(entry), "%s %s (%s, %.2f A)", residue, name,
+                 element != NULL && element[0] != '\0' ? element : "?", topology->radii[atom]);
+        for (int k = 0; k < n_listed && !seen; ++k) seen = strcmp(listed[k], entry) == 0;
+        if (seen) continue;
+        if (n_listed < kMaxListed) {
+            snprintf(listed[n_listed++], sizeof(listed[0]), "%s", entry);
+        } else {
+            ++n_more;
+        }
+    }
+    if (n_unlisted == 0) return;
+    fprintf(stderr, "FastSASA: warning: %d calculated atom%s not in the radius table (%s); "
+            "element radii used, class unknown:",
+            n_unlisted, n_unlisted == 1 ? " is" : "s are",
+            config != NULL && config->name[0] != '\0' ? config->name : "none loaded");
+    for (int k = 0; k < n_listed; ++k) fprintf(stderr, "%s %s", k == 0 ? "" : ",", listed[k]);
+    if (n_more > 0) fprintf(stderr, ", and %d more name%s", n_more, n_more == 1 ? "" : "s");
+    fprintf(stderr, "\n");
+}
+
 static int
 build_class_selection_masks(const fastsasa_owned_topology *topology,
                             const selection_plan *selections,
@@ -1052,6 +1166,7 @@ typedef struct {
     int *frame_indices;
     int batch_count;
     int seek_failed_frame;
+    int read_failed_frame;
 } batch_read_job;
 
 static void
@@ -1059,6 +1174,7 @@ fill_batch(batch_read_job *job)
 {
     job->batch_count = 0;
     job->seek_failed_frame = -1;
+    job->read_failed_frame = -1;
     while (job->batch_count < job->batch_size &&
            (job->plan->stream_all ||
             *job->frame_position < job->plan->n_indices)) {
@@ -1076,6 +1192,7 @@ fill_batch(batch_read_job *job)
         if (job->filter_indices != NULL) {
             if (!trajectory_reader_read_frame_soa(job->reader, job->x_full,
                                                   job->y_full, job->z_full)) {
+                if (!job->plan->stream_all) job->read_failed_frame = requested_frame;
                 break;
             }
             for (int atom = 0; atom < job->n_calc_atoms; ++atom) {
@@ -1086,6 +1203,7 @@ fill_batch(batch_read_job *job)
                 z[atom] = job->z_full[source];
             }
         } else if (!trajectory_reader_read_frame_soa(job->reader, x, y, z)) {
+            if (!job->plan->stream_all) job->read_failed_frame = requested_frame;
             break;
         }
         job->frame_indices[job->batch_count] = requested_frame;
@@ -1294,6 +1412,7 @@ run_topology_trajectory(const char *topology_path,
     int n_calc_atoms = 0;
     double *filtered_radii = NULL;
     int *filtered_residue_ids = NULL;
+    unsigned char *residue_in_filter = NULL;
     int frame_position = 0;
     int frames_processed = 0;
     int *batch_frame_indices = NULL;
@@ -1374,6 +1493,7 @@ run_topology_trajectory(const char *topology_path,
         if (out != stdout) fclose(out);
         return 1;
     }
+    warn_unlisted_atoms(&topology, config, filter_indices, n_calc_atoms);
     if (!build_selection_plan(&selections, &topology, selection_commands, n_selections)) {
         fprintf(stderr, "failed to build reusable selection masks\n");
         selection_plan_release(&filter);
@@ -1482,6 +1602,21 @@ run_topology_trajectory(const char *topology_path,
         fprintf(stderr, "failed to build filtered topology\n");
         status = FASTSASA_MEMORY_ERROR;
         goto cleanup;
+    }
+    /* Per-residue output lists only residues with calculated atoms, so a
+     * protein filter on a solvated system does not print every water. */
+    if (residue_output && topology.n_residues > 0) {
+        residue_in_filter = (unsigned char *)calloc((size_t)topology.n_residues, 1u);
+        if (residue_in_filter == NULL) {
+            fprintf(stderr, "failed to allocate the residue list\n");
+            status = FASTSASA_MEMORY_ERROR;
+            goto cleanup;
+        }
+        for (int atom = 0; atom < sasa_topology.n_atoms; ++atom) {
+            const int residue = sasa_topology.residue_ids[atom];
+
+            if (residue >= 0 && residue < topology.n_residues) residue_in_filter[residue] = 1u;
+        }
     }
     if (filter_indices != NULL &&
         !compact_selection_plan(&selections, filter_indices, n_calc_atoms, topology.n_atoms, "selection")) {
@@ -1632,6 +1767,7 @@ run_topology_trajectory(const char *topology_path,
             jobs[side].frame_indices = batch_frame_indices + (size_t)side * (size_t)batch_size;
             jobs[side].batch_count = 0;
             jobs[side].seek_failed_frame = -1;
+            jobs[side].read_failed_frame = -1;
         }
         fill_batch(&jobs[current]);
 
@@ -1644,6 +1780,12 @@ run_topology_trajectory(const char *topology_path,
         if (job->seek_failed_frame >= 0) {
             fprintf(stderr, "failed to seek trajectory frame: %d\n",
                     job->seek_failed_frame);
+            status = FASTSASA_INVALID_ARGUMENT;
+            goto cleanup;
+        }
+        if (job->read_failed_frame >= 0) {
+            fprintf(stderr, "failed to read trajectory frame: %d (file truncated or corrupt)\n",
+                    job->read_failed_frame);
             status = FASTSASA_INVALID_ARGUMENT;
             goto cleanup;
         }
@@ -1660,6 +1802,7 @@ run_topology_trajectory(const char *topology_path,
         } else {
             jobs[1 - current].batch_count = 0;
             jobs[1 - current].seek_failed_frame = -1;
+            jobs[1 - current].read_failed_frame = -1;
         }
         frames.x = job->x;
         frames.y = job->y;
@@ -1772,6 +1915,7 @@ run_topology_trajectory(const char *topology_path,
                 }
             } else if (residue_output) {
                 for (int residue = 0; residue < topology.n_residues; ++residue) {
+                    if (!residue_in_filter[residue]) continue;
                     fprintf(out,
                             "%d,%d,%.12f,%.12f,%.9f\n",
                             frame_ids[i],
@@ -1908,45 +2052,51 @@ surface_export_failed:
     if (summary_output) {
         double gpu_fps = gpu_seconds > 0.0 ? (double)frames_processed / gpu_seconds : 0.0;
         double wall_fps = wall_seconds > 0.0 ? (double)frames_processed / wall_seconds : 0.0;
+        char radii[340];
+
+        /* The radius set behind the run: table name and source. */
+        snprintf(radii, sizeof(radii), "%s (%s)",
+                 config != NULL && config->name[0] != '\0' ? config->name : "unnamed table",
+                 config != NULL && config->source[0] != '\0' ? config->source : "none");
 
         if (class_output && n_selections > 0) {
-            fprintf(out, "frames,known_frames,atoms,batch_size,selection,total_sasa_sum,polar_sasa_sum,apolar_sasa_sum,unknown_sasa_sum,gpu_seconds,wall_seconds,gpu_frames_per_second,wall_frames_per_second\n");
+            fprintf(out, "frames,known_frames,atoms,batch_size,selection,total_sasa_sum,polar_sasa_sum,apolar_sasa_sum,unknown_sasa_sum,gpu_seconds,wall_seconds,gpu_frames_per_second,wall_frames_per_second,radii\n");
             for (int selection = 0; selection < n_selections; ++selection) {
                 const size_t base = (size_t)selection * 4u;
 
                 fprintf(out,
-                        "%d,%d,%d,%d,%s,%.12f,%.12f,%.12f,%.12f,%.9f,%.9f,%.6f,%.6f\n",
+                        "%d,%d,%d,%d,%s,%.12f,%.12f,%.12f,%.12f,%.9f,%.9f,%.6f,%.6f,\"%s\"\n",
                         frames_processed, known_frames, n_calc_atoms, batch_size, selections.names[selection],
                         selection_sasa_sum[base],
                         selection_sasa_sum[base + 1u],
                         selection_sasa_sum[base + 2u],
                         selection_sasa_sum[base + 3u],
-                        gpu_seconds, wall_seconds, gpu_fps, wall_fps);
+                        gpu_seconds, wall_seconds, gpu_fps, wall_fps, radii);
             }
         } else if (class_output) {
-            fprintf(out, "frames,known_frames,atoms,batch_size,total_sasa_sum,polar_sasa_sum,apolar_sasa_sum,unknown_sasa_sum,gpu_seconds,wall_seconds,gpu_frames_per_second,wall_frames_per_second\n");
+            fprintf(out, "frames,known_frames,atoms,batch_size,total_sasa_sum,polar_sasa_sum,apolar_sasa_sum,unknown_sasa_sum,gpu_seconds,wall_seconds,gpu_frames_per_second,wall_frames_per_second,radii\n");
             fprintf(out,
-                    "%d,%d,%d,%d,%.12f,%.12f,%.12f,%.12f,%.9f,%.9f,%.6f,%.6f\n",
+                    "%d,%d,%d,%d,%.12f,%.12f,%.12f,%.12f,%.9f,%.9f,%.6f,%.6f,\"%s\"\n",
                     frames_processed, known_frames, n_calc_atoms, batch_size, total_sasa_sum,
                     selection_sasa_sum[0],
                     selection_sasa_sum[1],
                     selection_sasa_sum[2],
-                    gpu_seconds, wall_seconds, gpu_fps, wall_fps);
+                    gpu_seconds, wall_seconds, gpu_fps, wall_fps, radii);
         } else if (n_selections > 0) {
-            fprintf(out, "frames,known_frames,atoms,batch_size,selection,selection_sasa_sum,gpu_seconds,wall_seconds,gpu_frames_per_second,wall_frames_per_second\n");
+            fprintf(out, "frames,known_frames,atoms,batch_size,selection,selection_sasa_sum,gpu_seconds,wall_seconds,gpu_frames_per_second,wall_frames_per_second,radii\n");
             for (int selection = 0; selection < n_selections; ++selection) {
                 fprintf(out,
-                        "%d,%d,%d,%d,%s,%.12f,%.9f,%.9f,%.6f,%.6f\n",
+                        "%d,%d,%d,%d,%s,%.12f,%.9f,%.9f,%.6f,%.6f,\"%s\"\n",
                         frames_processed, known_frames, n_calc_atoms, batch_size, selections.names[selection],
                         selection_sasa_sum[selection],
-                        gpu_seconds, wall_seconds, gpu_fps, wall_fps);
+                        gpu_seconds, wall_seconds, gpu_fps, wall_fps, radii);
             }
         } else {
-            fprintf(out, "frames,known_frames,atoms,batch_size,total_sasa_sum,gpu_seconds,wall_seconds,gpu_frames_per_second,wall_frames_per_second\n");
+            fprintf(out, "frames,known_frames,atoms,batch_size,total_sasa_sum,gpu_seconds,wall_seconds,gpu_frames_per_second,wall_frames_per_second,radii\n");
             fprintf(out,
-                    "%d,%d,%d,%d,%.12f,%.9f,%.9f,%.6f,%.6f\n",
+                    "%d,%d,%d,%d,%.12f,%.9f,%.9f,%.6f,%.6f,\"%s\"\n",
                     frames_processed, known_frames, n_calc_atoms, batch_size, total_sasa_sum,
-                    gpu_seconds, wall_seconds, gpu_fps, wall_fps);
+                    gpu_seconds, wall_seconds, gpu_fps, wall_fps, radii);
         }
     }
     status = FASTSASA_SUCCESS;
@@ -2005,6 +2155,7 @@ cleanup:
     free(filter_indices);
     free(filtered_radii);
     free(filtered_residue_ids);
+    free(residue_in_filter);
     trajectory_reader_close(&reader);
     fastsasa_topology_free(&topology);
     if (out != stdout) fclose(out);

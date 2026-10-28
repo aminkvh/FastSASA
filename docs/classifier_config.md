@@ -6,15 +6,25 @@ FastSASA assigns a radius to every included atom before SASA calculation.
 
 1. User-provided `--config-file FILE`.
 2. `FASTSASA_DEFAULT_CONFIG`, when set.
-3. Bundled or installed `share/protor.config`.
+3. The ProtOr table built into FastSASA (the same content as
+   `share/protor.config`).
 4. Element-radius fallback for unknown residue/atom pairs.
 
-When running from a source tree or an installed prefix, FastSASA searches common
-`share/protor.config` locations automatically. If you run the binary from an
-unusual directory layout, pass `--config-file` or set `FASTSASA_DEFAULT_CONFIG`
-so the intended radius table is unambiguous.
+The ProtOr table is compiled into the program, so the radii do not depend on
+the directory you run FastSASA from. JSON and XML output, and the trajectory
+`--summary` CSV, record which radius table was used.
 
-When FastSASA uses an element fallback, it prints a warning:
+CHARMM and GROMACS atom names that differ from the PDB names in the table are
+mapped automatically: `ILE CD` to `CD1`, C-terminal `OT1`/`OT2` (or
+`OC1`/`OC2`) to `O`/`OXT`, the ACE cap atoms `CAY`/`CY`/`OY`, and nucleic
+`O1P`/`O2P`. For PSF topologies the element of each atom comes from its mass,
+because the PSF type column holds force-field atom types, not elements.
+Hydrogen mass repartitioning (HMR) is handled: a heavy atom carrying
+repartitioned hydrogen mass is still read as its own element, using the
+atom name to decide when a mass is ambiguous.
+
+When FastSASA uses an element fallback, it prints a warning (the trajectory
+command prints one summary line listing the affected residue/atom names):
 
 ```text
 FastSASA: warning: atom 'NAG C1' unknown, guessing element is 'C', and radius 1.700 A
@@ -126,7 +136,7 @@ or rely on element guessing when approximate lipid radii are acceptable.
 
 Relative-SASA (RSA) output uses the bundled ProtOr residue references. They
 are reported whenever the loaded config declares `name: ProtOr`, which the
-bundled `share/protor.config` does, whether it was auto-discovered, named by
+built-in table does, whether it is the default, named by
 `FASTSASA_DEFAULT_CONFIG`, or passed with `--config-file`. Any other table,
 including the glycan extension (`name: ProtOr-Glycans`), reports `N/A` for
 the relative fields, because the references describe ProtOr radii only.

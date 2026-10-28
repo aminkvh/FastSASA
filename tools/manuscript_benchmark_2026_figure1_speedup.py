@@ -128,7 +128,7 @@ def main():
     fig.suptitle(
         "Figure 1. Trajectory-engine speedup vs. single-thread FreeSASA, averaged across two public systems\n"
         "Shrake-Rupley, 100 points/atom, 1.4 A probe, protein-only systems (no solvent, ions, or membrane).\n"
-        "Cx46 hemichannel (34,764 protein atoms) and GABA_A receptor, betaAbetaAgamma stoichiometry (27,324 protein atoms).\n"
+        "Cx46 gap-junction channel (34,764 protein atoms) and GABA_A receptor, betaAbetaAgamma stoichiometry (27,324 protein atoms).\n"
         "Error bars = min-max speedup across the 2 datasets, not repeat variance (each per-dataset value is itself a\n"
         "median of 3 timed repeats). Raw per-dataset frames/s and citations are in Table S2.",
         fontsize=9.5, y=1.05)

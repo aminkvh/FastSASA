@@ -474,6 +474,7 @@ struct WorkerArgs {
     const double *test_points;
     const float *test_points_f;      /* FP32 mode only */
     bool fp32;
+    const int *slots;                /* slots to compute; nullptr: every slot */
     double *sasa;
     Stats *stats;
     std::atomic<int> *status;
@@ -601,7 +602,8 @@ static FASTSASA_ALWAYS_INLINE void worker_body(const WorkerArgs &A, int begin, i
                              (long long)0x8000000000000000ULL, (long long)0x8000000000000000ULL};
 #endif
 
-        for (int slot = begin; slot < end; ++slot) {
+        for (int work = begin; work < end; ++work) {
+            const int slot = A.slots != nullptr ? A.slots[work] : work;
             const int atom = grid.atom_of[static_cast<size_t>(slot)];
             const double ri = gsr[slot];
             const double ri2 = gsr2[slot];
@@ -917,9 +919,12 @@ fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points, i
     return work >= break_even ? 1 : 0;
 }
 
+/* centers, when not null, lists the atoms whose SASA is computed (all atoms
+ * still occlude); the other entries of sasa are set to zero. */
 static int
 mask_kernel(int n_atoms, int n_points, const double *x, const double *y, const double *z,
-            const double *expanded_radii, const double *test_points, int n_threads, bool fp32, double *sasa)
+            const double *expanded_radii, const double *test_points, int n_threads, bool fp32,
+            const int *centers, int n_centers, double *sasa)
 {
     if (n_points > kMaxPoints) return kUnsupported;
     if (n_points <= 0 || n_atoms <= 0) return FASTSASA_INVALID_ARGUMENT;
@@ -936,6 +941,23 @@ mask_kernel(int n_atoms, int n_points, const double *x, const double *y, const d
      * 5x5x5 block, 42% less volume than 3x3x3 cells of twice the edge. */
     Grid grid;
     if (!grid.build(n_atoms, x, y, z, expanded_radii, 2.0 * max_radius, max_radius, fp32)) return kUnsupported;
+    /* Selected centres in slot order, so a worker's atoms stay spatially
+     * local exactly as in the full calculation. */
+    std::vector<int> slots;
+    int n_work = n_atoms;
+    if (centers != nullptr) {
+        std::vector<unsigned char> is_center(static_cast<size_t>(n_atoms), 0u);
+        for (int k = 0; k < n_centers; ++k) {
+            if (centers[k] < 0 || centers[k] >= n_atoms) return FASTSASA_INVALID_ARGUMENT;
+            is_center[static_cast<size_t>(centers[k])] = 1u;
+        }
+        for (int slot = 0; slot < n_atoms; ++slot) {
+            if (is_center[static_cast<size_t>(grid.atom_of[static_cast<size_t>(slot)])]) slots.push_back(slot);
+        }
+        n_work = static_cast<int>(slots.size());
+        std::fill(sasa, sasa + n_atoms, 0.0);
+        if (n_work == 0) return FASTSASA_SUCCESS;
+    }
     std::vector<float> points_f;
     if (fp32) {
         points_f.resize(3u * static_cast<size_t>(n_points));
@@ -949,10 +971,10 @@ mask_kernel(int n_atoms, int n_points, const double *x, const double *y, const d
     int count = n_threads > 0 ? n_threads : fastsasa_cpu_default_threads();
     if (count < 1) count = 1;
     if (n_threads <= 0) {
-        const int by_size = n_atoms / 256 + 1;
+        const int by_size = n_work / 256 + 1;
         if (count > by_size) count = by_size;
     }
-    if (count > n_atoms) count = n_atoms;
+    if (count > n_work) count = n_work;
 
     const bool want_stats = std::getenv("FASTSASA_CPU_MASK_STATS") != nullptr;
     std::vector<Stats> stats(static_cast<size_t>(count));
@@ -965,7 +987,8 @@ mask_kernel(int n_atoms, int n_points, const double *x, const double *y, const d
      * atoms are processed in sorted slot order so their neighbourhoods are
      * spatially and cache local). The worker is instantiated per mask width
      * so the visibility mask is a fixed-size register array. */
-    WorkerArgs args{grid, lut, test_points, fp32 ? points_f.data() : nullptr, fp32, sasa, stats.data(), &worker_status, &candidates};
+    WorkerArgs args{grid, lut, test_points, fp32 ? points_f.data() : nullptr, fp32,
+                    centers != nullptr ? slots.data() : nullptr, sasa, stats.data(), &worker_status, &candidates};
     auto run = [&](int begin, int end, int tid) {
         switch (words) {
         case 1: worker_impl<1>(args, begin, end, tid); break;
@@ -976,8 +999,8 @@ mask_kernel(int n_atoms, int n_points, const double *x, const double *y, const d
     };
 
     fastsasa_cpu::WorkerPool::run(count, [&](int tid) {
-        const int begin = static_cast<int>(static_cast<size_t>(tid) * static_cast<size_t>(n_atoms) / static_cast<size_t>(count));
-        const int end = static_cast<int>(static_cast<size_t>(tid + 1) * static_cast<size_t>(n_atoms) / static_cast<size_t>(count));
+        const int begin = static_cast<int>(static_cast<size_t>(tid) * static_cast<size_t>(n_work) / static_cast<size_t>(count));
+        const int end = static_cast<int>(static_cast<size_t>(tid + 1) * static_cast<size_t>(n_work) / static_cast<size_t>(count));
         run(begin, end, tid);
     });
     if (want_stats) {
@@ -1000,7 +1023,7 @@ extern "C" int
 fastsasa_cpu_shrake_rupley_mask(int n_atoms, int n_points, const double *x, const double *y, const double *z,
                                 const double *expanded_radii, const double *test_points, int n_threads, double *sasa)
 {
-    return mask_kernel(n_atoms, n_points, x, y, z, expanded_radii, test_points, n_threads, false, sasa);
+    return mask_kernel(n_atoms, n_points, x, y, z, expanded_radii, test_points, n_threads, false, nullptr, 0, sasa);
 }
 
 /* FP32 variant: same construction, with the neighbour prefilter, coincidence
@@ -1011,7 +1034,18 @@ extern "C" int
 fastsasa_cpu_shrake_rupley_mask_fp32(int n_atoms, int n_points, const double *x, const double *y, const double *z,
                                      const double *expanded_radii, const double *test_points, int n_threads, double *sasa)
 {
-    return mask_kernel(n_atoms, n_points, x, y, z, expanded_radii, test_points, n_threads, true, sasa);
+    return mask_kernel(n_atoms, n_points, x, y, z, expanded_radii, test_points, n_threads, true, nullptr, 0, sasa);
+}
+
+/* Selected-centre form of both variants, for fastsasa_cpu_shrake_rupley_centers
+ * (src/fastsasa_cpu.cc). Returns -100 for inputs the kernel does not handle. */
+extern "C" int
+fastsasa_cpu_shrake_rupley_mask_centers(int n_atoms, int n_points, const double *x, const double *y, const double *z,
+                                        const double *expanded_radii, const double *test_points, int n_threads,
+                                        int fp32, const int *centers, int n_centers, double *sasa)
+{
+    return mask_kernel(n_atoms, n_points, x, y, z, expanded_radii, test_points, n_threads, fp32 != 0,
+                       centers, n_centers, sasa);
 }
 
 /* Shared access to the direction table for the GPU backends. The handle keeps

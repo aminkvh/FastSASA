@@ -6,7 +6,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(FASTSASA_VERSION "0.1.0rc20" CACHE STRING "FastSASA release version")
+set(FASTSASA_VERSION "1.0.0" CACHE STRING "FastSASA release version")
 
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
@@ -296,11 +296,30 @@ if(FASTSASA_ENABLE_VULKAN)
     endif()
 endif()
 
-file(GLOB FASTSASA_MOLFILE_INCLUDE_HINTS "/usr/local/lib/*/plugins/include")
-find_path(FASTSASA_MOLFILE_INCLUDE_DIR
-    NAMES molfile_plugin.h
-    HINTS ${FASTSASA_MOLFILE_INCLUDE_HINTS}
+# Vendored xdrfile (BSD-2-Clause, see third-party/xdrfile/LICENSE.txt) gives
+# the CLI a native XTC reader. Third-party code: built without the project
+# warning flags.
+add_library(fastsasa_xdrfile OBJECT
+    third-party/xdrfile/xdrfile.c
+    third-party/xdrfile/xdrfile_xtc.c
 )
+target_include_directories(fastsasa_xdrfile PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third-party/xdrfile)
+target_compile_definitions(fastsasa_xdrfile PRIVATE _FILE_OFFSET_BITS=64 $<$<C_COMPILER_ID:MSVC>:_CRT_SECURE_NO_WARNINGS>)
+set_target_properties(fastsasa_xdrfile PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# The default ProtOr table is compiled into the library so radii never depend
+# on the working directory or on an installed data file; CMake re-embeds it
+# whenever share/protor.config changes.
+set(INPUT ${CMAKE_CURRENT_SOURCE_DIR}/share/protor.config)
+set(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/generated/fastsasa_protor_config.h)
+set(SYMBOL fastsasa_protor_config)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake)
+unset(INPUT)
+unset(OUTPUT)
+unset(SYMBOL)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/share/protor.config)
+set_source_files_properties(src/fastsasa_radius.c PROPERTIES
+    INCLUDE_DIRECTORIES ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 if(FASTSASA_BUILD_STATIC)
     add_library(fastsasa STATIC
@@ -314,6 +333,7 @@ if(FASTSASA_BUILD_STATIC)
         ${FASTSASA_DEVICE_SOURCE}
         ${FASTSASA_VULKAN_SOURCE}
         src/xtc_reader.c
+        $<TARGET_OBJECTS:fastsasa_xdrfile>
     )
 endif()
 
@@ -439,14 +459,10 @@ elseif(WIN32)
     set_target_properties(fastsasa_native PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
 
-if(FASTSASA_BUILD_STATIC AND FASTSASA_MOLFILE_INCLUDE_DIR)
+if(FASTSASA_BUILD_STATIC)
     target_include_directories(fastsasa
         PRIVATE
-            ${FASTSASA_MOLFILE_INCLUDE_DIR}
-    )
-    target_compile_definitions(fastsasa
-        PRIVATE
-            FASTSASA_HAVE_MOLFILE=1
+            ${CMAKE_CURRENT_SOURCE_DIR}/third-party/xdrfile
     )
 endif()
 
@@ -547,6 +563,9 @@ install(FILES
         licenses/TAO-PEGTL-MIT.txt
         licenses/FreeSASA-radii-table-MIT.txt
         licenses/volk-MIT.md
+        licenses/SunPro.txt
+        licenses/musl-MIT.txt
+        licenses/xdrfile-BSD-2-Clause.txt
     DESTINATION ${CMAKE_INSTALL_DATADIR}/fastsasa/licenses
 )
 install(DIRECTORY examples/
@@ -789,6 +808,11 @@ if(FASTSASA_BUILD_NATIVE_TESTS)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/trajectory_cli_dispatch_validation.py
                 --fastsasa $<TARGET_FILE:fastsasa_cli>
     )
+    # Skips (passes) when VMD is not installed.
+    add_test(NAME fastsasa_vmd_integration
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/vmd_integration_validation.py
+                --fastsasa $<TARGET_FILE:fastsasa_cli>
+    )
     # The same feature/RSA validation the GPU builds run, pinned to the
     # threaded CPU tier so CPU-only builds exercise it too (including the
     # --format rsa cross-check, the CPU FP32 path, and the FP64 fallbacks).
@@ -880,6 +904,7 @@ if(FASTSASA_BUILD_NATIVE_TESTS)
         fastsasa_python_feature_unit
         fastsasa_python_mdanalysis_adapter_unit
         fastsasa_trajectory_cli_dispatch
+        fastsasa_vmd_integration
         fastsasa_scientific_fixtures
         PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} LABELS "cpu;release"
     )

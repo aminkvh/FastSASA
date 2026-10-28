@@ -29,6 +29,11 @@ extern "C" int fastsasa_cpu_shrake_rupley_mask_fp32(int n_atoms, int n_points,
                                                     const double *x, const double *y, const double *z,
                                                     const double *expanded_radii, const double *test_points,
                                                     int n_threads, double *sasa);
+extern "C" int fastsasa_cpu_shrake_rupley_mask_centers(int n_atoms, int n_points,
+                                                       const double *x, const double *y, const double *z,
+                                                       const double *expanded_radii, const double *test_points,
+                                                       int n_threads, int fp32, const int *centers, int n_centers,
+                                                       double *sasa);
 
 static void
 join_threads(std::vector<std::thread> *threads) noexcept
@@ -256,6 +261,10 @@ cpu_frame_thread_count(int total_threads,
     return requested > 0 ? requested : 1;
 }
 
+/* centers, when not null, lists the atoms whose SASA is computed; every
+ * atom still occludes, and the other entries of sasa are set to zero. Each
+ * atom's area depends only on its neighbours, so the computed values equal
+ * the full calculation's bit for bit. */
 static int
 cpu_shrake_rupley_impl(int n_atoms,
                        int n_points,
@@ -265,6 +274,8 @@ cpu_shrake_rupley_impl(int n_atoms,
                        const double *expanded_radii,
                        const double *test_points,
                        int n_threads,
+                       const int *centers,
+                       int n_centers,
                        double *sasa)
 {
     std::vector<double> radius2;
@@ -284,28 +295,40 @@ cpu_shrake_rupley_impl(int n_atoms,
     if (max_radius <= 0.0 || !cell_keys_fit(n_atoms, x, y, z, max_radius)) {
         return FASTSASA_INVALID_ARGUMENT;
     }
-    if (fastsasa_cpu_mask_policy(n_atoms, n_points, test_points, n_threads)) {
-        const int status = fastsasa_cpu_shrake_rupley_mask(n_atoms, n_points, x, y, z,
-                                                           expanded_radii, test_points, n_threads, sasa);
+    const int n_work = centers != nullptr ? n_centers : n_atoms;
+    if (centers != nullptr) {
+        for (int k = 0; k < n_centers; ++k) {
+            if (centers[k] < 0 || centers[k] >= n_atoms) return FASTSASA_INVALID_ARGUMENT;
+        }
+    }
+    if (fastsasa_cpu_mask_policy(n_work, n_points, test_points, n_threads)) {
+        const int status = centers != nullptr
+            ? fastsasa_cpu_shrake_rupley_mask_centers(n_atoms, n_points, x, y, z, expanded_radii, test_points,
+                                                      n_threads, 0, centers, n_centers, sasa)
+            : fastsasa_cpu_shrake_rupley_mask(n_atoms, n_points, x, y, z,
+                                              expanded_radii, test_points, n_threads, sasa);
         if (status != -100) return status;
     }
+    if (centers != nullptr) std::fill(sasa, sasa + n_atoms, 0.0);
+    if (n_work == 0) return FASTSASA_SUCCESS;
     radius2.resize(static_cast<size_t>(n_atoms));
     for (int atom = 0; atom < n_atoms; ++atom) {
         radius2[static_cast<size_t>(atom)] = expanded_radii[atom] * expanded_radii[atom];
     }
-    count = thread_count(n_threads, n_atoms);
+    count = thread_count(n_threads, n_work);
     if (!env_enabled("FASTSASA_CPU_SIMD", 1)) {
         const cell_list cells(n_atoms, x, y, z, max_radius);
 
         fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
                 const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
-                                                   static_cast<size_t>(n_atoms) /
+                                                   static_cast<size_t>(n_work) /
                                                    static_cast<size_t>(count));
                 const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
-                                                 static_cast<size_t>(n_atoms) /
+                                                 static_cast<size_t>(n_work) /
                                                  static_cast<size_t>(count));
                     try {
-                for (int atom = begin; atom < end; ++atom) {
+                for (int work = begin; work < end; ++work) {
+                    const int atom = centers != nullptr ? centers[work] : work;
                     const double radius = expanded_radii[atom];
                     int accessible = 0;
 
@@ -343,10 +366,10 @@ cpu_shrake_rupley_impl(int n_atoms,
     const int point_simd = env_enabled("FASTSASA_CPU_POINT_SIMD", 0);
     fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
             const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
-                                               static_cast<size_t>(n_atoms) /
+                                               static_cast<size_t>(n_work) /
                                                static_cast<size_t>(count));
             const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
-                                             static_cast<size_t>(n_atoms) /
+                                             static_cast<size_t>(n_work) /
                                              static_cast<size_t>(count));
                 try {
             std::vector<int> candidates;
@@ -354,7 +377,8 @@ cpu_shrake_rupley_impl(int n_atoms,
             candidates.reserve(128u);
             neighbors.reserve(64u);
 
-            for (int atom = begin; atom < end; ++atom) {
+            for (int work = begin; work < end; ++work) {
+                const int atom = centers != nullptr ? centers[work] : work;
                 const double radius = expanded_radii[atom];
                 int accessible = 0;
 
@@ -434,7 +458,7 @@ fastsasa_cpu_shrake_rupley(int n_atoms,
 {
     try {
         return cpu_shrake_rupley_impl(n_atoms, n_points, x, y, z,
-                                      expanded_radii, test_points, n_threads, sasa);
+                                      expanded_radii, test_points, n_threads, nullptr, 0, sasa);
     } catch (const std::bad_alloc &) {
         return FASTSASA_MEMORY_ERROR;
     } catch (...) {
@@ -513,6 +537,8 @@ cpu_shrake_rupley_impl_fp32(int n_atoms,
                             const double *expanded_radii,
                             const double *test_points,
                             int n_threads,
+                            const int *centers,
+                            int n_centers,
                             double *sasa)
 {
     std::atomic<int> worker_status(FASTSASA_SUCCESS);
@@ -534,11 +560,22 @@ cpu_shrake_rupley_impl_fp32(int n_atoms,
     if (max_radius <= 0.0 || !cell_keys_fit(n_atoms, x, y, z, max_radius)) {
         return FASTSASA_INVALID_ARGUMENT;
     }
-    if (fastsasa_cpu_mask_policy(n_atoms, n_points, test_points, n_threads)) {
-        const int status = fastsasa_cpu_shrake_rupley_mask_fp32(n_atoms, n_points, x, y, z,
-                                                                expanded_radii, test_points, n_threads, sasa);
+    const int n_work = centers != nullptr ? n_centers : n_atoms;
+    if (centers != nullptr) {
+        for (int k = 0; k < n_centers; ++k) {
+            if (centers[k] < 0 || centers[k] >= n_atoms) return FASTSASA_INVALID_ARGUMENT;
+        }
+    }
+    if (fastsasa_cpu_mask_policy(n_work, n_points, test_points, n_threads)) {
+        const int status = centers != nullptr
+            ? fastsasa_cpu_shrake_rupley_mask_centers(n_atoms, n_points, x, y, z, expanded_radii, test_points,
+                                                      n_threads, 1, centers, n_centers, sasa)
+            : fastsasa_cpu_shrake_rupley_mask_fp32(n_atoms, n_points, x, y, z,
+                                                   expanded_radii, test_points, n_threads, sasa);
         if (status != -100) return status;
     }
+    if (centers != nullptr) std::fill(sasa, sasa + n_atoms, 0.0);
+    if (n_work == 0) return FASTSASA_SUCCESS;
 
     /* The FP32 coordinates are box-local, matching the CUDA and Vulkan FP32
      * shadows: subtracting the per-axis minimum in double before the float
@@ -570,15 +607,15 @@ cpu_shrake_rupley_impl_fp32(int n_atoms,
     std::vector<float> points_f(static_cast<size_t>(n_points) * 3u);
     for (int i = 0; i < 3 * n_points; ++i) points_f[static_cast<size_t>(i)] = static_cast<float>(test_points[i]);
 
-    count = thread_count(n_threads, n_atoms);
+    count = thread_count(n_threads, n_work);
     const cell_list32 cells(n_atoms, xf.data(), yf.data(), zf.data(), 2.0f * static_cast<float>(max_radius));
 
     fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
             const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
-                                               static_cast<size_t>(n_atoms) /
+                                               static_cast<size_t>(n_work) /
                                                static_cast<size_t>(count));
             const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
-                                             static_cast<size_t>(n_atoms) /
+                                             static_cast<size_t>(n_work) /
                                              static_cast<size_t>(count));
                 try {
                     std::vector<int> candidates;
@@ -586,7 +623,8 @@ cpu_shrake_rupley_impl_fp32(int n_atoms,
                     candidates.reserve(128u);
                     neighbors.reserve(64u);
 
-                    for (int atom = begin; atom < end; ++atom) {
+                    for (int work = begin; work < end; ++work) {
+                        const int atom = centers != nullptr ? centers[work] : work;
                         const float radius = radius_f[static_cast<size_t>(atom)];
                         int accessible = 0;
 
@@ -662,10 +700,49 @@ fastsasa_cpu_shrake_rupley_precision(int n_atoms,
     try {
         if (precision == FASTSASA_PRECISION_FP32) {
             return cpu_shrake_rupley_impl_fp32(n_atoms, n_points, x, y, z,
-                                               expanded_radii, test_points, n_threads, sasa);
+                                               expanded_radii, test_points, n_threads, nullptr, 0, sasa);
         }
         return cpu_shrake_rupley_impl(n_atoms, n_points, x, y, z,
-                                      expanded_radii, test_points, n_threads, sasa);
+                                      expanded_radii, test_points, n_threads, nullptr, 0, sasa);
+    } catch (const std::bad_alloc &) {
+        return FASTSASA_MEMORY_ERROR;
+    } catch (...) {
+        return FASTSASA_INVALID_ARGUMENT;
+    }
+}
+
+int
+fastsasa_cpu_shrake_rupley_centers(int n_atoms,
+                                   int n_points,
+                                   const double *x,
+                                   const double *y,
+                                   const double *z,
+                                   const double *expanded_radii,
+                                   const double *test_points,
+                                   int n_threads,
+                                   int precision,
+                                   const int *centers,
+                                   int n_centers,
+                                   double *sasa)
+{
+    if ((precision != FASTSASA_PRECISION_FP64 && precision != FASTSASA_PRECISION_FP32) ||
+        n_centers < 0 || (centers == nullptr && n_centers > 0)) {
+        return FASTSASA_INVALID_ARGUMENT;
+    }
+    /* No centres: every area is zero. Handled here because a null list
+     * means "every atom" to the kernels below. */
+    if (n_centers == 0) {
+        if (n_atoms < 0 || (n_atoms > 0 && sasa == nullptr)) return FASTSASA_INVALID_ARGUMENT;
+        for (int atom = 0; atom < n_atoms; ++atom) sasa[atom] = 0.0;
+        return FASTSASA_SUCCESS;
+    }
+    try {
+        if (precision == FASTSASA_PRECISION_FP32) {
+            return cpu_shrake_rupley_impl_fp32(n_atoms, n_points, x, y, z,
+                                               expanded_radii, test_points, n_threads, centers, n_centers, sasa);
+        }
+        return cpu_shrake_rupley_impl(n_atoms, n_points, x, y, z,
+                                      expanded_radii, test_points, n_threads, centers, n_centers, sasa);
     } catch (const std::bad_alloc &) {
         return FASTSASA_MEMORY_ERROR;
     } catch (...) {
@@ -974,6 +1051,69 @@ fastsasa_cpu_lee_richards_atom(int n_atoms,
     return FASTSASA_SUCCESS;
 }
 
+/*
+ * Lee-Richards areas of the listed atoms only, with the cell list and worker
+ * threads of the full calculation; areas[i] is the area of centers[i]. The
+ * GPU backends use it for atoms whose slices overflow their arc buffers,
+ * which is common with explicit hydrogens, so a per-atom brute-force scan
+ * would dominate the frame time.
+ */
+int
+fastsasa_cpu_lee_richards_centers(int n_atoms,
+                                  int n_slices,
+                                  const double *x,
+                                  const double *y,
+                                  const double *z,
+                                  const double *expanded_radii,
+                                  int n_threads,
+                                  const int *centers,
+                                  int n_centers,
+                                  double *areas)
+{
+    std::atomic<int> worker_status(FASTSASA_SUCCESS);
+
+    if (n_atoms <= 0 || n_slices <= 0 || x == nullptr || y == nullptr || z == nullptr ||
+        expanded_radii == nullptr || n_centers < 0 ||
+        (n_centers > 0 && (centers == nullptr || areas == nullptr))) {
+        return FASTSASA_INVALID_ARGUMENT;
+    }
+    if (n_centers == 0) return FASTSASA_SUCCESS;
+    for (int i = 0; i < n_centers; ++i) {
+        if (centers[i] < 0 || centers[i] >= n_atoms) return FASTSASA_INVALID_ARGUMENT;
+    }
+    try {
+        if (!finite_geometry(n_atoms, x, y, z, expanded_radii)) return FASTSASA_INVALID_ARGUMENT;
+        const double max_radius = maximum_radius(expanded_radii, n_atoms);
+        if (max_radius <= 0.0 || !cell_keys_fit(n_atoms, x, y, z, max_radius)) {
+            return FASTSASA_INVALID_ARGUMENT;
+        }
+        const cell_list cells(n_atoms, x, y, z, 2.0 * max_radius);
+        const int count = thread_count(n_threads, n_centers);
+
+        fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
+            const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
+                                               static_cast<size_t>(n_centers) / static_cast<size_t>(count));
+            const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
+                                             static_cast<size_t>(n_centers) / static_cast<size_t>(count));
+            try {
+                for (int i = begin; i < end; ++i) {
+                    areas[i] = lee_richards_atom_area(n_atoms, n_slices, x, y, z, expanded_radii,
+                                                      cells, centers[i]);
+                }
+            } catch (const std::bad_alloc &) {
+                worker_status.store(FASTSASA_MEMORY_ERROR);
+            } catch (...) {
+                worker_status.store(FASTSASA_INVALID_ARGUMENT);
+            }
+        });
+    } catch (const std::bad_alloc &) {
+        return FASTSASA_MEMORY_ERROR;
+    } catch (...) {
+        return FASTSASA_INVALID_ARGUMENT;
+    }
+    return worker_status.load();
+}
+
 int
 fastsasa_cpu_lee_richards(int n_atoms,
                         int n_slices,
@@ -1248,6 +1388,17 @@ cpu_calc_trajectory_soa_impl(const fastsasa_topology *topology,
     return FASTSASA_SUCCESS;
 }
 
+/* Same switch as the GPU backends' selected-centre path
+ * (src/fastsasa_trajectory.c): on unless FASTSASA_SELECTED_CENTER is 0/false. */
+static bool
+cpu_selected_center_enabled()
+{
+    const char *value = std::getenv("FASTSASA_SELECTED_CENTER");
+
+    return value == nullptr || value[0] == '\0' ||
+           (std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0);
+}
+
 static int
 cpu_calc_trajectory_soa_selection_impl(const fastsasa_topology *topology,
                                        const fastsasa_soa_frames *frames,
@@ -1277,6 +1428,19 @@ cpu_calc_trajectory_soa_selection_impl(const fastsasa_topology *topology,
     const std::vector<double> points = algorithm == FASTSASA_ALGORITHM_SHRAKE_RUPLEY
                                            ? cpu_test_points(resolution)
                                            : std::vector<double>();
+    /* Without a full-system total, only the selected atoms need surface
+     * points; the rest of the system still occludes them. The selected
+     * atoms' areas are unchanged bit for bit (see
+     * fastsasa_cpu_shrake_rupley_centers). */
+    std::vector<int> centers;
+    const bool selected_center = total_sasa == nullptr &&
+                                 algorithm == FASTSASA_ALGORITHM_SHRAKE_RUPLEY &&
+                                 cpu_selected_center_enabled();
+    if (selected_center) {
+        for (int atom = 0; atom < topology->n_atoms; ++atom) {
+            if (selection_masks[atom] != 0u) centers.push_back(atom);
+        }
+    }
     std::atomic<int> next_frame(0);
     std::vector<int> statuses(static_cast<size_t>(frame_threads), FASTSASA_SUCCESS);
     std::vector<std::thread> workers;
@@ -1299,7 +1463,20 @@ cpu_calc_trajectory_soa_selection_impl(const fastsasa_topology *topology,
                                               static_cast<size_t>(frame) * static_cast<size_t>(n_selections);
                     int frame_status;
 
-                    if (algorithm == FASTSASA_ALGORITHM_LEE_RICHARDS) {
+                    if (selected_center) {
+                        frame_status = fastsasa_cpu_shrake_rupley_centers(topology->n_atoms,
+                                                                          resolution,
+                                                                          x,
+                                                                          y,
+                                                                          z,
+                                                                          expanded.data(),
+                                                                          points.data(),
+                                                                          atom_threads,
+                                                                          precision,
+                                                                          centers.data(),
+                                                                          static_cast<int>(centers.size()),
+                                                                          scratch.data());
+                    } else if (algorithm == FASTSASA_ALGORITHM_LEE_RICHARDS) {
                         frame_status = fastsasa_cpu_lee_richards(topology->n_atoms,
                                                                resolution,
                                                                x,

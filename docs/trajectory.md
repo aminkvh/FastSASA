@@ -88,7 +88,8 @@ The accelerator API itself is format-neutral. Any reader that produces coordinat
 arrays can feed FastSASA.
 
 Runtime backend selection is automatic: CUDA, then Vulkan when compiled and
-available, then threaded CPU. Use `--backend auto|vulkan|cuda|cpu` to pin a
+available (software Vulkan devices such as llvmpipe are skipped), then
+threaded CPU. Use `--backend auto|vulkan|cuda|cpu` to pin a
 backend from the CLI. The environment variable
 `FASTSASA_BACKEND=auto|vulkan|cuda|cpu` makes the same choice for the C and
 Python APIs; the flag and the environment variable are equivalent. Normal
@@ -107,8 +108,9 @@ This separation matters: removing atoms while parsing a topology would shift
 trajectory indices and could attach coordinates to the wrong atoms.
 
 PSF does not store the PDB ATOM/HETATM distinction. Hydrogen exclusion still
-works from the atom element, but protein, ligand, lipid, water, and ion scope
-must be expressed with `--filter`.
+works: FastSASA takes each atom's element from its PSF mass (the PSF type
+column holds force-field types such as `CT3`, not elements). Protein, ligand,
+lipid, water, and ion scope must be expressed with `--filter`.
 
 If you omit `--filter`, all atoms eligible under the hydrogen/HETATM policy
 participate in SASA and FastSASA prints a warning.
@@ -136,7 +138,10 @@ For PSF topologies, select subunits by PSF segment name (`segid`) rather
 than PDB chain — see the PSF segment naming notes in
 [Selection Syntax](selection.md), which also covers the distinction between
 `--filter` (what participates in the calculation) and `--select` (what is
-reported).
+reported). When only `--select` results are written, every backend computes
+surface points for the selected atoms alone, with the rest of the system
+still blocking solvent, so small selections run much faster than the whole
+system; the selected atoms' values are identical either way.
 
 If you are comparing against VMD `measure sasa`, check the atom radii
 first — see the radius note in the [CLI Reference](cli.md).
@@ -156,9 +161,8 @@ first — see the radius note in the [CLI Reference](cli.md).
 
 For the old “first N frames” behavior, use `--frames :N`.
 
-DCD frame selection uses direct file seeking. XTC uses the same frame syntax;
-depending on the available trajectory backend, jumping backward or to the last
-frame may require reopening the stream and skipping frames.
+DCD and XTC frame selection both use direct file seeking. XTC is read by
+FastSASA's built-in reader; no GROMACS or VMD installation is needed.
 
 ## Output Modes
 

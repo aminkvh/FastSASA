@@ -5,6 +5,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from types import SimpleNamespace
+
 import numpy as np
 
 
@@ -260,6 +262,7 @@ def main() -> int:
 
     _check_protor_table_matches_cli(args.python_dir)
     _check_residue_aliases(args.python_dir)
+    _check_charmm_atoms(args.python_dir)
     _check_summary_layout_guard()
 
     print("fastsasa_python_feature_unit,status,pass")
@@ -277,7 +280,7 @@ def _check_residue_aliases(python_dir: Path) -> None:
     from fastsasa_features import _PROTOR_MAX_ASA, _residue_max_asa
 
     source = (python_dir.resolve().parent / "src" / "fastsasa_radius.c").read_text()
-    c_aliases = dict(re.findall(r'\{"([A-Z]{3})", "([A-Z]{3})"\}', source))
+    c_aliases = dict(re.findall(r'\{"([A-Z]{3})", "([A-Z]{1,3})"\}', source))
     if not c_aliases:
         raise SystemExit("no residue alias table found in src/fastsasa_radius.c")
     if c_aliases != RESIDUE_NAME_ALIASES:
@@ -299,6 +302,78 @@ def _check_residue_aliases(python_dir: Path) -> None:
         raise SystemExit(f"_residue_max_asa() alias resolution failed: {values}")
     if not any("ZZZ" in str(w.message) for w in caught):
         raise SystemExit("_residue_max_asa() did not warn about an unknown residue name")
+
+
+def _check_charmm_atoms(python_dir: Path) -> None:
+    """CHARMM/GROMACS atom names resolve to the ProtOr names, the Python and
+    C alias tables agree, and an MDAnalysis selection without elements (PSF)
+    takes elements from the masses instead of the atom names."""
+    import re
+
+    from fastsasa_adapters import (
+        ATOM_NAME_ALIASES,
+        element_from_mass,
+        load_radius_config,
+        mdanalysis_selection_arrays,
+    )
+
+    source = (python_dir.resolve().parent / "src" / "fastsasa_radius.c").read_text()
+    c_aliases = {
+        (residue if residue != "NULL" else None, atom): (
+            canonical_residue.strip('"') if canonical_residue != "NULL" else None, canonical_atom)
+        for residue, atom, canonical_residue, canonical_atom in (
+            (r.strip('"'), a, cr, ca) for r, a, cr, ca in re.findall(
+                r'\{("[A-Z]+"|NULL), "([A-Z0-9]+)", ("[A-Z0-9]+"|NULL), "([A-Z0-9]+)"\}', source))
+    }
+    if not c_aliases or c_aliases != ATOM_NAME_ALIASES:
+        raise SystemExit(f"ATOM_NAME_ALIASES {ATOM_NAME_ALIASES} differs from the C table {c_aliases}")
+
+    for mass, element in ((1.008, "H"), (3.024, "H"), (12.011, "C"), (15.9994, "O"), (22.98977, "NA"),
+                          (35.45, "CL"), (0.0, None), (7.0, None)):
+        if element_from_mass(mass) != element:
+            raise SystemExit(f"element_from_mass({mass}) = {element_from_mass(mass)!r}, expected {element!r}")
+    # Hydrogen mass repartitioning: heavy atoms lose 2.016 per bonded H, so
+    # the atom name decides (amide N-H 11.991 is not carbon, hydroxyl O-H
+    # 13.983 is not nitrogen, an aromatic CA carbon is not calcium).
+    for mass, name, element in ((11.991, "NZ", "N"), (13.983, "OH", "O"), (9.995, "CA", "C"),
+                                (12.011, "CA", "C"), (40.078, "CA", "CA"), (5.963, "C1", "C"),
+                                (22.98977, "SOD", "NA")):
+        if element_from_mass(mass, name) != element:
+            raise SystemExit(f"element_from_mass({mass}, {name!r}) = {element_from_mass(mass, name)!r}, "
+                             f"expected {element!r}")
+
+    config = load_radius_config()
+    for residue, atom, reference in (("ILE", "CD", ("ILE", "CD1")), ("LEU", "OT1", ("LEU", "O")),
+                                     ("LEU", "OT2", ("LEU", "OXT")), ("GLY", "CAY", ("ACE", "CH3")),
+                                     ("HSD", "CY", ("ACE", "C")), ("THY", "C5M", ("DT", "C7"))):
+        if config.radius(residue, atom) != config.radius(*reference):
+            raise SystemExit(f"{residue} {atom} did not resolve to {reference}")
+    if config.radius("LIG", "CY", element="C") != 1.70:
+        raise SystemExit("terminal-patch aliases must not apply to non-amino-acid residues")
+
+    class PsfSelection:
+        """An MDAnalysis AtomGroup read from a PSF: masses, no elements."""
+
+        atoms = [SimpleNamespace(name=name, resname=residue) for residue, name in
+                 (("ILE", "CD"), ("ILE", "HD1"), ("SOD", "SOD"), ("LIG", "CA"))]
+        positions = np.zeros((4, 3))
+        masses = np.array([12.011, 1.008, 22.98977, 12.011])
+        resnames = [atom.resname for atom in atoms]
+
+        def __iter__(self):
+            return iter(self.atoms)
+
+        def __len__(self):
+            return len(self.atoms)
+
+    selection = PsfSelection()
+    _, radii = mdanalysis_selection_arrays(selection, radius_config=config)
+    expected = [config.radius("ILE", "CD1"), 1.10, 2.27, 1.70]
+    if list(radii) != expected:
+        raise SystemExit(f"PSF-style selection radii {list(radii)} != {expected}")
+    _, radii = mdanalysis_selection_arrays(selection)
+    if list(radii) != [1.70, 1.10, 2.27, 1.70]:
+        raise SystemExit(f"element radii from masses failed: {list(radii)}")
 
 
 def _check_summary_layout_guard() -> None:

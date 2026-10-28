@@ -357,14 +357,12 @@ infer_element(const std::string &atom_name,
 }
 
 static int
-load_radius_config(const char *path,
-                   radius_config *config)
+load_radius_config_stream(std::istream &input,
+                          radius_config *config)
 {
-    std::ifstream input(path);
     std::string line;
     std::string section;
 
-    if (!input) return 0;
     while (std::getline(input, line)) {
         std::string::size_type hash = line.find('#');
         if (hash != std::string::npos) line.erase(hash);
@@ -407,6 +405,16 @@ load_radius_config(const char *path,
     return 1;
 }
 
+static int
+load_radius_config(const char *path,
+                   radius_config *config)
+{
+    std::ifstream input(path);
+
+    if (!input) return 0;
+    return load_radius_config_stream(input, config);
+}
+
 /* The relative-SASA references are ProtOr max-ASA values, so they apply
  * exactly when the loaded table declares itself ProtOr (`name: ProtOr`),
  * whether it was auto-discovered, named by FASTSASA_DEFAULT_CONFIG, or
@@ -421,25 +429,67 @@ note_config_loaded(cli_state *state,
     state->active_config_path = path;
 }
 
+/* The radius set behind a run, recorded in the JSON and XML outputs: the
+ * table's name and where it came from, or element radii when none loaded. */
+static std::string
+radii_description(const cli_state &state)
+{
+    if (!state.config_loaded) return "element (Bondi)";
+    const std::string name = state.config.name.empty() ? "unnamed table" : state.config.name;
+    if (state.active_config_path == "built-in ProtOr") return name + " (built-in)";
+    return name + " (" + state.active_config_path + ")";
+}
+
 static int
 load_default_radius_config(cli_state *state)
 {
     const char *env_path = std::getenv("FASTSASA_DEFAULT_CONFIG");
+    size_t length = 0u;
+    const char *text = nullptr;
 
-    if (env_path != nullptr && env_path[0] != '\0' && load_radius_config(env_path, &state->config)) {
-        note_config_loaded(state, env_path);
-        return 1;
-    }
-    for (size_t i = 0;; ++i) {
-        const char *candidate = fastsasa_default_config_candidate(i);
-
-        if (candidate == nullptr) break;
-        if (load_radius_config(candidate, &state->config)) {
-            note_config_loaded(state, candidate);
+    if (env_path != nullptr && env_path[0] != '\0') {
+        if (load_radius_config(env_path, &state->config)) {
+            note_config_loaded(state, env_path);
             return 1;
         }
+        std::fprintf(stderr,
+                     "FastSASA: warning: cannot read FASTSASA_DEFAULT_CONFIG=%s; using the built-in ProtOr table\n",
+                     env_path);
+        state->config = radius_config();
     }
-    return 0;
+    /* The ProtOr table is compiled in, so radii never depend on the
+     * working directory. */
+    text = fastsasa_default_config_text(&length);
+    std::istringstream input(std::string(text, length));
+    if (!load_radius_config_stream(input, &state->config)) return 0;
+    note_config_loaded(state, "built-in ProtOr");
+    return 1;
+}
+
+/* The table's atom type for residue/atom: exact entry, then the canonical
+ * residue for MD variants (HIE -> HIS), then ANY:atom, then the CHARMM/GROMACS
+ * atom-name alias (ILE CD -> CD1, OT1 -> O, ...). nullptr when unlisted. */
+static const std::string *
+find_atom_type(const radius_config *config,
+               const std::string &residue,
+               const std::string &atom)
+{
+    auto atom_it = config->atom_type.find(residue + ":" + atom);
+    if (atom_it == config->atom_type.end()) {
+        const char *canonical = fastsasa_canonical_residue(residue.c_str());
+        if (canonical != nullptr) atom_it = config->atom_type.find(std::string(canonical) + ":" + atom);
+    }
+    if (atom_it == config->atom_type.end()) atom_it = config->atom_type.find("ANY:" + atom);
+    if (atom_it == config->atom_type.end()) {
+        const char *alias_residue = nullptr;
+        const char *alias_atom = nullptr;
+
+        if (fastsasa_canonical_atom(residue.c_str(), atom.c_str(), &alias_residue, &alias_atom)) {
+            atom_it = config->atom_type.find(std::string(alias_residue != nullptr ? alias_residue : residue.c_str()) +
+                                             ":" + alias_atom);
+        }
+    }
+    return atom_it != config->atom_type.end() ? &atom_it->second : nullptr;
 }
 
 static double
@@ -453,16 +503,9 @@ configured_radius(const char *residue_name,
     if (config != nullptr) {
         const std::string atom = upper(trim(atom_name ? atom_name : ""));
         const std::string residue = upper(trim(residue_name ? residue_name : ""));
-        const std::string key = residue + ":" + atom;
-        const std::string any_key = "ANY:" + atom;
-        auto atom_it = config->atom_type.find(key);
-        if (atom_it == config->atom_type.end()) {
-            const char *canonical = fastsasa_canonical_residue(residue.c_str());
-            if (canonical != nullptr) atom_it = config->atom_type.find(std::string(canonical) + ":" + atom);
-        }
-        if (atom_it == config->atom_type.end()) atom_it = config->atom_type.find(any_key);
-        if (atom_it != config->atom_type.end()) {
-            const auto type_it = config->type_radius.find(atom_it->second);
+        const std::string *atom_type = find_atom_type(config, residue, atom);
+        if (atom_type != nullptr) {
+            const auto type_it = config->type_radius.find(*atom_type);
             if (type_it != config->type_radius.end()) return type_it->second;
         }
         if (!residue.empty() && residue != "?" && residue != ".") {
@@ -630,6 +673,9 @@ make_test_points(int n_points,
     }
 }
 
+/* The backend that produced the result, recorded in the JSON/XML outputs. */
+static std::string g_backend_used = "cpu";
+
 static int
 run_lee_richards_gpu(const fastsasa_owned_topology &topology,
                      const cli_state &state,
@@ -661,6 +707,7 @@ run_lee_richards_gpu(const fastsasa_owned_topology &topology,
         return 0;
     }
     status = fastsasa_context_lee_richards(context, &input, atom_sasa->data());
+    if (status == FASTSASA_SUCCESS) g_backend_used = fastsasa_context_backend(context);
     fastsasa_context_free(context);
     return status == FASTSASA_SUCCESS;
 }
@@ -675,6 +722,7 @@ run_cpu(const fastsasa_owned_topology &topology,
     int status;
 
     if (topology.n_atoms <= 0) return 0;
+    g_backend_used = "cpu";
     for (int atom = 0; atom < topology.n_atoms; ++atom) {
         expanded_radii[atom] = topology.radii[atom] + state.probe_radius;
     }
@@ -881,6 +929,7 @@ run_sasa(const fastsasa_owned_topology &topology,
             status = fastsasa_context_shrake_rupley_cell_list(context, &input,
                                                             atom_sasa->data());
         }
+        if (status == FASTSASA_SUCCESS) g_backend_used = fastsasa_context_backend(context);
         fastsasa_context_free(context);
     }
     if (status != FASTSASA_SUCCESS) {
@@ -1017,17 +1066,10 @@ atom_class_from_config(const radius_config *config,
 
     const std::string atom = upper(trim(atom_name ? atom_name : ""));
     const std::string residue = upper(residue_name ? residue_name : "");
-    auto atom_it =
-        config->atom_type.find(residue + ":" + atom);
+    const std::string *atom_type = find_atom_type(config, residue, atom);
+    if (atom_type == nullptr) return -1;
 
-    if (atom_it == config->atom_type.end()) {
-        const char *canonical = fastsasa_canonical_residue(residue.c_str());
-        if (canonical != nullptr) atom_it = config->atom_type.find(std::string(canonical) + ":" + atom);
-    }
-    if (atom_it == config->atom_type.end()) atom_it = config->atom_type.find("ANY:" + atom);
-    if (atom_it == config->atom_type.end()) return -1;
-
-    const auto class_it = config->type_class.find(atom_it->second);
+    const auto class_it = config->type_class.find(*atom_type);
     if (class_it == config->type_class.end()) return -1;
     if (class_it->second == "POLAR") return 1;
     if (class_it->second == "APOLAR") return 0;
@@ -1478,11 +1520,14 @@ write_json_output(FILE *out,
     }
     std::fprintf(out, "{\n");
     std::fprintf(out, "  \"source\": \"%s\",\n", json_escape(source).c_str());
-    std::fprintf(out, "  \"parameters\": {\"algorithm\": \"%s\", \"probe_radius\": %.12g, \"%s\": %d},\n",
+    std::fprintf(out,
+                 "  \"parameters\": {\"algorithm\": \"%s\", \"probe_radius\": %.12g, \"%s\": %d, \"radii\": \"%s\", \"backend\": \"%s\"},\n",
                  fastsasa_algorithm_name(state),
                  state.probe_radius,
                  state.lee_richards ? "n_slices" : "n_points",
-                 state.n_points);
+                 state.n_points,
+                 json_escape(radii_description(state).c_str()).c_str(),
+                 g_backend_used.c_str());
     std::fprintf(out, "  \"total_sasa\": %.12f,\n", total_sasa);
     if (state.report_classes) {
         std::fprintf(out,
@@ -1579,11 +1624,13 @@ write_xml_output(FILE *out,
         structure_area = sum_rsa_areas(residue_areas);
     }
     std::fprintf(out, "<FastSASA source=\"%s\">\n", xml_escape(source).c_str());
-    std::fprintf(out, "  <parameters algorithm=\"%s\" probe_radius=\"%.12g\" %s=\"%d\" />\n",
+    std::fprintf(out, "  <parameters algorithm=\"%s\" probe_radius=\"%.12g\" %s=\"%d\" radii=\"%s\" backend=\"%s\" />\n",
                  fastsasa_algorithm_name(state),
                  state.probe_radius,
                  state.lee_richards ? "n_slices" : "n_points",
-                 state.n_points);
+                 state.n_points,
+                 xml_escape(radii_description(state).c_str()).c_str(),
+                 g_backend_used.c_str());
     std::fprintf(out, "  <total_sasa>%.12f</total_sasa>\n", total_sasa);
     if (state.report_classes) {
         std::fprintf(out,
@@ -2038,6 +2085,14 @@ parse_args(int argc,
     if (state->n_threads <= 0) {
         std::fprintf(stderr, "--threads must be positive\n");
         return 0;
+    }
+    /* A single structure finishes on the threaded CPU backend before a GPU
+     * context is even initialized (about 5 ms vs 150-250 ms for 1UBQ), so
+     * auto means CPU here. --backend cuda|vulkan still selects a GPU;
+     * trajectories keep the GPU-first order. */
+    const char *backend = std::getenv("FASTSASA_BACKEND");
+    if (backend == nullptr || backend[0] == '\0' || std::strcmp(backend, "auto") == 0) {
+        state->force_cpu = 1;
     }
     return 1;
 }

@@ -7,6 +7,7 @@
 #   set area [fastsasa -sel $sel]                      ;# current frame total, numbers only
 #   set areas [fastsasa -sel $sel -frames all]         ;# per-frame list, numbers only
 #   set part [fastsasa -sel $all -restrict $selA]      ;# measure sasa -restrict
+#   set parts [fastsasa -sel $all -restrict $selA -frames all]  ;# per frame
 #   fastsasa -sel $sel -points pts                     ;# accessible surface points
 #   fastsasa -sel $sel -visualize 1 -color yellow      ;# draw the surface + on-screen counter
 #   fastsasa -sel $sel -frames all -visualize 1        ;# synced surface track + counter
@@ -50,6 +51,9 @@ namespace eval ::FastSASA {
     variable hud_label ""
     variable hud_areas
     array set hud_areas {}
+    # segid written onto the -restrict atoms of the temporary topology
+    # (PDB columns 73-76, so exactly four characters).
+    variable restrict_marker "FSRX"
 }
 
 proc ::FastSASA::find_executable {override} {
@@ -357,15 +361,82 @@ proc ::FastSASA::parse_pdb_sasa {path} {
     return $values
 }
 
+proc ::FastSASA::common_indices {sel restrict} {
+    array set wanted {}
+    foreach index [$restrict get index] {
+        set wanted($index) 1
+    }
+    set common {}
+    foreach index [$sel get index] {
+        if {[info exists wanted($index)]} {
+            lappend common $index
+        }
+    }
+    return $common
+}
+
+# Rewrites the segid columns (73-76) of the topology PDB written by
+# "$sel writepdb" for every atom that is also in $restrict, and returns how
+# many were marked. Atom records appear in the file in $sel order. Only the
+# segid column changes: coordinates are unused by the trajectory run and
+# radii are keyed by residue and atom name, not segid.
+proc ::FastSASA::mark_restricted {path sel restrict marker} {
+    array set wanted {}
+    foreach index [$restrict get index] {
+        set wanted($index) 1
+    }
+    set indices [$sel get index]
+    set in [open $path r]
+    set lines {}
+    set atom 0
+    set marked 0
+    while {[gets $in line] >= 0} {
+        set record [string range $line 0 5]
+        if {$record eq "ATOM  " || $record eq "HETATM"} {
+            if {[info exists wanted([lindex $indices $atom])]} {
+                set line [format %-72s [string range $line 0 71]]
+                set line "$line[format %-4s $marker][string range $line 76 end]"
+                incr marked
+            }
+            incr atom
+        }
+        lappend lines $line
+    }
+    close $in
+    if {$atom != [llength $indices]} {
+        error "fastsasa: atom count mismatch between VMD and the temporary topology"
+    }
+    set out [open $path w]
+    puts $out [join $lines "\n"]
+    close $out
+    return $marked
+}
+
+# Per-frame totals from "fastsasa trajectory --select" CSV output, whose
+# rows are "frame,selection,selection_sasa,seconds" (one row per frame for
+# our single selection; warnings mixed into the output are skipped).
+proc ::FastSASA::parse_selection_totals {output} {
+    set totals {}
+    foreach line [split $output "\n"] {
+        if {[regexp {^\d+,[^,]*,([-0-9.eE+]+),} $line -> total]} {
+            lappend totals $total
+        }
+    }
+    return $totals
+}
+
 # fastsasa ?options?
 #   -sel $atomselect     selection to measure (required unless -topfile)
 #   -probe R             probe radius, default 1.4
 #   -samples N           SR sphere points, default 500 (measure sasa's
 #                        default; FastSASA outside VMD defaults to 100)
 #   -frames now|all      current frame or the whole loaded trajectory
-#   -restrict $sel2      report only these atoms; -sel still occludes
+#   -restrict $sel2      report only these atoms; -sel still occludes. With
+#                        -frames all, returns the per-frame list of the
+#                        restricted atoms' SASA (atoms outside -sel are ignored)
 #   -peratom varname     store the per-atom SASA list (frames now only)
 #   -points varname      store accessible surface points as {x y z} lists
+#                        (frames now only)
 #   -visualize 0|1       show the accessible surface, default 0 (off). With
 #                        -frames now: draw the current frame's points as
 #                        static graphics (each call replaces the previous
@@ -400,8 +471,9 @@ proc ::FastSASA::parse_pdb_sasa {path} {
 #   -color name          drawing color for -visualize/-track, default yellow
 #   -radii vmd|protor    radius source, default vmd (molecule radii)
 #   -backend auto|vulkan|cuda|cpu
-#   -precision fp32|fp64  default fp32 (measure sasa computes in single
-#                         precision; FastSASA outside VMD defaults to fp64)
+#   -precision fp32|fp64  default fp64, same as every other FastSASA interface
+#                         (fp32 is available for speed; measure sasa itself
+#                         computes in single precision)
 #   -threads N           CPU thread count passthrough to the fastsasa CLI's
 #                        --threads (ignored on GPU backends); default "" lets
 #                        the CLI pick its own default thread count
@@ -415,7 +487,7 @@ proc fastsasa {args} {
     array set option {
         -sel "" -probe 1.4 -samples 500 -frames now -restrict "" -peratom ""
         -points "" -visualize 0 -track "" -track-samples "" -hud "" -color yellow
-        -radii vmd -backend auto -precision fp32 -exe "" -threads ""
+        -radii vmd -backend auto -precision fp64 -exe "" -threads ""
         -topfile "" -trajfile "" -filter protein -clear 0
     }
     foreach {key value} $args {
@@ -492,11 +564,22 @@ proc fastsasa {args} {
         error "fastsasa: -radii must be vmd or protor"
     }
 
+    if {$option(-frames) eq "all" && $option(-restrict) ne "" &&
+        [llength [::FastSASA::common_indices $sel $option(-restrict)]] == 0} {
+        # No restricted atom is part of -sel (as with -frames now, atoms
+        # outside -sel are ignored), so every frame is 0.
+        foreach path $cleanup {catch {file delete $path}}
+        set zeros {}
+        for {set i 0} {$i < [molinfo [$sel molid] get numframes]} {incr i} {
+            lappend zeros 0.0
+        }
+        return $zeros
+    }
+
     if {[catch {
         if {$option(-frames) eq "all"} {
-            if {$option(-restrict) ne "" || $option(-peratom) ne "" ||
-                $option(-points) ne ""} {
-                error "fastsasa: -restrict, -peratom, and -points support -frames now only"
+            if {$option(-peratom) ne "" || $option(-points) ne ""} {
+                error "fastsasa: -peratom and -points support -frames now only"
             }
             if {$option(-track-samples) ne "" && !$option(-track)} {
                 error "fastsasa: -track-samples requires -track 1"
@@ -506,6 +589,18 @@ proc fastsasa {args} {
             lappend cleanup $trajectory
             set trajectory_args [list $exe trajectory \
                 --topology $topology --trajectory $trajectory --frames :]
+            if {$option(-restrict) ne ""} {
+                # Tag the restricted atoms with a marker segid in the
+                # temporary topology so the CLI can report them as one
+                # selection while all of -sel still occludes.
+                set restrict_count [::FastSASA::mark_restricted \
+                    $topology $sel $option(-restrict) $::FastSASA::restrict_marker]
+                if {$restrict_count == 0} {
+                    error "fastsasa: internal error: no -restrict atoms were marked"
+                }
+                lappend trajectory_args --select \
+                    "restrict, segid $::FastSASA::restrict_marker"
+            }
             set track_file ""
             set track_samples $option(-samples)
             if {$option(-track)} {
@@ -529,10 +624,14 @@ proc fastsasa {args} {
                     --surface-resolution $track_samples
             }
             set output [::FastSASA::run_cli [concat $trajectory_args $common]]
-            set result {}
-            foreach line [split $output "\n"] {
-                if {[regexp {^\d+,([-0-9.eE+]+),} $line -> total]} {
-                    lappend result $total
+            if {$option(-restrict) ne ""} {
+                set result [::FastSASA::parse_selection_totals $output]
+            } else {
+                set result {}
+                foreach line [split $output "\n"] {
+                    if {[regexp {^\d+,([-0-9.eE+]+),} $line -> total]} {
+                        lappend result $total
+                    }
                 }
             }
             if {$track_file ne ""} {

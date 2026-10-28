@@ -12,7 +12,7 @@ recursive-include licenses *.txt *.md
 recursive-include docs *.md *.csv *.png
 recursive-include python *.py
 recursive-include examples *.py
-recursive-include tests *.py *.c *.cc *.pdb *.cif *.config
+recursive-include tests *.py *.c *.cc *.pdb *.cif *.config *.xtc *.dcd
 include tests/cmake_consumer/CMakeLists.txt
 prune tests/external_mmcif
 include tools/fastsasa_benchmark.py
@@ -30,6 +30,7 @@ include third-party/gemmi/README.md
 include third-party/volk/volk.h
 include third-party/volk/volk.c
 include third-party/volk/LICENSE.md
+recursive-include third-party/xdrfile *.c *.h *.txt
 recursive-include include fastsasa*.h
 include src/fastsasa_api.c
 include src/fastsasa_backend_internal.h

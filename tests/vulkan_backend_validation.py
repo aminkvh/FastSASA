@@ -60,6 +60,50 @@ def close_atoms(label: str, expected: dict, actual: dict,
               relative_tolerance)
 
 
+def check_fp64_shader_tuning(fastsasa: Path, root: Path, scratch: Path) -> None:
+    """FP64 trajectories pick the mask or reference SR shaders by timing both
+    at run time; the per-frame results must not depend on that choice."""
+    import struct
+
+    atoms = [(float(line[30:38]), float(line[38:46]), float(line[46:54]))
+             for line in (root / "tests/data/1ubq.pdb").read_text().splitlines()
+             if line.startswith(("ATOM", "HETATM"))]
+    # 880 frames of 602 atoms pass the 512k centre-frame setup gate.
+    n_frames = 880
+    trajectory = scratch / "tuning.dcd"
+
+    def record(handle, payload: bytes) -> None:
+        handle.write(struct.pack("<i", len(payload)) + payload + struct.pack("<i", len(payload)))
+
+    with trajectory.open("wb") as handle:
+        header = bytearray(84)
+        header[:4] = b"CORD"
+        struct.pack_into("<i", header, 4, n_frames)
+        record(handle, bytes(header))
+        record(handle, struct.pack("<i", 1) + b"FastSASA shader tuning".ljust(80))
+        record(handle, struct.pack("<i", len(atoms)))
+        for frame in range(n_frames):
+            shift = 0.05 * (frame % 7)
+            for axis in range(3):
+                record(handle, struct.pack(f"<{len(atoms)}f",
+                                           *(xyz[axis] + (shift if index % 3 == axis else 0.0)
+                                             for index, xyz in enumerate(atoms))))
+    results = {}
+    for mode in ("reference", "mask", "tuned"):
+        extra = {"FASTSASA_MASK_MIN_CENTERS": "1"}
+        if mode != "tuned":
+            extra["FASTSASA_VK_SR_KERNEL"] = mode
+        process = invoke(fastsasa, root, "vulkan", "trajectory", "--topology", "tests/data/1ubq.pdb",
+                         "--trajectory", str(trajectory), "--precision", "fp64",
+                         extra_environment=extra)
+        if process.returncode != 0:
+            raise RuntimeError(process.stderr or process.stdout)
+        results[mode] = [line.split(",")[1] for line in process.stdout.splitlines()[1:] if line]
+    if len(results["reference"]) != n_frames or results["mask"] != results["reference"] or \
+            results["tuned"] != results["reference"]:
+        raise RuntimeError("FP64 Vulkan trajectory results depend on the SR shader choice")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fastsasa", required=True, type=Path)
@@ -167,6 +211,10 @@ def main() -> int:
                       "--no-cpu-fallback", *common)
     close("--backend vulkan matches env selection", vk_sr["total_sasa"],
           flag_vulkan["total_sasa"], 0.0)
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as scratch:
+        check_fp64_shader_tuning(args.fastsasa, args.repo_root, Path(scratch))
 
     print(
         "fastsasa_vulkan_backend_validation,status,pass,"

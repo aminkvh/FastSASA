@@ -36,6 +36,9 @@ set areas [fastsasa -sel $sel -frames all]
 set all [atomselect top all]
 set chainA_area [fastsasa -sel $all -restrict [atomselect top "chain A"]]
 
+# The same for every frame, in one run:
+set chainA_areas [fastsasa -sel $all -restrict [atomselect top "chain A"] -frames all]
+
 # Per-atom SASA into a Tcl list, and stored on the atoms if you like:
 fastsasa -sel $sel -peratom areas
 $sel set user $areas
@@ -61,7 +64,7 @@ set areas [fastsasa -topfile sys.psf -trajfile run.dcd -filter protein]
 - `-frames now|all` — current frame, or every loaded frame as a per-frame
   list.
 - `-restrict $sel2` — report only these atoms; everything in `-sel` still
-  occludes. `-frames now` only.
+  occludes. With `-frames all` it returns the per-frame list for those atoms.
 - `-peratom var` — store the per-atom SASA list. `-frames now` only.
 - `-points var` — store accessible surface points as `{x y z}` lists.
   `-frames now` only.
@@ -78,7 +81,7 @@ set areas [fastsasa -topfile sys.psf -trajfile run.dcd -filter protein]
 - `-radii vmd|protor` — radius source, default `vmd` (the molecule's own
   per-atom radii).
 - `-backend auto|vulkan|cuda|cpu` and `-precision fp32|fp64` — default
-  `fp32` inside VMD, matching VMD's single-precision arithmetic.
+  `fp64`, as in every other FastSASA interface; `fp32` is available for speed.
 - `-threads N` — CPU thread count passed through to the CLI's `--threads`
   (ignored on GPU backends).
 - `-exe path` — explicit path to the `fastsasa` binary.
@@ -102,13 +105,11 @@ Mapping to `measure sasa` and the CLI:
 ## Defaults and comparability with `measure sasa`
 
 Inside VMD the wrapper defaults to **`-radii vmd`, `-samples 500`, and
-`-precision fp32`**, matching `measure sasa`'s radii, sampling density, and
-precision class, so bare `fastsasa` and bare `measure sasa` calls are
-directly comparable. (VMD stores coordinates and accumulates SASA in single
-precision; FastSASA's fp32 mode still counts exposures exactly and reduces
-in FP64, so it is the more accurate of the two.) Outside VMD, FastSASA
-defaults to ProtOr radii, 100 samples, and FP64; pass
-`-radii protor -samples 100 -precision fp64` in VMD to reproduce the native
+`-precision fp64`**: the radii and sampling density match `measure sasa`, and
+the precision matches every other FastSASA interface. (`measure sasa` itself
+computes in single precision; pass `-precision fp32` for FastSASA's
+single-precision mode.) Outside VMD, FastSASA defaults to ProtOr radii and 100
+samples; pass `-radii protor -samples 100` in VMD to reproduce the native
 CLI/Python defaults exactly.
 
 **Values differ slightly from `measure sasa` by design.** Both tools use
