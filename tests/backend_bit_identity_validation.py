@@ -66,6 +66,30 @@ def arc_overflow_system() -> tuple[np.ndarray, np.ndarray]:
     return xyz, radii
 
 
+def coincident_overflow_system() -> tuple[np.ndarray, np.ndarray]:
+    """A centre atom buried by a larger atom at exactly its position, after
+    40 partly overlapping neighbours have filled the mask kernels' parking
+    list (32 entries). The anchor atom fixes the grid origin at z = 0, so
+    with cell = 2 * Rmax = 6.8 A the ring (z = 13) lies in the cell below the
+    centre (z = 14) and is walked first. The reference buries every centre
+    point; the mask kernels must decide the coincident atom exactly even
+    when the list is full."""
+    angles = np.linspace(0.0, 2.0 * np.pi, 40, endpoint=False)
+    ring = np.stack([3.0 * np.cos(angles), 3.0 * np.sin(angles), np.full(40, 13.0)], axis=1)
+    centre = [[0.0, 0.0, 14.0]]
+    xyz = np.vstack([centre, ring, centre, [[60.0, 0.0, 0.0]]])
+    radii = np.concatenate([[1.5], np.full(40, 1.5), [2.0], [1.0]])
+    return xyz, radii
+
+
+def spread_copies(xyz: np.ndarray, radii: np.ndarray, copies: int, spacing: float) -> tuple[np.ndarray, np.ndarray]:
+    """Copies of one structure spread along x, so the system extent (and the
+    magnitude of the GPU kernels' box-local float coordinates) is large while
+    every neighbour distance stays that of the original structure."""
+    shifted = [xyz + np.array([k * spacing, 0.0, 0.0]) for k in range(copies)]
+    return np.vstack(shifted), np.tile(radii, copies)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", required=True)
@@ -138,6 +162,22 @@ def main() -> int:
                 checked += 1
         finally:
             engine.close()
+
+    # Mask-kernel edge cases, kernels forced on: a coincident atom after the
+    # parking list is full, and a 3,000 A extent (large box-local floats).
+    os.environ["FASTSASA_CPU_KERNEL"] = "reference"
+    for name in ("FASTSASA_CUDA_SR_KERNEL", "FASTSASA_VK_SR_KERNEL"):
+        os.environ[name] = "mask"
+    edge_cases = {"coincident atom with a full parking list": coincident_overflow_system(),
+                  "four 1UBQ copies over 3,000 A": spread_copies(*structures[STRUCTURES[0]], 4, 1000.0)}
+    for label, (xyz, radii) in edge_cases.items():
+        reference, _ = per_atom(module, "cpu", "SR", 100, xyz, radii, args.library)
+        for backend in gpu_backends:
+            values, _ = per_atom(module, backend, "SR", 100, xyz, radii, args.library)
+            compare(backend, f"SR100 on {label} (mask kernel forced)", values, reference)
+            checked += 1
+    for name in ("FASTSASA_CPU_KERNEL", "FASTSASA_CUDA_SR_KERNEL", "FASTSASA_VK_SR_KERNEL"):
+        os.environ.pop(name, None)
 
     # Lee-Richards arc overflow: FP64 stays bit-identical; FP32 recomputes
     # the flagged atoms too and stays within FP32 error.

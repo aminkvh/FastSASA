@@ -67,7 +67,7 @@ static inline int fastsasa_popcount64(std::uint64_t v) { return __builtin_popcou
 namespace {
 
 constexpr int kMaxWords = 4;                 /* up to 256 test points */
-constexpr int kMaxPoints = 255;              /* uint8 prefix counts */
+constexpr int kMaxPoints = 255;              /* largest supported point count */
 constexpr int kUnsupported = -100;
 #ifndef FASTSASA_MASK_TBINS
 #define FASTSASA_MASK_TBINS 64
@@ -79,7 +79,12 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
  * GPU kernels do that; t carries ~4e-6 absolute error for |t| <= 1 and a
  * unit direction ~2e-7 of chord), so one table serves every backend. Both
  * are far below the geometric margin (delta >= ~0.02 at resolution 64) and
- * far above double rounding, so the CPU pays a negligible price. */
+ * far above double rounding, so the CPU pays a negligible price. The GPU
+ * kernels form the neighbour vector from box-local float coordinates, whose
+ * rounding grows with the box rather than with the distance, so for them
+ * the pads are a tested margin, not a bound (bit identity checked on
+ * systems 3,000 A across; forming the vector in double instead cost 1.3-2.5x
+ * on CUDA FP64). */
 constexpr double kDotPad = 2.0e-5;
 constexpr double kDirPad = 2.0e-6;
 

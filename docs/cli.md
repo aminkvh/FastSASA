@@ -44,9 +44,10 @@ CUDA FP64 Shrake-Rupley and Lee-Richards results are bit-identical to the
 CPU reference, atom for atom (both use non-contracted arithmetic in the
 CPU's operation order and the same acos/atan2 implementation, and totals,
 residue sums, and selection sums are formed on the host in a fixed order on
-every backend). This holds on every Vulkan driver, including ones whose
-own FP64 division and square root are not correctly rounded: the shaders
-round these operations themselves. `--precision fp32` trades that guarantee for speed. Observed
+every backend). Vulkan drivers' own FP64 division and square root need not
+be correctly rounded, so the Lee-Richards shaders refine both results
+themselves; the refined results matched IEEE rounding on 2×10⁸ random
+cases, and the test suite checks bit identity on every driver it runs on. `--precision fp32` trades that guarantee for speed. Observed
 maximum relative error against the FP64 reference is around 1e-5 for
 structure totals; on trajectory per-frame totals it is typically below 4e-5
 for whole-system sums and up to a few times 1e-4 for small selection sums
@@ -71,14 +72,17 @@ comparing FastSASA with another SASA implementation.
 
 ### Shrake-Rupley kernels
 
-Every backend runs Shrake-Rupley through a mask-accelerated kernel: most
+For larger inputs every backend runs Shrake-Rupley through a
+mask-accelerated kernel: most
 sphere points are settled from precomputed spherical-cap masks, and only
 points near a cap boundary go through the exact distance test, in the
 reference kernel's own arithmetic. Results are identical to the reference
 kernels bit for bit (FP64 on every backend; FP32 within its documented
 tolerance), and the kernels are checked against each other in the test
-suite. Point counts above 255, and small inputs where the reference
-kernels are faster, use the reference kernels. To force one kernel:
+suite, including systems 3,000 Å across. Point counts above 255, and small inputs where the reference
+kernels are faster, use the reference kernels (the GPU thresholds are
+2048 centres; Vulkan FP64 also times both kernels once per context and keeps
+the faster). To force one kernel:
 `FASTSASA_CPU_KERNEL`, `FASTSASA_CUDA_SR_KERNEL`, `FASTSASA_VK_SR_KERNEL`
 set to `reference` or `mask`; `FASTSASA_MASK_MIN_CENTERS` (default 2048)
 moves the GPU crossover.

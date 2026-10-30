@@ -476,7 +476,7 @@ class SasaEngine:
     usually faster. ``precision`` is ``"fp64"`` by default; use ``"fp32"``
     for faster reduced-precision kernels.
 
-    Backend selection follows the native Vulkan -> CUDA -> threaded CPU
+    Backend selection follows the native CUDA -> Vulkan -> threaded CPU
     order and honors ``FASTSASA_BACKEND=auto|vulkan|cuda|cpu``. When no usable
     GPU exists (or a Vulkan device lacks FP64 for the default precision), the
     engine transparently uses the native threaded CPU backend, honoring the

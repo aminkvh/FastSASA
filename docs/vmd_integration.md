@@ -109,8 +109,10 @@ Inside VMD the wrapper defaults to **`-radii vmd`, `-samples 500`, and
 the precision matches every other FastSASA interface. (`measure sasa` itself
 computes in single precision; pass `-precision fp32` for FastSASA's
 single-precision mode.) Outside VMD, FastSASA defaults to ProtOr radii and 100
-samples; pass `-radii protor -samples 100` in VMD to reproduce the native
-CLI/Python defaults exactly.
+samples; pass `-radii protor -samples 100` in VMD to use the native
+CLI/Python defaults. The plugin hands coordinates and radii to FastSASA
+through PDB/DCD files, so results agree with the native tools to about
+0.01 Å² per atom rather than bit for bit.
 
 **Values differ slightly from `measure sasa` by design.** Both tools use
 deterministic sphere sampling, but different point sets (FastSASA uses a

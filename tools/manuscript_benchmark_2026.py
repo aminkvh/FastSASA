@@ -44,6 +44,7 @@ ALGORITHM_SR = 0
 N_THREADS_LOW = 1
 N_THREADS_HIGH = 15
 REPEATS = 5
+GPU_WARMUP_PASSES = 4
 
 DATASETS = {
     # "system_selection" restricts the whole loaded system (both panels) to
@@ -167,7 +168,9 @@ def _load_fastsasa_lib(library_path):
 
 
 def _fastsasa_library_path():
-    return os.path.join(REPO_ROOT, "build-cuda-vulkan/libfastsasa_native.so")
+    """The build under test; FASTSASA_BENCH_LIBRARY selects another one."""
+    return os.environ.get("FASTSASA_BENCH_LIBRARY",
+                          os.path.join(REPO_ROOT, "build-cuda-vulkan/libfastsasa_native.so"))
 
 
 # --------------------------------------------------------------------------
@@ -498,8 +501,13 @@ def cmd_run(args):
     else:
         raise ValueError(f"unknown tool {args.tool!r}")
 
+    # GPU contexts settle their kernel choice in the first calls (Vulkan FP64
+    # times the reference and mask kernels once per context), so they get
+    # extra untimed passes and every timed repeat measures the steady state.
+    warmup_passes = GPU_WARMUP_PASSES if engine_to_close is not None else 1
     try:
-        warmup_total = frame_loop()
+        for _ in range(warmup_passes):
+            warmup_total = frame_loop()
         timings = []
         for _ in range(args.repeats):
             t0 = time.perf_counter()
@@ -518,6 +526,7 @@ def cmd_run(args):
             "threads": args.threads,
             "precision": args.precision,
             "panel": args.panel,
+            "warmup_passes": warmup_passes,
             "repeat_index": repeat_index,
             "n_frames": n_frames,
             "elapsed_seconds": elapsed,

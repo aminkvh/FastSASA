@@ -110,7 +110,7 @@ def main():
                              f"complete) | CPU 15T {cpu_gain:.1f}× | CUDA {gpu_gain:.1f}× | | | | |")
 
     note = (f"Shrake–Rupley, 100 points, 1.4 Å probe, ProtOr radii. Compute-only frames/s, "
-            f"median [interquartile range] over 5 timed repeats after a warm-up. Hardware: "
+            f"median [interquartile range] over 5 timed repeats after untimed warm-up passes (one on the CPU, four on GPUs). Hardware: "
             f"{hardware['cpu']} (15 worker threads), {hardware['gpu']}; {hardware['os']}. "
             f"The selected panel computes SASA for the selection only, with every system atom "
             f"occluding; FreeSASA has no such mode and computes the whole system.")

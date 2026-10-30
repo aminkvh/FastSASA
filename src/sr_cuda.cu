@@ -2741,7 +2741,9 @@ shrake_rupley_cell_kernel(int n_atoms,
  * points are cleared with ANDs; band points still visible are parked and,
  * after the neighbour loop, decided with the exact FP64 test of
  * shrake_rupley_cell_kernel (fastsasa_dmul/fastsasa_dadd in the same
- * operation order). The result is therefore the reference's bit for bit.
+ * operation order). The result is therefore the reference's bit for bit
+ * wherever the table pads cover the float neighbour vector (see kDotPad in
+ * fastsasa_cpu_mask.cc).
  * A neighbour at the same centre has no cap direction: all its points go
  * through the exact test, which is what the reference's rounding decides.
  *
@@ -2861,7 +2863,6 @@ shrake_rupley_cell_mask_kernel(int n_atoms,
     unsigned long long *my_pending = pending_words + (size_t)center * FASTSASA_MASK_PENDING * W;
     int *my_pending_slot = pending_slot + (size_t)center * FASTSASA_MASK_PENDING;
     int n_pending = 0;
-    int overflow = 0;         /* pending list full: fall back to exact tests for the rest */
     int buried_all = 0;
     int any_visible = 1;
 
@@ -2907,58 +2908,57 @@ shrake_rupley_cell_mask_kernel(int n_atoms,
                 const float d2 = vx * vx + vy * vy + vz * vz;
                 const float reach = rif + __ldg(&radii_f[other]);
                 if (!(d2 < reach * reach * 1.00001f + 1.0e-6f)) continue;
-                if (d2 == 0.0f) {
-                    /* (near-)coincident centre in float: no cap direction;
-                     * every visible point is ambiguous */
-                    if (n_pending < FASTSASA_MASK_PENDING) {
-#pragma unroll
-                        for (int w = 0; w < W; ++w) my_pending[n_pending * W + w] = visible[w];
-                        my_pending_slot[n_pending] = other;
-                        ++n_pending;
-                    } else {
-                        overflow = 1;
-                    }
-                    continue;
-                }
                 const double rj2 = __ldg(&radii2[other]);
-                /* Cap threshold and direction bin in single precision: they
-                 * only select a conservative table entry, and the table's
-                 * pads cover float error (kDotPad, kDirPad). ri2 - rj2 is
-                 * formed in double then rounded once. */
-                const float inv_d = rsqrtf(d2);
-                const float t = ((float)(ri2 - rj2) + d2) * inv_two_ri_f * inv_d;
-                if (t >= lim_hi) continue;
-                if (t <= lim_lo) { buried_all = 1; break; }
-                const float inv_l1 = 1.0f / (fabsf(vx) + fabsf(vy) + fabsf(vz));
-                const float px = vx * inv_l1;
-                const float py = vy * inv_l1;
-                const float pz = vz * inv_l1;
-                float u;
-                float v;
-                if (pz >= 0.0f) {
-                    u = px;
-                    v = py;
-                } else {
-                    u = (1.0f - fabsf(py)) * (px >= 0.0f ? 1.0f : -1.0f);
-                    v = (1.0f - fabsf(px)) * (py >= 0.0f ? 1.0f : -1.0f);
-                }
-                int bx = (int)((u + 1.0f) * res_half);
-                int by = (int)((v + 1.0f) * res_half);
-                bx = bx < 0 ? 0 : (bx > res_max ? res_max : bx);
-                by = by < 0 ? 0 : (by > res_max ? res_max : by);
-                int q = (int)((t + 1.0f) * (0.5f * (float)table_tbins));
-                q = q < 0 ? 0 : (q >= table_tbins ? table_tbins - 1 : q);
-                const unsigned long long *e = table + ((size_t)(by * table_res + bx) * table_tbins + q) * 2u * W;
                 unsigned long long amb_any = 0ull;
                 unsigned long long any = 0ull;
                 unsigned long long amb[W];
+                if (d2 == 0.0f) {
+                    /* (near-)coincident centre in float: no cap direction;
+                     * every visible point is ambiguous and is decided by
+                     * the exact test (parked, or inline when the list is full) */
 #pragma unroll
-                for (int w = 0; w < W; ++w) {
-                    const unsigned long long vis = visible[w] & ~__ldg(&e[w]);
-                    amb[w] = vis & __ldg(&e[W + w]);
-                    amb_any |= amb[w];
-                    visible[w] = vis;
-                    any |= vis;
+                    for (int w = 0; w < W; ++w) {
+                        amb[w] = visible[w];
+                        amb_any |= amb[w];
+                        any |= visible[w];
+                    }
+                } else {
+                    /* Cap threshold and direction bin in single precision: they
+                     * only select a conservative table entry, and the table's
+                     * pads cover float error (kDotPad, kDirPad). ri2 - rj2 is
+                     * formed in double then rounded once. */
+                    const float inv_d = rsqrtf(d2);
+                    const float t = ((float)(ri2 - rj2) + d2) * inv_two_ri_f * inv_d;
+                    if (t >= lim_hi) continue;
+                    if (t <= lim_lo) { buried_all = 1; break; }
+                    const float inv_l1 = 1.0f / (fabsf(vx) + fabsf(vy) + fabsf(vz));
+                    const float px = vx * inv_l1;
+                    const float py = vy * inv_l1;
+                    const float pz = vz * inv_l1;
+                    float u;
+                    float v;
+                    if (pz >= 0.0f) {
+                        u = px;
+                        v = py;
+                    } else {
+                        u = (1.0f - fabsf(py)) * (px >= 0.0f ? 1.0f : -1.0f);
+                        v = (1.0f - fabsf(px)) * (py >= 0.0f ? 1.0f : -1.0f);
+                    }
+                    int bx = (int)((u + 1.0f) * res_half);
+                    int by = (int)((v + 1.0f) * res_half);
+                    bx = bx < 0 ? 0 : (bx > res_max ? res_max : bx);
+                    by = by < 0 ? 0 : (by > res_max ? res_max : by);
+                    int q = (int)((t + 1.0f) * (0.5f * (float)table_tbins));
+                    q = q < 0 ? 0 : (q >= table_tbins ? table_tbins - 1 : q);
+                    const unsigned long long *e = table + ((size_t)(by * table_res + bx) * table_tbins + q) * 2u * W;
+#pragma unroll
+                    for (int w = 0; w < W; ++w) {
+                        const unsigned long long vis = visible[w] & ~__ldg(&e[w]);
+                        amb[w] = vis & __ldg(&e[W + w]);
+                        amb_any |= amb[w];
+                        visible[w] = vis;
+                        any |= vis;
+                    }
                 }
                 if (amb_any) {
                     if (n_pending < FASTSASA_MASK_PENDING) {
@@ -2996,7 +2996,6 @@ shrake_rupley_cell_mask_kernel(int n_atoms,
             }
         }
     }
-    (void)overflow;
 
     int exposed = 0;
     if (!buried_all && any_visible) {

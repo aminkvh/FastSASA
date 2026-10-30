@@ -8,7 +8,9 @@
  * neighbourhood; every invocation walks the 5x5x5 cell block around its
  * subgroup leader's cell (uniform control flow, coalesced candidate
  * loads), keeping the candidates that overlap its own atom. Cap threshold
- * and direction bin are single precision; the table's pads cover that.
+ * and direction bin are single precision from box-local floats; the
+ * table's pads cover that (a tested margin, see kDotPad in
+ * fastsasa_cpu_mask.cc).
  * Certain points are cleared with ANDs; band points still visible are
  * parked and, after the scan, decided with the exact test of
  * sr_cell_list.comp (FP64: `precise` double arithmetic in the reference
@@ -187,36 +189,38 @@ void main()
                 /* conservative overlap prefilter in float (rf + rjf)^2 with pad */
                 const float reach = radius_f + sqrt(shadow.w);
                 if (!(d2 < reach * reach * 1.00001 + 1.0e-6)) continue;
-                if (d2 == 0.0) {
-                    /* coincident centre: every visible point is ambiguous */
-                    if (n_pending < uint(SR_MASK_PENDING)) {
-                        for (uint w = 0u; w < W; ++w) pending_words.values[(pend_base + n_pending) * W + w] = visible[w];
-                        pending_slot.values[pend_base + n_pending] = slot;
-                        ++n_pending;
-                    }
-                    continue;
-                }
-                const float inv_d = inversesqrt(d2);
-                const float t = ((radius2_f - shadow.w) + d2) * inv_two_r * inv_d;
-                if (t >= lim_hi) continue;
-                if (t <= lim_lo) { buried_all = true; break; }
-                const float inv_l1 = 1.0 / (abs(v.x) + abs(v.y) + abs(v.z));
-                const vec3 p = v * inv_l1;
-                vec2 uv = p.z >= 0.0 ? p.xy : vec2((1.0 - abs(p.y)) * (p.x >= 0.0 ? 1.0 : -1.0),
-                                                   (1.0 - abs(p.x)) * (p.y >= 0.0 ? 1.0 : -1.0));
-                const int bx = clamp(int((uv.x + 1.0) * res_half), 0, res_max);
-                const int by = clamp(int((uv.y + 1.0) * res_half), 0, res_max);
-                const int q = clamp(int((t + 1.0) * 0.5 * float(tbins)), 0, int(tbins) - 1);
-                const uint e = (uint(by * int(mask_params.resolution) + bx) * tbins + uint(q)) * 2u * W;
                 bool amb_any = false;
                 bool any = false;
                 uvec2 amb[SR_MASK_WORDS];
-                for (uint w = 0u; w < W; ++w) {
-                    const uvec2 vis = and_not(visible[w], mask_table.values[e + w]);
-                    amb[w] = and2(vis, mask_table.values[e + W + w]);
-                    amb_any = amb_any || any2(amb[w]);
-                    visible[w] = vis;
-                    any = any || any2(vis);
+                if (d2 == 0.0) {
+                    /* coincident centre: no cap direction; every visible point
+                     * is ambiguous and is decided by the exact test (parked,
+                     * or inline when the list is full) */
+                    for (uint w = 0u; w < W; ++w) {
+                        amb[w] = visible[w];
+                        amb_any = amb_any || any2(amb[w]);
+                        any = any || any2(visible[w]);
+                    }
+                } else {
+                    const float inv_d = inversesqrt(d2);
+                    const float t = ((radius2_f - shadow.w) + d2) * inv_two_r * inv_d;
+                    if (t >= lim_hi) continue;
+                    if (t <= lim_lo) { buried_all = true; break; }
+                    const float inv_l1 = 1.0 / (abs(v.x) + abs(v.y) + abs(v.z));
+                    const vec3 p = v * inv_l1;
+                    vec2 uv = p.z >= 0.0 ? p.xy : vec2((1.0 - abs(p.y)) * (p.x >= 0.0 ? 1.0 : -1.0),
+                                                       (1.0 - abs(p.x)) * (p.y >= 0.0 ? 1.0 : -1.0));
+                    const int bx = clamp(int((uv.x + 1.0) * res_half), 0, res_max);
+                    const int by = clamp(int((uv.y + 1.0) * res_half), 0, res_max);
+                    const int q = clamp(int((t + 1.0) * 0.5 * float(tbins)), 0, int(tbins) - 1);
+                    const uint e = (uint(by * int(mask_params.resolution) + bx) * tbins + uint(q)) * 2u * W;
+                    for (uint w = 0u; w < W; ++w) {
+                        const uvec2 vis = and_not(visible[w], mask_table.values[e + w]);
+                        amb[w] = and2(vis, mask_table.values[e + W + w]);
+                        amb_any = amb_any || any2(amb[w]);
+                        visible[w] = vis;
+                        any = any || any2(vis);
+                    }
                 }
                 if (amb_any) {
                     if (n_pending < uint(SR_MASK_PENDING)) {
