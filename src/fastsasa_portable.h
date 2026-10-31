@@ -8,6 +8,14 @@
 #ifndef FASTSASA_PORTABLE_H
 #define FASTSASA_PORTABLE_H
 
+#if defined(_MSC_VER)
+#define FASTSASA_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define FASTSASA_NOINLINE __attribute__((noinline))
+#else
+#define FASTSASA_NOINLINE
+#endif
+
 #if defined(_WIN32)
 
 #ifndef WIN32_LEAN_AND_MEAN

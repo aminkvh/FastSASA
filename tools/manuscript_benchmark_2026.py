@@ -526,7 +526,6 @@ def cmd_run(args):
             "threads": args.threads,
             "precision": args.precision,
             "panel": args.panel,
-            "warmup_passes": warmup_passes,
             "repeat_index": repeat_index,
             "n_frames": n_frames,
             "elapsed_seconds": elapsed,

@@ -44,7 +44,7 @@ from fastsasa_adapters import (
     sasa_rdkit_mol,
 )
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 __all__ = [
     "SasaEngine",

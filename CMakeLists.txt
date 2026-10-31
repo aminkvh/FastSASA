@@ -6,7 +6,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(FASTSASA_VERSION "1.0.1" CACHE STRING "FastSASA release version")
+set(FASTSASA_VERSION "1.0.2" CACHE STRING "FastSASA release version")
 
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)

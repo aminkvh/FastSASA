@@ -77,6 +77,19 @@ skip_record(FILE *file,
     return end_size == start_size;
 }
 
+/* Kept out of line: inlined into read_float_record, GCC 13 at -O3 widens
+ * through a stack round trip and the frame read runs ~4x slower. */
+static FASTSASA_NOINLINE void
+widen_floats(const float *src,
+             int n,
+             double *dst,
+             int stride)
+{
+    for (int i = 0; i < n; ++i) {
+        dst[(size_t)stride * (size_t)i] = src[i];
+    }
+}
+
 static int
 read_float_record(FILE *file,
                   int reverse_endian,
@@ -109,10 +122,7 @@ read_float_record(FILE *file,
         }
     }
 
-    for (int i = 0; i < n; ++i) {
-        dst[(size_t)stride * (size_t)i + (size_t)offset] = tmp[i];
-    }
-
+    widen_floats(tmp, n, dst + offset, stride);
     return 1;
 }
 

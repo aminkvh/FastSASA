@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastsasa"
-version = "1.0.1"
+version = "1.0.2"
 description = "GPU-accelerated Shrake-Rupley and Lee-Richards SASA calculations (Vulkan, CUDA, CPU)"
 readme = "README.md"
 requires-python = ">=3.9"
