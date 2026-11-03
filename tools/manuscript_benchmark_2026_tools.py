@@ -28,7 +28,8 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
 from manuscript_benchmark_2026 import DATASETS  # noqa: E402
 
-FASTSASA = os.path.join(REPO_ROOT, "build-cuda-vulkan/fastsasa")
+FASTSASA = os.environ.get("FASTSASA_BENCH_EXE",
+                          os.path.join(REPO_ROOT, "build-cuda-vulkan/fastsasa"))
 THREADS = 15
 
 

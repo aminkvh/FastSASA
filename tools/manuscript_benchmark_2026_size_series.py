@@ -25,7 +25,8 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
 import fastsasa_native as fn  # noqa: E402
 from fastsasa_adapters import load_radius_config  # noqa: E402
 
-LIBRARY = os.path.join(REPO_ROOT, "build-cuda-vulkan/libfastsasa_native.so")
+LIBRARY = os.environ.get("FASTSASA_BENCH_LIBRARY",
+                         os.path.join(REPO_ROOT, "build-cuda-vulkan/libfastsasa_native.so"))
 FREESASA_DRIVER = os.path.join(REPO_ROOT, "tools/manuscript_benchmark_2026_freesasa_driver/freesasa_calc_coord_driver")
 CONFIGS = [("cpu", "fp64"), ("cuda", "fp64"), ("cuda", "fp32"), ("vulkan", "fp64"), ("vulkan", "fp32")]
 

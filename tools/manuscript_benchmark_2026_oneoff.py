@@ -28,8 +28,10 @@ from fastsasa_adapters import load_radius_config  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from manuscript_benchmark_2026_size_series import freesasa_driver  # noqa: E402
 
-FASTSASA = os.path.join(REPO_ROOT, "build-cuda-vulkan/fastsasa")
-LIBRARY = os.path.join(REPO_ROOT, "build-cuda-vulkan/libfastsasa_native.so")
+FASTSASA = os.environ.get("FASTSASA_BENCH_EXE",
+                          os.path.join(REPO_ROOT, "build-cuda-vulkan/fastsasa"))
+LIBRARY = os.environ.get("FASTSASA_BENCH_LIBRARY",
+                         os.path.join(REPO_ROOT, "build-cuda-vulkan/libfastsasa_native.so"))
 FREESASA_CLI = os.environ.get("FREESASA_CLI") or shutil.which("freesasa")
 RUST_SASA = os.environ.get("RUST_SASA") or shutil.which("rust-sasa")
 VMD = os.environ.get("VMD") or shutil.which("vmd")

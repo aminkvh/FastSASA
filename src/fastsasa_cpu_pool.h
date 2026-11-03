@@ -9,11 +9,13 @@
 #ifndef FASTSASA_CPU_POOL_H
 #define FASTSASA_CPU_POOL_H
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -31,9 +33,39 @@ public:
      * parked workers cost nothing and the OS reclaims them at exit. */
     static WorkerPool &instance()
     {
-        static WorkerPool *pool = new WorkerPool();
+        static WorkerPool *pool = new WorkerPool(default_workers());
         return *pool;
     }
+
+    /* A private pool of `workers` threads that run() uses on the creating
+     * thread while the Team exists. Concurrent trajectory frames each get a
+     * team: through the shared pool only one frame at a time could split its
+     * work, and the others would spawn threads on every call. */
+    class Team {
+    public:
+        explicit Team(int workers) : previous_(current())
+        {
+            if (workers <= 0) return;
+            try {
+                pool_.reset(new WorkerPool(workers));
+            } catch (...) {
+                return; /* run() falls back to the shared pool or to spawning */
+            }
+            current() = pool_.get();
+        }
+        ~Team()
+        {
+            if (!pool_) return;
+            current() = previous_;
+            pool_->shutdown();
+        }
+        Team(const Team &) = delete;
+        Team &operator=(const Team &) = delete;
+
+    private:
+        WorkerPool *previous_;
+        std::unique_ptr<WorkerPool> pool_;
+    };
 
     /* Runs task(0) on the calling thread and task(1 .. count-1) on the
      * workers, returning when every task has finished. task must not throw.
@@ -44,7 +76,37 @@ public:
             task(0);
             return;
         }
-        instance().execute(count, task);
+        WorkerPool *team = current();
+        (team != nullptr ? *team : instance()).execute(count, task);
+    }
+
+    /* Hands [0, n) to count tasks in chunks taken from a shared counter, so
+     * a task that finishes early takes more work instead of idling at the
+     * join; body(begin, end, task) runs once per chunk. Every caller computes
+     * each item independently of the others, so the split never changes
+     * results. */
+    template <class Body>
+    static void run_chunked(int count, int n, const Body &body)
+    {
+        if (n <= 0) return;
+        const int chunk = chunk_size(count, n);
+        std::atomic<int> next(0);
+        run(count, [&](int task) {
+            for (;;) {
+                const int begin = next.fetch_add(chunk, std::memory_order_relaxed);
+                if (begin >= n) break;
+                body(begin, std::min(n, begin + chunk), task);
+            }
+        });
+    }
+
+    /* About 16 chunks per task evens out the load (surface and buried atoms
+     * differ several-fold in cost); 16 to 256 items keeps taking a chunk
+     * negligible next to the work in it. */
+    static int chunk_size(int count, int n)
+    {
+        if (count <= 1) return std::max(1, n);
+        return std::max(16, std::min(256, n / (count * 16)));
     }
 
 private:
@@ -69,10 +131,20 @@ private:
         busy_.store(false, std::memory_order_release);
     }
 
-    WorkerPool()
+    static WorkerPool *&current()
+    {
+        static thread_local WorkerPool *team = nullptr;
+        return team;
+    }
+
+    static int default_workers()
     {
         const unsigned available = std::thread::hardware_concurrency();
-        const int n = available > 1u ? static_cast<int>(available - 1u) : 0;
+        return available > 1u ? static_cast<int>(available - 1u) : 0;
+    }
+
+    explicit WorkerPool(int n)
+    {
 #ifndef _WIN32
         owner_ = getpid();
 #endif
@@ -104,14 +176,29 @@ private:
         return ready();
     }
 
+    /* Teams only: called when no run() is in progress. */
+    void shutdown()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_.store(true, std::memory_order_release);
+        }
+        wake_.notify_all();
+        for (std::thread &worker : workers_) worker.join();
+    }
+
     void worker_loop(int index)
     {
         std::uint64_t seen = 0;
         for (;;) {
-            if (!spin_until([&] { return generation_.load(std::memory_order_acquire) != seen; })) {
+            const auto ready = [&] {
+                return stop_.load(std::memory_order_acquire) || generation_.load(std::memory_order_acquire) != seen;
+            };
+            if (!spin_until(ready)) {
                 std::unique_lock<std::mutex> lock(mutex_);
-                wake_.wait(lock, [&] { return generation_.load(std::memory_order_acquire) != seen; });
+                wake_.wait(lock, ready);
             }
+            if (stop_.load(std::memory_order_acquire)) return;
             seen = generation_.load(std::memory_order_acquire);
             if (index + 1 < count_) (*task_)(index + 1);
             if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -149,6 +236,7 @@ private:
     std::atomic<std::uint64_t> generation_{0};
     std::atomic<int> pending_{0};
     std::atomic<bool> busy_{false};
+    std::atomic<bool> stop_{false};
     const std::function<void(int)> *task_ = nullptr;
     int count_ = 0;
 #ifndef _WIN32

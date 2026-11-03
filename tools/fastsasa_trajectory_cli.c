@@ -1348,6 +1348,24 @@ trajectory_host_free(void *ptr,
     else fastsasa_host_free(ptr);
 }
 
+/* CPU frames per batch. The CPU backend runs a batch's frames concurrently,
+ * one per thread, and joins at the end of each batch, so a batch holds four
+ * frames per thread to keep every thread busy until the join. It is capped
+ * so the two coordinate buffer sets (the reader fills one while the other
+ * is computed) stay within 256 MiB, and by the frame count when known. */
+static int
+cpu_trajectory_batch_size(int n_atoms, int known_frames, int n_threads)
+{
+    const double buffer_budget = 256.0 * 1024.0 * 1024.0;
+    const double bytes_per_frame = 2.0 * 3.0 * sizeof(double) * (double)(n_atoms > 0 ? n_atoms : 1);
+    double batch = 4.0 * (double)(n_threads > 0 ? n_threads : 1);
+
+    if (batch > buffer_budget / bytes_per_frame) batch = buffer_budget / bytes_per_frame;
+    if (known_frames > 0 && batch > (double)known_frames) batch = (double)known_frames;
+    if (batch < 8.0) batch = known_frames > 0 && known_frames < 8 ? (double)known_frames : 8.0;
+    return (int)batch;
+}
+
 static int
 run_topology_trajectory(const char *topology_path,
                         const char *trajectory_path,
@@ -1583,7 +1601,7 @@ run_topology_trajectory(const char *topology_path,
     }
     if (batch_size == 0) {
         if (force_cpu) {
-            batch_size = 8;
+            batch_size = cpu_trajectory_batch_size(n_calc_atoms, known_frames, n_threads);
         } else {
             batch_size = fastsasa_recommended_trajectory_batch_size(n_calc_atoms,
                                                                   known_frames,

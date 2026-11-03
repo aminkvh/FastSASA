@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -14,6 +15,17 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#else
+#include <unistd.h>
+#endif
 
 static const double FASTSASA_CPU_PI = 3.141592653589793238462643383279502884;
 
@@ -34,6 +46,20 @@ extern "C" int fastsasa_cpu_shrake_rupley_mask_centers(int n_atoms, int n_points
                                                        const double *expanded_radii, const double *test_points,
                                                        int n_threads, int fp32, const int *centers, int n_centers,
                                                        double *sasa);
+extern "C" void *fastsasa_cpu_mask_workspace_enter(void);
+extern "C" void fastsasa_cpu_mask_workspace_leave(void *workspace);
+
+/* Keeps the mask kernel's grid for the frames one trajectory worker runs. */
+class mask_workspace_scope {
+public:
+    mask_workspace_scope() : handle_(fastsasa_cpu_mask_workspace_enter()) {}
+    ~mask_workspace_scope() { fastsasa_cpu_mask_workspace_leave(handle_); }
+    mask_workspace_scope(const mask_workspace_scope &) = delete;
+    mask_workspace_scope &operator=(const mask_workspace_scope &) = delete;
+
+private:
+    void *handle_;
+};
 
 static void
 join_threads(std::vector<std::thread> *threads) noexcept
@@ -241,24 +267,112 @@ normalized_thread_count(int requested)
     return count > 0 ? count : 1;
 }
 
+/* Size of the largest CPU cache the platform reports (the L3 on desktop and
+ * server CPUs), in bytes; 32 MiB when it reports none. */
+static double
+cpu_last_level_cache_bytes()
+{
+    static const double bytes = [] {
+        double found = 0.0;
+#if defined(_WIN32)
+        DWORD length = 0;
+        GetLogicalProcessorInformation(nullptr, &length);
+        std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> info(length / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) + 1u);
+        if (length > 0 && GetLogicalProcessorInformation(info.data(), &length)) {
+            for (size_t i = 0; i < length / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION); ++i) {
+                if (info[i].Relationship == RelationCache) {
+                    found = std::max(found, static_cast<double>(info[i].Cache.Size));
+                }
+            }
+        }
+#elif defined(__APPLE__)
+        const char *names[] = {"hw.l3cachesize", "hw.l2cachesize"};
+        for (const char *name : names) {
+            std::int64_t value = 0;
+            size_t size = sizeof(value);
+            if (sysctlbyname(name, &value, &size, nullptr, 0) == 0 && value > 0) {
+                found = std::max(found, static_cast<double>(value));
+            }
+        }
+#elif defined(_SC_LEVEL3_CACHE_SIZE)
+        const long l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
+        const long l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
+        found = static_cast<double>(std::max(std::max(l3, l2), 0L));
+#endif
+        return found > 0.0 ? found : 32.0 * 1024.0 * 1024.0;
+    }();
+    return bytes;
+}
+
+/* Frames of one call run concurrently, each on its own thread or team of
+ * threads (cpu_atom_thread_count), so a frame's serial setup overlaps other
+ * frames' work and threads join once per call instead of once per frame.
+ *
+ * The cache caps how many run at once: each frame works on its own cell
+ * grid, and once the concurrent grids outgrow the last-level cache, memory
+ * traffic costs more than the parallelism gains. Measured with 15 threads on
+ * a Ryzen 7700X (32 MiB L3), throughput relative to one frame at a time:
+ *   Cx46,  17k atoms: 1.6x for 8 to 16 frames at once
+ *   1AON,  59k atoms: 1.06x at 2 frames, 0.91x at 8
+ *   4FTB, 471k atoms: 1.06x at 2 frames, 0.90x at 8
+ * kFrameCacheBytesPerAtom puts that machine at 8, 2 and 2 frames; two frames
+ * always beat one. A memory budget for the grids (about 128 bytes per atom
+ * each) binds only for millions of atoms.
+ *
+ * Within that cap the count is the one with the shortest estimated time:
+ * the call takes ceil(frames / count) rounds, each a frame on a team of
+ * threads / count threads, and a team of t threads computes a frame about
+ * t / (1 + kTeamLoss (t - 1)) times as fast as one thread (Cx46: 4.9x on 8
+ * threads). This keeps teams even and avoids a last round that leaves most
+ * threads idle (GABA_A, 14k atoms, 50 frames, 15 threads: 5 frames of 3
+ * threads 750 frames/s, 15 frames of 1 thread 697).
+ *
+ * FASTSASA_CPU_FRAME_THREADS overrides the count. */
 static int
 cpu_frame_thread_count(int total_threads,
                        int n_frames,
                        int n_atoms)
 {
+    constexpr double kFrameCacheBytesPerAtom = 224.0;
+    constexpr double kFrameBytesPerAtom = 128.0;
+    constexpr double kFrameMemoryBudget = 1024.0 * 1024.0 * 1024.0;
+    constexpr double kTeamLoss = 0.07;
     const char *value = std::getenv("FASTSASA_CPU_FRAME_THREADS");
     int requested = 0;
 
     if (n_frames <= 1 || total_threads <= 1) return 1;
     if (value != nullptr && value[0] != '\0') requested = std::atoi(value);
     if (requested <= 0) {
-        if (n_atoms >= 15000) requested = 1;
-        else if (n_atoms >= 5000) requested = std::max(1, total_threads / 3);
-        else requested = std::max(1, total_threads / 2);
+        const double atoms = static_cast<double>(std::max(1, n_atoms));
+        const double by_cache = std::max(2.0, cpu_last_level_cache_bytes() / (kFrameCacheBytesPerAtom * atoms));
+        const double by_memory = std::max(1.0, kFrameMemoryBudget / (kFrameBytesPerAtom * atoms));
+        const int limit = static_cast<int>(std::min<double>(std::min(total_threads, n_frames), std::min(by_cache, by_memory)));
+        double best = 0.0;
+
+        for (int count = 1; count <= limit; ++count) {
+            const int team = total_threads / count;
+            const int rounds = (n_frames + count - 1) / count;
+            const double time = rounds * (1.0 + kTeamLoss * (team - 1)) / team;
+            if (count == 1 || time < best * (1.0 - 1e-9)) {
+                best = time;
+                requested = count;
+            }
+        }
     }
     if (requested > total_threads) requested = total_threads;
     if (requested > n_frames) requested = n_frames;
     return requested > 0 ? requested : 1;
+}
+
+/* Atom threads for frame worker `worker`: the threads are shared out
+ * evenly, the first total % frame_threads workers taking one more, so none
+ * is left idle. */
+static int
+cpu_atom_thread_count(int total_threads,
+                      int frame_threads,
+                      int worker)
+{
+    return std::max(1, total_threads / frame_threads + (worker < total_threads % frame_threads ? 1 : 0));
 }
 
 /* centers, when not null, lists the atoms whose SASA is computed; every
@@ -319,13 +433,7 @@ cpu_shrake_rupley_impl(int n_atoms,
     if (!env_enabled("FASTSASA_CPU_SIMD", 1)) {
         const cell_list cells(n_atoms, x, y, z, max_radius);
 
-        fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
-                const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
-                                                   static_cast<size_t>(n_work) /
-                                                   static_cast<size_t>(count));
-                const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
-                                                 static_cast<size_t>(n_work) /
-                                                 static_cast<size_t>(count));
+        fastsasa_cpu::WorkerPool::run_chunked(count, n_work, [&](int begin, int end, int) {
                     try {
                 for (int work = begin; work < end; ++work) {
                     const int atom = centers != nullptr ? centers[work] : work;
@@ -364,13 +472,7 @@ cpu_shrake_rupley_impl(int n_atoms,
 
     const cell_list cells(n_atoms, x, y, z, 2.0 * max_radius);
     const int point_simd = env_enabled("FASTSASA_CPU_POINT_SIMD", 0);
-    fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
-            const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
-                                               static_cast<size_t>(n_work) /
-                                               static_cast<size_t>(count));
-            const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
-                                             static_cast<size_t>(n_work) /
-                                             static_cast<size_t>(count));
+    fastsasa_cpu::WorkerPool::run_chunked(count, n_work, [&](int begin, int end, int) {
                 try {
             std::vector<int> candidates;
             std::vector<int> neighbors;
@@ -610,13 +712,7 @@ cpu_shrake_rupley_impl_fp32(int n_atoms,
     count = thread_count(n_threads, n_work);
     const cell_list32 cells(n_atoms, xf.data(), yf.data(), zf.data(), 2.0f * static_cast<float>(max_radius));
 
-    fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
-            const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
-                                               static_cast<size_t>(n_work) /
-                                               static_cast<size_t>(count));
-            const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
-                                             static_cast<size_t>(n_work) /
-                                             static_cast<size_t>(count));
+    fastsasa_cpu::WorkerPool::run_chunked(count, n_work, [&](int begin, int end, int) {
                 try {
                     std::vector<int> candidates;
                     std::vector<int> neighbors;
@@ -784,13 +880,7 @@ cpu_exposed_points_impl(int n_atoms,
     }
     count = thread_count(n_threads, n_atoms);
     const cell_list cells(n_atoms, x, y, z, 2.0 * max_radius);
-    fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
-            const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
-                                               static_cast<size_t>(n_atoms) /
-                                               static_cast<size_t>(count));
-            const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
-                                             static_cast<size_t>(n_atoms) /
-                                             static_cast<size_t>(count));
+    fastsasa_cpu::WorkerPool::run_chunked(count, n_atoms, [&](int begin, int end, int) {
                 try {
                     for (int atom = begin; atom < end; ++atom) {
                         const double radius = expanded_radii[atom];
@@ -992,13 +1082,7 @@ cpu_lee_richards_impl(int n_atoms,
     }
     const cell_list cells(n_atoms, x, y, z, 2.0 * max_radius);
     count = thread_count(n_threads, n_atoms);
-    fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
-            const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
-                                               static_cast<size_t>(n_atoms) /
-                                               static_cast<size_t>(count));
-            const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
-                                             static_cast<size_t>(n_atoms) /
-                                             static_cast<size_t>(count));
+    fastsasa_cpu::WorkerPool::run_chunked(count, n_atoms, [&](int begin, int end, int) {
                 try {
             for (int atom = begin; atom < end; ++atom) {
                 sasa[atom] = lee_richards_atom_area(n_atoms,
@@ -1090,11 +1174,7 @@ fastsasa_cpu_lee_richards_centers(int n_atoms,
         const cell_list cells(n_atoms, x, y, z, 2.0 * max_radius);
         const int count = thread_count(n_threads, n_centers);
 
-        fastsasa_cpu::WorkerPool::run(count, [&](int thread_id) {
-            const int begin = static_cast<int>(static_cast<size_t>(thread_id) *
-                                               static_cast<size_t>(n_centers) / static_cast<size_t>(count));
-            const int end = static_cast<int>(static_cast<size_t>(thread_id + 1) *
-                                             static_cast<size_t>(n_centers) / static_cast<size_t>(count));
+        fastsasa_cpu::WorkerPool::run_chunked(count, n_centers, [&](int begin, int end, int) {
             try {
                 for (int i = begin; i < end; ++i) {
                     areas[i] = lee_richards_atom_area(n_atoms, n_slices, x, y, z, expanded_radii,
@@ -1305,7 +1385,6 @@ cpu_calc_trajectory_soa_impl(const fastsasa_topology *topology,
 
     const int total_threads = normalized_thread_count(n_threads);
     const int frame_threads = cpu_frame_thread_count(total_threads, frames->n_frames, topology->n_atoms);
-    const int atom_threads = std::max(1, total_threads / frame_threads);
     const std::vector<double> expanded = cpu_expanded_radii(topology->radii, topology->n_atoms, probe_radius);
     const std::vector<double> points = algorithm == FASTSASA_ALGORITHM_SHRAKE_RUPLEY
                                            ? cpu_test_points(resolution)
@@ -1319,6 +1398,9 @@ cpu_calc_trajectory_soa_impl(const fastsasa_topology *topology,
         for (int worker = 0; worker < frame_threads; ++worker) {
             workers.emplace_back([&, worker]() {
             try {
+                const int atom_threads = cpu_atom_thread_count(total_threads, frame_threads, worker);
+                const fastsasa_cpu::WorkerPool::Team team(frame_threads > 1 ? atom_threads - 1 : 0);
+                const mask_workspace_scope workspace;
                 std::vector<double> scratch(static_cast<size_t>(topology->n_atoms));
 
                 for (;;) {
@@ -1423,7 +1505,6 @@ cpu_calc_trajectory_soa_selection_impl(const fastsasa_topology *topology,
 
     const int total_threads = normalized_thread_count(n_threads);
     const int frame_threads = cpu_frame_thread_count(total_threads, frames->n_frames, topology->n_atoms);
-    const int atom_threads = std::max(1, total_threads / frame_threads);
     const std::vector<double> expanded = cpu_expanded_radii(topology->radii, topology->n_atoms, probe_radius);
     const std::vector<double> points = algorithm == FASTSASA_ALGORITHM_SHRAKE_RUPLEY
                                            ? cpu_test_points(resolution)
@@ -1450,6 +1531,9 @@ cpu_calc_trajectory_soa_selection_impl(const fastsasa_topology *topology,
         for (int worker = 0; worker < frame_threads; ++worker) {
             workers.emplace_back([&, worker]() {
             try {
+                const int atom_threads = cpu_atom_thread_count(total_threads, frame_threads, worker);
+                const fastsasa_cpu::WorkerPool::Team team(frame_threads > 1 ? atom_threads - 1 : 0);
+                const mask_workspace_scope workspace;
                 std::vector<double> scratch(static_cast<size_t>(topology->n_atoms));
 
                 for (;;) {

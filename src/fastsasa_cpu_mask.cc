@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -359,6 +360,28 @@ std::shared_ptr<const MaskTable> acquire_table(int n_points, const double *test_
     return table;
 }
 
+/* Uninitialised, growable array. Kept across calls by a workspace, it is
+ * neither reallocated nor cleared for the next frame; fresh, its pages are
+ * first written by the parallel scatter instead of being zeroed by one
+ * thread. */
+template <class T>
+struct Buffer {
+    std::unique_ptr<T[]> p;
+    std::size_t n = 0, cap = 0;
+    void resize(std::size_t m)
+    {
+        if (m > cap) {
+            p.reset(new T[m]);
+            cap = m;
+        }
+        n = m;
+    }
+    T *data() { return p.get(); }
+    const T *data() const { return p.get(); }
+    T &operator[](std::size_t i) { return p[i]; }
+    const T &operator[](std::size_t i) const { return p[i]; }
+};
+
 /* Dense cell grid; atoms counting-sorted by cell with SoA coordinates. */
 struct Grid {
     double origin[3];
@@ -367,22 +390,53 @@ struct Grid {
     int stencil;                          /* cells to each side covering the reach */
     std::vector<std::pair<int, int>> rows;  /* (dz, dy) offsets, nearest first */
     std::vector<int> cell_start;          /* size cells + 1 */
-    std::vector<int> atom_of;             /* sorted slot -> atom id */
-    std::vector<double> sx, sy, sz, sr;   /* sorted coordinates and expanded radii */
-    std::vector<double> sr2, inv_two_r;   /* R^2 and 1/(2R), sorted */
+    Buffer<int> atom_of;                  /* sorted slot -> atom id */
+    Buffer<double> sx, sy, sz, sr;        /* sorted coordinates and expanded radii */
+    Buffer<double> sr2, inv_two_r;        /* R^2 and 1/(2R), sorted */
     /* FP32 mode: the reference's float shadow (coordinates box-local in
      * double, then cast; float radii and squared radii), in slot order. */
-    std::vector<float> fx, fy, fz, fr, fr2;
+    Buffer<float> fx, fy, fz, fr, fr2;
+    Buffer<int> cell_of, slot_of;         /* build scratch */
+    std::vector<int> fill;
 
+    /* threads > 1 runs the per-atom passes in parallel. Slots are assigned
+     * by one serial stable pass in atom order, so the layout, and with it
+     * every result, is the same for any thread count. */
     bool build(int n_atoms, const double *x, const double *y, const double *z, const double *r,
-               double reach, double cell_size, bool fp32)
+               double reach, double cell_size, bool fp32, int threads)
     {
-        double lo[3] = {x[0], y[0], z[0]};
-        double hi[3] = {x[0], y[0], z[0]};
-        for (int a = 1; a < n_atoms; ++a) {
-            lo[0] = std::min(lo[0], x[a]); hi[0] = std::max(hi[0], x[a]);
-            lo[1] = std::min(lo[1], y[a]); hi[1] = std::max(hi[1], y[a]);
-            lo[2] = std::min(lo[2], z[a]); hi[2] = std::max(hi[2], z[a]);
+        const std::size_t n = static_cast<std::size_t>(n_atoms);
+        /* One task per 4,096 atoms at most: below that a pass is cheaper
+         * than waking a worker. */
+        const int tasks = std::max(1, std::min(threads, n_atoms / 4096));
+        auto pass = [&](const auto &body) {
+            if (tasks <= 1) {
+                body(0, n_atoms);
+                return;
+            }
+            fastsasa_cpu::WorkerPool::run(tasks, [&](int t) {
+                body(static_cast<int>(n * static_cast<std::size_t>(t) / static_cast<std::size_t>(tasks)),
+                     static_cast<int>(n * static_cast<std::size_t>(t + 1) / static_cast<std::size_t>(tasks)));
+            });
+        };
+
+        std::vector<double> bounds(6u * static_cast<std::size_t>(tasks));
+        if (tasks <= 1) {
+            box(x, y, z, 0, n_atoms, bounds.data());
+        } else {
+            fastsasa_cpu::WorkerPool::run(tasks, [&](int t) {
+                box(x, y, z, static_cast<int>(n * static_cast<std::size_t>(t) / static_cast<std::size_t>(tasks)),
+                    static_cast<int>(n * static_cast<std::size_t>(t + 1) / static_cast<std::size_t>(tasks)),
+                    bounds.data() + 6u * static_cast<std::size_t>(t));
+            });
+        }
+        double lo[3] = {bounds[0], bounds[1], bounds[2]};
+        double hi[3] = {bounds[3], bounds[4], bounds[5]};
+        for (int t = 1; t < tasks; ++t) {
+            for (int k = 0; k < 3; ++k) {
+                lo[k] = std::min(lo[k], bounds[6u * static_cast<std::size_t>(t) + static_cast<std::size_t>(k)]);
+                hi[k] = std::max(hi[k], bounds[6u * static_cast<std::size_t>(t) + 3u + static_cast<std::size_t>(k)]);
+            }
         }
         inv_cell = 1.0 / cell_size;
         stencil = static_cast<int>(std::ceil(reach * inv_cell));
@@ -401,45 +455,57 @@ struct Grid {
             cells *= static_cast<std::size_t>(dims[k]);
             if (cells > (std::size_t(1) << 26)) return false;
         }
-        cell_start.assign(cells + 1u, 0);
-        std::vector<int> cell_of(static_cast<size_t>(n_atoms));
-        for (int a = 0; a < n_atoms; ++a) {
-            const int c = cell_index(x[a], y[a], z[a]);
-            cell_of[static_cast<size_t>(a)] = c;
-            ++cell_start[static_cast<size_t>(c) + 1u];
-        }
-        for (std::size_t c = 0; c < cells; ++c) cell_start[c + 1u] += cell_start[c];
-        atom_of.resize(static_cast<size_t>(n_atoms));
-        sx.resize(static_cast<size_t>(n_atoms));
-        sy.resize(static_cast<size_t>(n_atoms));
-        sz.resize(static_cast<size_t>(n_atoms));
-        sr.resize(static_cast<size_t>(n_atoms));
-        sr2.resize(static_cast<size_t>(n_atoms));
-        inv_two_r.resize(static_cast<size_t>(n_atoms));
+        cell_of.resize(n);
+        slot_of.resize(n);
+        atom_of.resize(n);
+        sx.resize(n); sy.resize(n); sz.resize(n); sr.resize(n); sr2.resize(n); inv_two_r.resize(n);
         if (fp32) {
-            fx.resize(static_cast<size_t>(n_atoms)); fy.resize(static_cast<size_t>(n_atoms)); fz.resize(static_cast<size_t>(n_atoms));
-            fr.resize(static_cast<size_t>(n_atoms)); fr2.resize(static_cast<size_t>(n_atoms));
+            fx.resize(n); fy.resize(n); fz.resize(n); fr.resize(n); fr2.resize(n);
         }
-        std::vector<int> fill(cell_start.begin(), cell_start.end() - 1);
-        for (int a = 0; a < n_atoms; ++a) {
-            const int slot = fill[static_cast<size_t>(cell_of[static_cast<size_t>(a)])]++;
-            atom_of[static_cast<size_t>(slot)] = a;
-            sx[static_cast<size_t>(slot)] = x[a];
-            sy[static_cast<size_t>(slot)] = y[a];
-            sz[static_cast<size_t>(slot)] = z[a];
-            sr[static_cast<size_t>(slot)] = r[a];
-            sr2[static_cast<size_t>(slot)] = r[a] * r[a];
-            inv_two_r[static_cast<size_t>(slot)] = 1.0 / (2.0 * r[a]);
-            if (fp32) {
-                /* same expressions as cpu_shrake_rupley_impl_fp32 */
-                fx[static_cast<size_t>(slot)] = static_cast<float>(x[a] - lo[0]);
-                fy[static_cast<size_t>(slot)] = static_cast<float>(y[a] - lo[1]);
-                fz[static_cast<size_t>(slot)] = static_cast<float>(z[a] - lo[2]);
-                fr[static_cast<size_t>(slot)] = static_cast<float>(r[a]);
-                fr2[static_cast<size_t>(slot)] = fr[static_cast<size_t>(slot)] * fr[static_cast<size_t>(slot)];
+        pass([&](int begin, int end) {
+            for (int a = begin; a < end; ++a) cell_of[static_cast<size_t>(a)] = cell_index(x[a], y[a], z[a]);
+        });
+        cell_start.assign(cells + 1u, 0);
+        for (std::size_t a = 0; a < n; ++a) ++cell_start[static_cast<size_t>(cell_of[a]) + 1u];
+        for (std::size_t c = 0; c < cells; ++c) cell_start[c + 1u] += cell_start[c];
+        fill.assign(cell_start.begin(), cell_start.end() - 1);
+        for (std::size_t a = 0; a < n; ++a) slot_of[a] = fill[static_cast<size_t>(cell_of[a])]++;
+        pass([&](int begin, int end) {
+            for (int a = begin; a < end; ++a) {
+                const std::size_t slot = static_cast<std::size_t>(slot_of[static_cast<size_t>(a)]);
+                atom_of[slot] = a;
+                sx[slot] = x[a];
+                sy[slot] = y[a];
+                sz[slot] = z[a];
+                sr[slot] = r[a];
+                sr2[slot] = r[a] * r[a];
+                inv_two_r[slot] = 1.0 / (2.0 * r[a]);
+                if (fp32) {
+                    /* same expressions as cpu_shrake_rupley_impl_fp32 */
+                    fx[slot] = static_cast<float>(x[a] - lo[0]);
+                    fy[slot] = static_cast<float>(y[a] - lo[1]);
+                    fz[slot] = static_cast<float>(z[a] - lo[2]);
+                    fr[slot] = static_cast<float>(r[a]);
+                    fr2[slot] = fr[slot] * fr[slot];
+                }
             }
-        }
+        });
         return true;
+    }
+
+    static void box(const double *x, const double *y, const double *z, int begin, int end, double *out)
+    {
+        double lo[3] = {x[begin], y[begin], z[begin]};
+        double hi[3] = {x[begin], y[begin], z[begin]};
+        for (int a = begin + 1; a < end; ++a) {
+            lo[0] = std::min(lo[0], x[a]); hi[0] = std::max(hi[0], x[a]);
+            lo[1] = std::min(lo[1], y[a]); hi[1] = std::max(hi[1], y[a]);
+            lo[2] = std::min(lo[2], z[a]); hi[2] = std::max(hi[2], z[a]);
+        }
+        for (int k = 0; k < 3; ++k) {
+            out[k] = lo[k];
+            out[3 + k] = hi[k];
+        }
     }
 
     inline int coord(double v, int k) const
@@ -484,7 +550,28 @@ struct WorkerArgs {
     Stats *stats;
     std::atomic<int> *status;
     std::atomic<long> *candidates;
+    std::atomic<int> *next;          /* shared counter over [0, n_work) */
+    int n_work;
+    int chunk;
 };
+
+/* A task's position in the work it has taken: yields items one at a time
+ * and takes the next chunk from the shared counter when the current one is
+ * used up, so tasks that finish early take more. -1 when none is left. */
+struct WorkCursor {
+    int pos = 0, end = 0;
+};
+
+static FASTSASA_ALWAYS_INLINE int next_work(const WorkerArgs &A, WorkCursor &cursor)
+{
+    if (cursor.pos == cursor.end) {
+        const int begin = A.next->fetch_add(A.chunk, std::memory_order_relaxed);
+        if (begin >= A.n_work) return -1;
+        cursor.pos = begin;
+        cursor.end = std::min(A.n_work, begin + A.chunk);
+    }
+    return cursor.pos++;
+}
 
 /* One neighbour's cap applied to the visibility mask. Returns false when
  * the atom is settled (fully buried, or nothing visible remains). */
@@ -533,38 +620,38 @@ static FASTSASA_ALWAYS_INLINE bool apply_cap(const MaskTable &lut, std::uint64_t
 #endif
 
 template <int W>
-static FASTSASA_ALWAYS_INLINE void worker_body(const WorkerArgs &A, int begin, int end, int tid);
+static FASTSASA_ALWAYS_INLINE void worker_body(const WorkerArgs &A, int tid);
 
 template <int W>
-static void worker_impl_base(const WorkerArgs &A, int begin, int end, int tid)
+static void worker_impl_base(const WorkerArgs &A, int tid)
 {
-    worker_body<W>(A, begin, end, tid);
+    worker_body<W>(A, tid);
 }
 
 #if FASTSASA_MASK_MULTIVERSION
 template <int W>
 __attribute__((target("avx2,fma")))
-static void worker_impl_avx2(const WorkerArgs &A, int begin, int end, int tid)
+static void worker_impl_avx2(const WorkerArgs &A, int tid)
 {
-    worker_body<W>(A, begin, end, tid);
+    worker_body<W>(A, tid);
 }
 #endif
 
 template <int W>
-static void worker_impl(const WorkerArgs &A, int begin, int end, int tid)
+static void worker_impl(const WorkerArgs &A, int tid)
 {
 #if FASTSASA_MASK_MULTIVERSION
     static const bool have_avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
     if (have_avx2) {
-        worker_impl_avx2<W>(A, begin, end, tid);
+        worker_impl_avx2<W>(A, tid);
         return;
     }
 #endif
-    worker_impl_base<W>(A, begin, end, tid);
+    worker_impl_base<W>(A, tid);
 }
 
 template <int W>
-static FASTSASA_ALWAYS_INLINE void worker_body(const WorkerArgs &A, int begin, int end, int tid)
+static FASTSASA_ALWAYS_INLINE void worker_body(const WorkerArgs &A, int tid)
 {
     const Grid &grid = A.grid;
     const MaskTable &lut = A.lut;
@@ -607,7 +694,8 @@ static FASTSASA_ALWAYS_INLINE void worker_body(const WorkerArgs &A, int begin, i
                              (long long)0x8000000000000000ULL, (long long)0x8000000000000000ULL};
 #endif
 
-        for (int work = begin; work < end; ++work) {
+        WorkCursor cursor;
+        for (int work = next_work(A, cursor); work >= 0; work = next_work(A, cursor)) {
             const int slot = A.slots != nullptr ? A.slots[work] : work;
             const int atom = grid.atom_of[static_cast<size_t>(slot)];
             const double ri = gsr[slot];
@@ -924,6 +1012,28 @@ fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points, i
     return work >= break_even ? 1 : 0;
 }
 
+/* Grid storage kept for the calling thread between enter and leave, so a
+ * trajectory reuses one grid for all its frames instead of allocating and
+ * faulting in fresh arrays every frame (most of the serial per-frame time).
+ * Outside a workspace each call uses its own grid as before. */
+static thread_local Grid *t_workspace = nullptr;
+
+extern "C" void *
+fastsasa_cpu_mask_workspace_enter(void)
+{
+    if (t_workspace != nullptr) return nullptr;
+    t_workspace = new (std::nothrow) Grid();
+    return t_workspace;
+}
+
+extern "C" void
+fastsasa_cpu_mask_workspace_leave(void *workspace)
+{
+    if (workspace == nullptr || workspace != t_workspace) return;
+    delete t_workspace;
+    t_workspace = nullptr;
+}
+
 /* centers, when not null, lists the atoms whose SASA is computed (all atoms
  * still occlude); the other entries of sasa are set to zero. */
 static int
@@ -944,8 +1054,11 @@ mask_kernel(int n_atoms, int n_points, const double *x, const double *y, const d
 
     /* Cell edge = max radius, stencil 2: covers reach 2 * max_radius with a
      * 5x5x5 block, 42% less volume than 3x3x3 cells of twice the edge. */
-    Grid grid;
-    if (!grid.build(n_atoms, x, y, z, expanded_radii, 2.0 * max_radius, max_radius, fp32)) return kUnsupported;
+    std::unique_ptr<Grid> own;
+    if (t_workspace == nullptr) own.reset(new Grid());
+    Grid &grid = t_workspace != nullptr ? *t_workspace : *own;
+    const int build_threads = n_threads > 0 ? n_threads : fastsasa_cpu_default_threads();
+    if (!grid.build(n_atoms, x, y, z, expanded_radii, 2.0 * max_radius, max_radius, fp32, build_threads)) return kUnsupported;
     /* Selected centres in slot order, so a worker's atoms stay spatially
      * local exactly as in the full calculation. */
     std::vector<int> slots;
@@ -992,21 +1105,18 @@ mask_kernel(int n_atoms, int n_points, const double *x, const double *y, const d
      * atoms are processed in sorted slot order so their neighbourhoods are
      * spatially and cache local). The worker is instantiated per mask width
      * so the visibility mask is a fixed-size register array. */
+    std::atomic<int> next{0};
     WorkerArgs args{grid, lut, test_points, fp32 ? points_f.data() : nullptr, fp32,
-                    centers != nullptr ? slots.data() : nullptr, sasa, stats.data(), &worker_status, &candidates};
-    auto run = [&](int begin, int end, int tid) {
-        switch (words) {
-        case 1: worker_impl<1>(args, begin, end, tid); break;
-        case 2: worker_impl<2>(args, begin, end, tid); break;
-        case 3: worker_impl<3>(args, begin, end, tid); break;
-        default: worker_impl<4>(args, begin, end, tid); break;
-        }
-    };
+                    centers != nullptr ? slots.data() : nullptr, sasa, stats.data(), &worker_status, &candidates,
+                    &next, n_work, fastsasa_cpu::WorkerPool::chunk_size(count, n_work)};
 
     fastsasa_cpu::WorkerPool::run(count, [&](int tid) {
-        const int begin = static_cast<int>(static_cast<size_t>(tid) * static_cast<size_t>(n_work) / static_cast<size_t>(count));
-        const int end = static_cast<int>(static_cast<size_t>(tid + 1) * static_cast<size_t>(n_work) / static_cast<size_t>(count));
-        run(begin, end, tid);
+        switch (words) {
+        case 1: worker_impl<1>(args, tid); break;
+        case 2: worker_impl<2>(args, tid); break;
+        case 3: worker_impl<3>(args, tid); break;
+        default: worker_impl<4>(args, tid); break;
+        }
     });
     if (want_stats) {
         Stats total;

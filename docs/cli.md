@@ -87,6 +87,11 @@ the faster). To force one kernel:
 set to `reference` or `mask`; `FASTSASA_MASK_MIN_CENTERS` (default 2048)
 moves the GPU crossover.
 
+On the CPU, the frames of a trajectory batch run concurrently, each on its
+own thread or team of threads. The number of concurrent frames follows the
+system size, the last-level cache and the batch length;
+`FASTSASA_CPU_FRAME_THREADS=N` fixes it. Results do not depend on it.
+
 ## Core Options
 
 | Option | Meaning |
@@ -234,7 +239,7 @@ Options:
 | `--topology FILE` | `.pdb`, `.cif`, or `.psf` topology |
 | `--trajectory FILE` | `.dcd` or `.xtc` trajectory |
 | `--frames SPEC` | Python-style frame selection; `:` means all, `10` means frame 10, `-1` means last frame |
-| `--batch-size N` | frames per GPU or CPU trajectory batch; omitted means conservative automatic choice |
+| `--batch-size N` | frames per GPU or CPU trajectory batch; omitted means an automatic choice (CPU: four frames per thread) |
 | `--probe-radius N`, `-p N` | solvent probe radius, default `1.4` |
 | `--resolution N`, `-n N` | SR points or LR slices; defaults are SR `100`, LR `20` |
 | `--precision fp64\|fp32` | arithmetic precision, default `fp64` |
