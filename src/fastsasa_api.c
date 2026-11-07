@@ -1,6 +1,7 @@
 #include "fastsasa_exact_math.h"
 #include "fastsasa.h"
 #include "fastsasa_trajectory.h"
+#include "fastsasa_cpu.h"
 
 #include "fastsasa_backend_internal.h"
 #include "fastsasa_device.h"
@@ -1001,6 +1002,91 @@ fastsasa_context_lee_richards(fastsasa_context *context,
 #endif
 }
 
+static int
+cpu_exact_scatter(int n_atoms, const double *x, const double *y, const double *z, const double *radii,
+                  const int *centers, int n_centers, double *sasa)
+{
+    double *areas = (double *)malloc(sizeof(double) * (size_t)n_centers);
+    int status;
+
+    if (areas == NULL) return FASTSASA_MEMORY_ERROR;
+    status = fastsasa_cpu_exact_centers(n_atoms, x, y, z, radii, 0, centers, n_centers, areas);
+    if (status == FASTSASA_SUCCESS) {
+        for (int c = 0; c < n_centers; ++c) sasa[centers[c]] = areas[c];
+    }
+    free(areas);
+    return status;
+}
+
+int
+fastsasa_context_exact(fastsasa_context *context,
+                     const fastsasa_sr_input *input,
+                     double *sasa)
+{
+    const double *x, *y, *z;
+    double *soa = NULL;
+    const int *centers = NULL;
+    int n_centers = 0;
+    int mixed;
+    int status;
+
+    if (context == NULL || input == NULL || sasa == NULL || input->n_atoms < 0 || input->radii == NULL ||
+        (input->x == NULL && input->xyz == NULL) || (input->n_selections > 0 && input->selection_masks == NULL) ||
+        (input->n_residues > 0 && input->residue_ids == NULL)) {
+        return FASTSASA_INVALID_ARGUMENT;
+    }
+    x = input->x;
+    y = input->y;
+    z = input->z;
+    if (x == NULL || y == NULL || z == NULL) {
+        soa = (double *)malloc(sizeof(double) * 3u * (size_t)(input->n_atoms > 0 ? input->n_atoms : 1));
+        if (soa == NULL) return FASTSASA_MEMORY_ERROR;
+        for (int i = 0; i < input->n_atoms; ++i) {
+            soa[i] = input->xyz[3 * i];
+            soa[input->n_atoms + i] = input->xyz[3 * i + 1];
+            soa[2 * input->n_atoms + i] = input->xyz[3 * i + 2];
+        }
+        x = soa;
+        y = soa + input->n_atoms;
+        z = soa + 2 * input->n_atoms;
+    }
+    if (input->active_center_indices != NULL && input->n_active_centers > 0) {
+        centers = input->active_center_indices;
+        n_centers = input->n_active_centers;
+        memset(sasa, 0, sizeof(double) * (size_t)input->n_atoms);
+    }
+    mixed = input->force_double_precision > 0
+                ? 0
+                : input->force_double_precision < 0 || context->precision == FASTSASA_PRECISION_FP32;
+    if (context->backend == FASTSASA_BACKEND_CUDA) {
+        status = fastsasa_device_context_exact(context->cuda, input->n_atoms, x, y, z, input->radii,
+                                               centers, n_centers, mixed, sasa);
+    } else {
+#ifdef FASTSASA_HAVE_VULKAN
+        status = fastsasa_vk_exact(context->vulkan, input->n_atoms, x, y, z, input->radii,
+                                   centers, n_centers, mixed, sasa);
+#else
+        status = FASTSASA_NO_DEVICE;
+#endif
+        /* a Vulkan device without the needed features: the CPU computes the same areas */
+        if (status == FASTSASA_DEVICE_UNSUPPORTED) {
+            status = centers != NULL
+                         ? cpu_exact_scatter(input->n_atoms, x, y, z, input->radii, centers, n_centers, sasa)
+                         : fastsasa_cpu_exact(input->n_atoms, x, y, z, input->radii, 0, sasa);
+        }
+    }
+    free(soa);
+    if (status == FASTSASA_SUCCESS && input->residue_sasa != NULL && input->n_residues > 0) {
+        status = fastsasa_sum_residues(sasa, input->residue_ids, input->n_atoms, input->n_residues,
+                                       input->residue_sasa);
+    }
+    if (status == FASTSASA_SUCCESS && input->selection_sasa != NULL && input->n_selections > 0) {
+        status = fastsasa_sum_selections(sasa, input->selection_masks, input->n_atoms, input->n_selections,
+                                         input->selection_sasa);
+    }
+    return status;
+}
+
 int
 fastsasa_check_device(void)
 {
@@ -1054,6 +1140,7 @@ const char *
 fastsasa_status_string(int status)
 {
     if (status == FASTSASA_VULKAN_ERROR) return "Vulkan error";
+    if (status == FASTSASA_DEGENERATE_GEOMETRY) return "degenerate geometry";
     return fastsasa_device_status_string(status);
 }
 

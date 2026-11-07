@@ -46,6 +46,18 @@ int fastsasa_device_context_shrake_rupley_cell_list_total(fastsasa_device_contex
 int fastsasa_device_context_shrake_rupley_cell_list_total_async(fastsasa_device_context *context,
                                                               const fastsasa_device_sr_input *input,
                                                               double *total_sasa);
+/* Exact SASA (fastsasa_context_exact): areas of all atoms, or of centers[0..n_centers) only
+ * (sasa[centers[c]]); mixed selects FP32 geometry with an FP64 re-pass. */
+int fastsasa_device_context_exact(fastsasa_device_context *context,
+                                int n_atoms,
+                                const double *x,
+                                const double *y,
+                                const double *z,
+                                const double *expanded_radii,
+                                const int *centers,
+                                int n_centers,
+                                int mixed,
+                                double *sasa);
 int fastsasa_device_context_lee_richards(fastsasa_device_context *context,
                                        const fastsasa_device_sr_input *input,
                                        double *sasa);

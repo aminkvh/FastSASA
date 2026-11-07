@@ -97,6 +97,7 @@ struct cli_state {
     int n_points = 100;
     int resolution_set = 0;
     int lee_richards = 0;
+    int exact = 0;
     int force_cpu = 0;
     int cpu_fallback = 1;
     int precision = FASTSASA_PRECISION_FP64;
@@ -159,7 +160,7 @@ usage(const char *program,
     std::fprintf(out,
                  "usage: %s [options] structure.pdb|structure.cif\n"
                  "       %s trajectory --topology FILE --trajectory FILE [trajectory-options]\n"
-                 "options: --shrake-rupley --lee-richards --probe-radius N --resolution N\n"
+                 "options: --shrake-rupley --lee-richards --exact --probe-radius N --resolution N\n"
                  "         --threads N --precision fp64|fp32\n"
                  "         --backend auto|vulkan|cuda|cpu --cpu --no-cpu-fallback\n"
                  "         --config-file FILE --hetatm --hydrogen --unknown guess|skip|halt\n"
@@ -168,7 +169,7 @@ usage(const char *program,
                  "         --surface-points FILE\n"
                  "trajectory-options: --frames SPEC --batch-size N --probe-radius N --resolution N --output FILE --summary --residue\n"
                  "                    --backend auto|vulkan|cuda|cpu --cpu --threads N --precision fp64|fp32\n"
-                 "                    --shrake-rupley --lee-richards --config-file FILE --hetatm --hydrogen --filter COMMAND\n"
+                 "                    --shrake-rupley --lee-richards --exact --config-file FILE --hetatm --hydrogen --filter COMMAND\n"
                  "                    --select COMMAND --classes --help --version\n",
                  program,
                  program);
@@ -712,6 +713,39 @@ run_lee_richards_gpu(const fastsasa_owned_topology &topology,
     return status == FASTSASA_SUCCESS;
 }
 
+/* Lee-Richards or exact SASA on the GPU (state.exact picks the method). */
+static int
+run_atomwise_gpu(const fastsasa_owned_topology &topology,
+                 const cli_state &state,
+                 std::vector<double> *atom_sasa)
+{
+    if (!state.exact) return run_lee_richards_gpu(topology, state, atom_sasa);
+    fastsasa_context *context = nullptr;
+    fastsasa_sr_input input;
+    std::vector<double> expanded_radii(static_cast<size_t>(topology.n_atoms));
+    int status;
+
+    if (topology.n_atoms <= 0) return 0;
+    atom_sasa->assign(static_cast<size_t>(topology.n_atoms), 0.0);
+    for (int atom = 0; atom < topology.n_atoms; ++atom) {
+        expanded_radii[atom] = topology.radii[atom] + state.probe_radius;
+    }
+    std::memset(&input, 0, sizeof(input));
+    input.n_atoms = topology.n_atoms;
+    input.x = topology.x;
+    input.y = topology.y;
+    input.z = topology.z;
+    input.radii = expanded_radii.data();
+
+    status = fastsasa_context_create(&context);
+    if (status != FASTSASA_SUCCESS) return 0;
+    status = fastsasa_context_set_precision(context, state.precision);
+    if (status == FASTSASA_SUCCESS) status = fastsasa_context_exact(context, &input, atom_sasa->data());
+    if (status == FASTSASA_SUCCESS) g_backend_used = fastsasa_context_backend(context);
+    fastsasa_context_free(context);
+    return status == FASTSASA_SUCCESS;
+}
+
 static int
 run_cpu(const fastsasa_owned_topology &topology,
         const cli_state &state,
@@ -727,7 +761,19 @@ run_cpu(const fastsasa_owned_topology &topology,
         expanded_radii[atom] = topology.radii[atom] + state.probe_radius;
     }
     atom_sasa->assign(static_cast<size_t>(topology.n_atoms), 0.0);
-    if (state.lee_richards) {
+    if (state.exact) {
+        if (state.precision == FASTSASA_PRECISION_FP32) {
+            std::fprintf(stderr,
+                         "FastSASA: warning: CPU exact SASA is FP64-only; --precision fp32 ignored for this algorithm\n");
+        }
+        status = fastsasa_cpu_exact(topology.n_atoms,
+                                    topology.x,
+                                    topology.y,
+                                    topology.z,
+                                    expanded_radii.data(),
+                                    state.n_threads,
+                                    atom_sasa->data());
+    } else if (state.lee_richards) {
         if (state.precision == FASTSASA_PRECISION_FP32) {
             std::fprintf(stderr,
                          "FastSASA: warning: CPU Lee-Richards is FP64-only; --precision fp32 ignored for this algorithm\n");
@@ -870,15 +916,16 @@ run_sasa(const fastsasa_owned_topology &topology,
         *selection_masks_out = selection_masks;
     }
 
-    if (state.lee_richards) {
+    if (state.lee_richards || state.exact) {
         int ok = 0;
 
         if (state.force_cpu) {
             ok = run_cpu(topology, state, atom_sasa);
         } else {
-            ok = run_lee_richards_gpu(topology, state, atom_sasa);
+            ok = run_atomwise_gpu(topology, state, atom_sasa);
             if (!ok && state.cpu_fallback) {
-                std::fprintf(stderr, "GPU Lee-Richards failed; trying CPU fallback with %d thread(s)\n", state.n_threads);
+                std::fprintf(stderr, "GPU %s failed; trying CPU fallback with %d thread(s)\n",
+                             state.exact ? "exact SASA" : "Lee-Richards", state.n_threads);
                 ok = run_cpu(topology, state, atom_sasa);
             }
         }
@@ -950,13 +997,13 @@ run_sasa(const fastsasa_owned_topology &topology,
 static const char *
 output_algorithm_name(const cli_state &state)
 {
-    return state.lee_richards ? "Lee & Richards" : "Shrake & Rupley";
+    return state.exact ? "Exact (analytic)" : state.lee_richards ? "Lee & Richards" : "Shrake & Rupley";
 }
 
 static const char *
 fastsasa_algorithm_name(const cli_state &state)
 {
-    return state.lee_richards ? "Lee-Richards" : "Shrake-Rupley";
+    return state.exact ? "Exact" : state.lee_richards ? "Lee-Richards" : "Shrake-Rupley";
 }
 
 static const char *
@@ -1257,9 +1304,11 @@ write_rsa_output(FILE *out,
     for (size_t i = 0; i < chain_order.size(); ++i) std::fprintf(out, " %s", chain_order[i].c_str());
     std::fprintf(out, "\nREM  Algorithm: %s\n", output_algorithm_name(state));
     std::fprintf(out, "REM  Probe-radius: %.2f\n", state.probe_radius);
-    std::fprintf(out, "REM  %s: %d\n",
-                 state.lee_richards ? "Slices" : "Test-points",
-                 state.n_points);
+    if (!state.exact) {
+        std::fprintf(out, "REM  %s: %d\n",
+                     state.lee_richards ? "Slices" : "Test-points",
+                     state.n_points);
+    }
     std::fprintf(out, "REM RES _ NUM      All-atoms   Total-Side   Main-Chain    Non-polar    All polar\n");
     std::fprintf(out, "REM                ABS   REL    ABS   REL    ABS   REL    ABS   REL    ABS   REL\n");
 
@@ -1440,9 +1489,11 @@ write_fastsasa_cif_output(FILE *out,
     std::fprintf(out, "#\n");
     std::fprintf(out, "_FastSASA_results.algorithm '%s'\n", fastsasa_algorithm_name(state));
     std::fprintf(out, "_FastSASA_results.probe_radius %.12g\n", state.probe_radius);
-    std::fprintf(out, "_FastSASA_results.%s %d\n",
-                 state.lee_richards ? "n_slices" : "n_points",
-                 state.n_points);
+    if (!state.exact) {
+        std::fprintf(out, "_FastSASA_results.%s %d\n",
+                     state.lee_richards ? "n_slices" : "n_points",
+                     state.n_points);
+    }
     std::fprintf(out, "_FastSASA_results.total_sasa %.12f\n", total_sasa);
     if (state.report_classes) {
         std::fprintf(out, "_FastSASA_results.polar_sasa %.12f\n", structure_area.polar);
@@ -1520,12 +1571,15 @@ write_json_output(FILE *out,
     }
     std::fprintf(out, "{\n");
     std::fprintf(out, "  \"source\": \"%s\",\n", json_escape(source).c_str());
+    const std::string json_resolution =
+        state.exact ? std::string()
+                    : std::string("\"") + (state.lee_richards ? "n_slices" : "n_points") + "\": " +
+                          std::to_string(state.n_points) + ", ";
     std::fprintf(out,
-                 "  \"parameters\": {\"algorithm\": \"%s\", \"probe_radius\": %.12g, \"%s\": %d, \"radii\": \"%s\", \"backend\": \"%s\"},\n",
+                 "  \"parameters\": {\"algorithm\": \"%s\", \"probe_radius\": %.12g, %s\"radii\": \"%s\", \"backend\": \"%s\"},\n",
                  fastsasa_algorithm_name(state),
                  state.probe_radius,
-                 state.lee_richards ? "n_slices" : "n_points",
-                 state.n_points,
+                 json_resolution.c_str(),
                  json_escape(radii_description(state).c_str()).c_str(),
                  g_backend_used.c_str());
     std::fprintf(out, "  \"total_sasa\": %.12f,\n", total_sasa);
@@ -1624,11 +1678,14 @@ write_xml_output(FILE *out,
         structure_area = sum_rsa_areas(residue_areas);
     }
     std::fprintf(out, "<FastSASA source=\"%s\">\n", xml_escape(source).c_str());
-    std::fprintf(out, "  <parameters algorithm=\"%s\" probe_radius=\"%.12g\" %s=\"%d\" radii=\"%s\" backend=\"%s\" />\n",
+    const std::string xml_resolution =
+        state.exact ? std::string()
+                    : std::string(state.lee_richards ? "n_slices" : "n_points") + "=\"" +
+                          std::to_string(state.n_points) + "\" ";
+    std::fprintf(out, "  <parameters algorithm=\"%s\" probe_radius=\"%.12g\" %sradii=\"%s\" backend=\"%s\" />\n",
                  fastsasa_algorithm_name(state),
                  state.probe_radius,
-                 state.lee_richards ? "n_slices" : "n_points",
-                 state.n_points,
+                 xml_resolution.c_str(),
                  xml_escape(radii_description(state).c_str()).c_str(),
                  g_backend_used.c_str());
     std::fprintf(out, "  <total_sasa>%.12f</total_sasa>\n", total_sasa);
@@ -1704,15 +1761,15 @@ write_xml_output(FILE *out,
  * Writes the solvent-accessible Shrake-Rupley surface points as
  * "x y z atom_index" lines. The exposed-point test is identical to the SASA
  * calculation, so the emitted points sample exactly the reported surface.
- * Lee-Richards runs sample with the default 100 Shrake-Rupley points because
- * LR resolution counts slices, not sphere points.
+ * Lee-Richards and exact runs sample with the default 100 Shrake-Rupley
+ * points: LR resolution counts slices, and the exact method has no points.
  */
 static int
 write_surface_points(const char *path,
                      const fastsasa_owned_topology &topology,
                      const cli_state &state)
 {
-    const int n_points = state.lee_richards ? 100 : state.n_points;
+    const int n_points = state.lee_richards || state.exact ? 100 : state.n_points;
     std::vector<double> expanded_radii(static_cast<size_t>(topology.n_atoms));
     std::vector<double> points;
     std::vector<unsigned char> exposed(
@@ -1803,12 +1860,16 @@ write_output(FILE *out,
 
     if (state.format_log) {
         std::fprintf(out, "## %s ##\n\n", generator_name(state));
-        std::fprintf(out, "PARAMETERS\nalgorithm    : %s\nprobe-radius : %.3f\n%s%s: %d\n\n",
+        std::fprintf(out, "PARAMETERS\nalgorithm    : %s\nprobe-radius : %.3f\n",
                      output_algorithm_name(state),
-                     state.probe_radius,
-                     resolution_key(state),
-                     state.lee_richards ? "       " : "   ",
-                     state.n_points);
+                     state.probe_radius);
+        if (!state.exact) {
+            std::fprintf(out, "%s%s: %d\n",
+                         resolution_key(state),
+                         state.lee_richards ? "       " : "   ",
+                         state.n_points);
+        }
+        std::fprintf(out, "\n");
         std::fprintf(out, "INPUT\nsource  : %s\nchains  : ", source);
         for (std::set<std::string>::const_iterator it = chains.begin(); it != chains.end(); ++it) {
             std::fprintf(out, "%s", it->c_str());
@@ -1930,11 +1991,16 @@ parse_args(int argc,
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shrake-rupley") == 0 || std::strcmp(argv[i], "-S") == 0) {
             state->lee_richards = 0;
+            state->exact = 0;
             continue;
         } else if (std::strcmp(argv[i], "--cif") == 0) {
             state->force_cif_input = 1;
         } else if (std::strcmp(argv[i], "--lee-richards") == 0 || std::strcmp(argv[i], "-L") == 0) {
             state->lee_richards = 1;
+            state->exact = 0;
+        } else if (std::strcmp(argv[i], "--exact") == 0) {
+            state->exact = 1;
+            state->lee_richards = 0;
         } else if (std::strcmp(argv[i], "--probe-radius") == 0 || std::strcmp(argv[i], "-p") == 0) {
             if (++i >= argc || !parse_double_strict_cpp(argv[i], &state->probe_radius)) {
                 std::fprintf(stderr, "invalid --probe-radius value\n");
@@ -2159,8 +2225,7 @@ main(int argc,
     }
 
     if (!run_sasa(topology, state, &atom_sasa, &total_sasa, &residue_sasa, &selection_sasa, &selection_names, &selection_masks)) {
-        std::fprintf(stderr, "%s SASA calculation failed",
-                     state.lee_richards ? "Lee-Richards" : "Shrake-Rupley");
+        std::fprintf(stderr, "%s SASA calculation failed", fastsasa_algorithm_name(state));
         if (fastsasa_last_error()[0] != '\0') std::fprintf(stderr, ": %s", fastsasa_last_error());
         std::fprintf(stderr, "\n");
         fastsasa_topology_free(&topology);

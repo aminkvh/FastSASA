@@ -722,14 +722,46 @@ class SasaEngine:
         slicing resolution instead of SR point count.
         """
 
+        if n_slices <= 0:
+            raise ValueError("n_slices must be positive")
+        return self._atomwise(1, positions, radii, probe_radius, int(n_slices), atom_sasa, residue_ids,
+                              n_residues, selection_masks, n_selections, as_result)
+
+    def exact(
+        self,
+        positions,
+        radii,
+        probe_radius=1.4,
+        atom_sasa=False,
+        residue_ids=None,
+        n_residues=None,
+        selection_masks=None,
+        n_selections=None,
+        as_result=False,
+    ):
+        """Compute exact (analytic) SASA on the selected accelerator.
+
+        Every atom's exposed area is computed in closed form, with no test
+        points or slices, so results carry no sampling error. Input and
+        return shapes match ``sasa()``. With ``precision="fp32"`` the GPU
+        backends use FP32 geometry with FP64 sums (per-atom error below
+        1e-4 A^2); the CPU backend is FP64-only.
+        """
+
+        return self._atomwise(2, positions, radii, probe_radius, 1, atom_sasa, residue_ids,
+                              n_residues, selection_masks, n_selections, as_result)
+
+    def _atomwise(self, algorithm, positions, radii, probe_radius, resolution, atom_sasa, residue_ids,
+                  n_residues, selection_masks, n_selections, as_result):
+        """Lee-Richards (algorithm 1) or exact SASA (algorithm 2)."""
+
         self._require_open()
         coords = _as_double_array(positions)
         if coords.ndim == 2:
             coords = coords.reshape((1,) + coords.shape)
         if coords.ndim != 3 or coords.shape[2] != 3:
             raise ValueError("positions must have shape (atoms, 3) or (frames, atoms, 3)")
-        if n_slices <= 0:
-            raise ValueError("n_slices must be positive")
+        n_slices = resolution
 
         n_frames, n_atoms, _ = coords.shape
         base_radii = _as_double_array(radii, (n_atoms,))
@@ -770,7 +802,7 @@ class SasaEngine:
 
         if self.backend == "cpu":
             result = self._cpu_run(
-                coords, radii_array, n_slices, None, 1,
+                coords, radii_array, n_slices, None, algorithm,
                 totals, atom_values if atom_sasa else None,
                 residue_array, residue_values,
                 selection_array, n_selections, selection_values, as_result,
@@ -802,7 +834,7 @@ class SasaEngine:
 
         batch_atom_values = atom_values if atom_sasa else None
         if self._run_vulkan_batch(
-            coords, base_radii, probe_radius, n_slices, 1,
+            coords, base_radii, probe_radius, n_slices, algorithm,
             totals, batch_atom_values, residue_array, residue_values,
             selection_array, n_selections, selection_values,
         ):
@@ -816,7 +848,9 @@ class SasaEngine:
             # coords and radii_array stay alive until each synchronous ctypes
             # call returns.
             input_data.xyz = _as_double_ptr(coords[frame])
-            status = self._lib.fastsasa_context_lee_richards(
+            run = (self._lib.fastsasa_context_exact if algorithm == 2
+                   else self._lib.fastsasa_context_lee_richards)
+            status = run(
                 self._ctx,
                 ctypes.byref(input_data),
                 _as_double_ptr(atom_values[frame]),
@@ -886,6 +920,12 @@ class SasaEngine:
             ctypes.POINTER(ctypes.c_double),
         ]
         self._lib.fastsasa_context_lee_richards.restype = ctypes.c_int
+        self._lib.fastsasa_context_exact.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_SrInput),
+            ctypes.POINTER(ctypes.c_double),
+        ]
+        self._lib.fastsasa_context_exact.restype = ctypes.c_int
         self._lib.fastsasa_context_calc_trajectory_soa.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(_TrajectoryTopology),
@@ -927,6 +967,10 @@ class SasaEngine:
             double_ptr, ctypes.c_int, double_ptr,
         ]
         self._lib.fastsasa_cpu_lee_richards.restype = ctypes.c_int
+        self._lib.fastsasa_cpu_exact.argtypes = [
+            ctypes.c_int, double_ptr, double_ptr, double_ptr, double_ptr, ctypes.c_int, double_ptr,
+        ]
+        self._lib.fastsasa_cpu_exact.restype = ctypes.c_int
 
     def _check(self, status):
         if status == FASTSASA_SUCCESS:
@@ -972,14 +1016,15 @@ class SasaEngine:
         selection_values,
         as_result,
     ):
-        """Native threaded CPU execution shared by sasa() and lee_richards()."""
+        """Native threaded CPU execution shared by sasa(), lee_richards() and exact()."""
 
         n_frames, n_atoms, _ = coords.shape
         expanded = np.ascontiguousarray(expanded_radii, dtype=np.float64)
         precision_value, _ = _precision_value(self.precision)
         if algorithm != 0 and precision_value != 0:
             warnings.warn(
-                "CPU Lee-Richards is fp64-only; precision='fp32' is ignored for this algorithm",
+                ("CPU exact SASA" if algorithm == 2 else "CPU Lee-Richards")
+                + " is fp64-only; precision='fp32' is ignored for this algorithm",
                 RuntimeWarning,
                 stacklevel=3,
             )
@@ -997,6 +1042,11 @@ class SasaEngine:
                     _as_double_ptr(y), _as_double_ptr(z),
                     _as_double_ptr(expanded), _as_double_ptr(test_points), 0,
                     precision_value, _as_double_ptr(target),
+                )
+            elif algorithm == 2:
+                status = self._lib.fastsasa_cpu_exact(
+                    n_atoms, _as_double_ptr(x), _as_double_ptr(y), _as_double_ptr(z),
+                    _as_double_ptr(expanded), 0, _as_double_ptr(target),
                 )
             else:
                 status = self._lib.fastsasa_cpu_lee_richards(
@@ -1179,6 +1229,37 @@ def lee_richards(
         radii,
         probe_radius,
         n_slices,
+        atom_sasa,
+        residue_ids,
+        n_residues,
+        selection_masks,
+        n_selections,
+        as_result,
+    )
+
+
+def exact(
+    positions,
+    radii,
+    probe_radius=1.4,
+    atom_sasa=False,
+    residue_ids=None,
+    n_residues=None,
+    selection_masks=None,
+    n_selections=None,
+    as_result=False,
+    precision="fp64",
+):
+    """One-shot exact (analytic) SASA using the shared default engine.
+
+    ``precision`` accepts ``"fp64"`` (default) or ``"fp32"``.
+    """
+
+    engine = default_engine(precision)
+    return engine.exact(
+        positions,
+        radii,
+        probe_radius,
         atom_sasa,
         residue_ids,
         n_residues,

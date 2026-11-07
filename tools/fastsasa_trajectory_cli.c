@@ -1323,7 +1323,7 @@ print_usage(const char *program,
             "options: --frames spec --batch-size n --probe-radius n --resolution n --precision fp64|fp32 --output file\n"
             "         --residue|--summary --config-file file --hydrogen --hetatm --threads n\n"
             "         --backend auto|vulkan|cuda|cpu --cpu --surface-points file --surface-resolution n\n"
-            "         --shrake-rupley|--lee-richards --classes --filter expression\n"
+            "         --shrake-rupley|--lee-richards|--exact --classes --filter expression\n"
             "         --select 'expression|name, expression' --help --version\n",
             program,
             program);
@@ -1710,10 +1710,11 @@ run_topology_trajectory(const char *topology_path,
     parameters.algorithm = algorithm;
     parameters.n_points = resolution;
     parameters.precision = precision;
-    if (force_cpu && algorithm == FASTSASA_ALGORITHM_LEE_RICHARDS &&
+    if (force_cpu && algorithm != FASTSASA_ALGORITHM_SHRAKE_RUPLEY &&
         precision == FASTSASA_PRECISION_FP32) {
         fprintf(stderr,
-                "FastSASA: warning: CPU Lee-Richards is FP64-only; --precision fp32 ignored for this algorithm\n");
+                "FastSASA: warning: CPU %s is FP64-only; --precision fp32 ignored for this algorithm\n",
+                algorithm == FASTSASA_ALGORITHM_EXACT ? "exact SASA" : "Lee-Richards");
     }
 
     if (!summary_output && class_output && n_selections > 0) fprintf(out, "frame,selection,total_sasa,polar_sasa,apolar_sasa,unknown_sasa,seconds\n");
@@ -1723,15 +1724,16 @@ run_topology_trajectory(const char *topology_path,
     else if (!summary_output) fprintf(out, "frame,total_sasa,seconds\n");
 
     if (surface_points_path != NULL) {
-        /* Lee-Richards resolutions count slices; sample the surface with the
-         * default 100 Shrake-Rupley points in that case. surface_resolution
+        /* Lee-Richards resolutions count slices and the exact method has no
+         * points; sample the surface with the default 100 Shrake-Rupley
+         * points in those cases. surface_resolution
          * lets a caller decouple the exported point density from the
          * reported SASA's --resolution, so one pass can compute high-density
          * totals and a lighter-density surface together. */
         if (surface_resolution > 0) {
             surface_n_points = surface_resolution;
         } else {
-            surface_n_points = algorithm == FASTSASA_ALGORITHM_LEE_RICHARDS ? 100 : resolution;
+            surface_n_points = algorithm != FASTSASA_ALGORITHM_SHRAKE_RUPLEY ? 100 : resolution;
         }
         {
             /* A .xyz target writes a VMD-loadable multi-frame XYZ file and a
@@ -2289,6 +2291,8 @@ fastsasa_trajectory_cli_main(int argc,
             algorithm = FASTSASA_ALGORITHM_SHRAKE_RUPLEY;
         } else if (strcmp(argv[i], "--lee-richards") == 0 || strcmp(argv[i], "-L") == 0) {
             algorithm = FASTSASA_ALGORITHM_LEE_RICHARDS;
+        } else if (strcmp(argv[i], "--exact") == 0) {
+            algorithm = FASTSASA_ALGORITHM_EXACT;
         } else if (strcmp(argv[i], "--hydrogen") == 0 || strcmp(argv[i], "-Y") == 0) {
             include_hydrogen = 1;
         } else if (strcmp(argv[i], "--hetatm") == 0 || strcmp(argv[i], "-H") == 0) {

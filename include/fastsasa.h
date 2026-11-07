@@ -15,7 +15,9 @@ enum fastsasa_status {
     FASTSASA_NO_DEVICE = -4,
     FASTSASA_DEVICE_UNSUPPORTED = -5,
     FASTSASA_CELL_GRID_TOO_LARGE = -6,
-    FASTSASA_VULKAN_ERROR = -7
+    FASTSASA_VULKAN_ERROR = -7,
+    /* Exact SASA: an atom's geometry stayed degenerate after every retry. */
+    FASTSASA_DEGENERATE_GEOMETRY = -8
 };
 
 enum fastsasa_precision {
@@ -148,6 +150,20 @@ int fastsasa_context_shrake_rupley_cell_list_total_async(fastsasa_context *conte
 int fastsasa_context_lee_richards(fastsasa_context *context,
                                 const fastsasa_sr_input *input,
                                 double *sasa);
+/*
+ * Exact (analytic) SASA: every atom's exposed area computed in closed form
+ * (power cell + Gauss-Bonnet), with no test points or slices; n_points and
+ * test_points are ignored. input->radii must include the probe radius.
+ * FASTSASA_PRECISION_FP64 computes in FP64 throughout; FASTSASA_PRECISION_FP32
+ * uses FP32 geometry with FP64 sums and recomputes near-degenerate atoms in
+ * FP64 (per-atom error below 1e-4 A^2). Selection sums and active-centre
+ * lists are honoured as for fastsasa_context_shrake_rupley_cell_list.
+ * Returns FASTSASA_DEGENERATE_GEOMETRY if an atom's geometry cannot be
+ * resolved (never observed on molecular structures).
+ */
+int fastsasa_context_exact(fastsasa_context *context,
+                         const fastsasa_sr_input *input,
+                         double *sasa);
 
 int fastsasa_check_device(void);
 unsigned int fastsasa_abi_version(void);

@@ -2505,3 +2505,12 @@ extern "C" int fastsasa_vk_lee_richards_frames(fastsasa_vk_context *context,
                                   probe_radius, nullptr, atom_count,
                                   frame_sasa, true);
 }
+
+extern "C" int fastsasa_vk_exact(fastsasa_vk_context *context, int n_atoms, const double *x, const double *y,
+                                 const double *z, const double *expanded_radii, const int *centers, int n_centers,
+                                 int mixed, double *sasa)
+{
+    (void)context; (void)n_atoms; (void)x; (void)y; (void)z; (void)expanded_radii;
+    (void)centers; (void)n_centers; (void)mixed; (void)sasa;
+    return FASTSASA_DEVICE_UNSUPPORTED;
+}

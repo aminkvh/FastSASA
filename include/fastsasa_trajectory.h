@@ -9,7 +9,9 @@ extern "C" {
 
 enum fastsasa_algorithm {
     FASTSASA_ALGORITHM_SHRAKE_RUPLEY = 0,
-    FASTSASA_ALGORITHM_LEE_RICHARDS = 1
+    FASTSASA_ALGORITHM_LEE_RICHARDS = 1,
+    /* Exact analytic SASA; n_points is ignored. */
+    FASTSASA_ALGORITHM_EXACT = 2
 };
 
 typedef struct fastsasa_parameters {
@@ -18,7 +20,7 @@ typedef struct fastsasa_parameters {
     int algorithm;
     /* FASTSASA_PRECISION_FP64 (0, default) or FASTSASA_PRECISION_FP32 (see
      * fastsasa.h). Only affects the CPU Shrake-Rupley path; CPU Lee-Richards
-     * is FP64-only regardless of this field. */
+     * and CPU exact SASA are FP64-only regardless of this field. */
     int precision;
 } fastsasa_parameters;
 

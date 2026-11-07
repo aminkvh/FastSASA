@@ -21,7 +21,8 @@ trajectory_parameters(const fastsasa_parameters *parameters,
     *algorithm = parameters != NULL ? parameters->algorithm : FASTSASA_ALGORITHM_SHRAKE_RUPLEY;
     return *probe_radius >= 0.0 && *n_points > 0 &&
            (*algorithm == FASTSASA_ALGORITHM_SHRAKE_RUPLEY ||
-            *algorithm == FASTSASA_ALGORITHM_LEE_RICHARDS);
+            *algorithm == FASTSASA_ALGORITHM_LEE_RICHARDS ||
+            *algorithm == FASTSASA_ALGORITHM_EXACT);
 }
 
 static double *
@@ -205,7 +206,7 @@ fastsasa_context_calc_trajectory_soa(fastsasa_context *context,
         free(test_points);
         return FASTSASA_MEMORY_ERROR;
     }
-    if (residue_sasa_frames != NULL || algorithm == FASTSASA_ALGORITHM_LEE_RICHARDS) {
+    if (residue_sasa_frames != NULL || algorithm != FASTSASA_ALGORITHM_SHRAKE_RUPLEY) {
         scratch_sasa = (double *)malloc(sizeof(double) * (size_t)topology->n_atoms);
         if (scratch_sasa == NULL) {
             free(expanded_radii);
@@ -226,6 +227,7 @@ fastsasa_context_calc_trajectory_soa(fastsasa_context *context,
     }
 
     if (strcmp(fastsasa_context_backend(context), "vulkan") == 0 &&
+        algorithm != FASTSASA_ALGORITHM_EXACT &&
         frames->n_frames > 1) {
         status = fastsasa_context_vulkan_frames(
             context, &input, frames->x, frames->y, frames->z,
@@ -301,11 +303,13 @@ fastsasa_context_calc_trajectory_soa(fastsasa_context *context,
                                   ? residue_sasa_frames + (size_t)frame * (size_t)topology->n_residues
                                   : NULL;
 
-        if (algorithm == FASTSASA_ALGORITHM_LEE_RICHARDS) {
+        if (algorithm != FASTSASA_ALGORITHM_SHRAKE_RUPLEY) {
             frame_sasa = atom_sasa_frames != NULL
                              ? atom_sasa_frames + (size_t)frame * (size_t)topology->n_atoms
                              : scratch_sasa;
-            status = fastsasa_context_lee_richards(context, &input, frame_sasa);
+            status = algorithm == FASTSASA_ALGORITHM_EXACT
+                         ? fastsasa_context_exact(context, &input, frame_sasa)
+                         : fastsasa_context_lee_richards(context, &input, frame_sasa);
             if (status == FASTSASA_SUCCESS) {
                 status = sum_atoms(frame_sasa, topology->n_atoms, &total_sasa[frame]);
             }
@@ -552,9 +556,9 @@ fastsasa_context_calc_trajectory_soa_selection(fastsasa_context *context,
     expanded_radii = expanded_radii_new(topology->radii, topology->n_atoms, probe_radius);
     test_points = algorithm == FASTSASA_ALGORITHM_SHRAKE_RUPLEY ? test_points_new(n_points) : NULL;
     selected_center = total_sasa == NULL &&
-                      algorithm == FASTSASA_ALGORITHM_SHRAKE_RUPLEY &&
+                      algorithm != FASTSASA_ALGORITHM_LEE_RICHARDS &&
                       use_selected_center_optimization();
-    need_scratch_sasa = algorithm == FASTSASA_ALGORITHM_LEE_RICHARDS ||
+    need_scratch_sasa = algorithm != FASTSASA_ALGORITHM_SHRAKE_RUPLEY ||
                         total_sasa != NULL ||
                         !selected_center;
     if (need_scratch_sasa) {
@@ -600,6 +604,7 @@ fastsasa_context_calc_trajectory_soa_selection(fastsasa_context *context,
     }
 
     if (strcmp(fastsasa_context_backend(context), "vulkan") == 0 &&
+        algorithm != FASTSASA_ALGORITHM_EXACT &&
         frames->n_frames > 1) {
         status = fastsasa_context_vulkan_frames(
             context, &input, frames->x, frames->y, frames->z,
@@ -618,7 +623,7 @@ fastsasa_context_calc_trajectory_soa_selection(fastsasa_context *context,
         status = FASTSASA_SUCCESS;
     }
 
-    if (selected_center && frames->n_frames > 1) {
+    if (selected_center && algorithm == FASTSASA_ALGORITHM_SHRAKE_RUPLEY && frames->n_frames > 1) {
         int n_lanes = fastsasa_recommended_parallel_frames(topology->n_atoms,
                                                          n_points,
                                                          frames->n_frames,
@@ -645,8 +650,10 @@ fastsasa_context_calc_trajectory_soa_selection(fastsasa_context *context,
         input.y = frames->y + (size_t)frame * (size_t)topology->n_atoms;
         input.z = frames->z + (size_t)frame * (size_t)topology->n_atoms;
         input.selection_sasa = selection_sasa_frames + (size_t)frame * (size_t)n_selections;
-        if (algorithm == FASTSASA_ALGORITHM_LEE_RICHARDS) {
-            status = fastsasa_context_lee_richards(context, &input, scratch_sasa);
+        if (algorithm != FASTSASA_ALGORITHM_SHRAKE_RUPLEY) {
+            status = algorithm == FASTSASA_ALGORITHM_EXACT
+                         ? fastsasa_context_exact(context, &input, scratch_sasa)
+                         : fastsasa_context_lee_richards(context, &input, scratch_sasa);
             if (status == FASTSASA_SUCCESS) {
                 status = sum_selections(scratch_sasa,
                                         selection_masks,

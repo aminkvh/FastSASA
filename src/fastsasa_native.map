@@ -10,6 +10,8 @@
         fastsasa_cpu_calc_trajectory_soa_selection;
         fastsasa_cpu_default_threads;
         fastsasa_cpu_exposed_points;
+        fastsasa_cpu_exact;
+        fastsasa_cpu_exact_centers;
         fastsasa_cpu_lee_richards;
         fastsasa_cpu_lee_richards_atom;
         fastsasa_cpu_lee_richards_centers;
@@ -28,6 +30,7 @@
         fastsasa_context_enable_profile;
         fastsasa_context_free;
         fastsasa_context_last_cell_profile;
+        fastsasa_context_exact;
         fastsasa_context_lee_richards;
         fastsasa_context_precision;
         fastsasa_context_set_precision;

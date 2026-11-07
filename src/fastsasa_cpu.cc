@@ -1228,7 +1228,8 @@ cpu_trajectory_parameters(const fastsasa_parameters *parameters,
     return *probe_radius >= 0.0 &&
            *resolution > 0 &&
            (*algorithm == FASTSASA_ALGORITHM_SHRAKE_RUPLEY ||
-            *algorithm == FASTSASA_ALGORITHM_LEE_RICHARDS) &&
+            *algorithm == FASTSASA_ALGORITHM_LEE_RICHARDS ||
+            *algorithm == FASTSASA_ALGORITHM_EXACT) &&
            (*precision == FASTSASA_PRECISION_FP64 || *precision == FASTSASA_PRECISION_FP32);
 }
 
@@ -1424,6 +1425,9 @@ cpu_calc_trajectory_soa_impl(const fastsasa_topology *topology,
                                                                expanded.data(),
                                                                atom_threads,
                                                                frame_sasa);
+                    } else if (algorithm == FASTSASA_ALGORITHM_EXACT) {
+                        frame_status = fastsasa_cpu_exact(topology->n_atoms, x, y, z, expanded.data(),
+                                                          atom_threads, frame_sasa);
                     } else {
                         frame_status = fastsasa_cpu_shrake_rupley_precision(topology->n_atoms,
                                                                 resolution,
@@ -1515,7 +1519,8 @@ cpu_calc_trajectory_soa_selection_impl(const fastsasa_topology *topology,
      * fastsasa_cpu_shrake_rupley_centers). */
     std::vector<int> centers;
     const bool selected_center = total_sasa == nullptr &&
-                                 algorithm == FASTSASA_ALGORITHM_SHRAKE_RUPLEY &&
+                                 (algorithm == FASTSASA_ALGORITHM_SHRAKE_RUPLEY ||
+                                  algorithm == FASTSASA_ALGORITHM_EXACT) &&
                                  cpu_selected_center_enabled();
     if (selected_center) {
         for (int atom = 0; atom < topology->n_atoms; ++atom) {
@@ -1535,6 +1540,7 @@ cpu_calc_trajectory_soa_selection_impl(const fastsasa_topology *topology,
                 const fastsasa_cpu::WorkerPool::Team team(frame_threads > 1 ? atom_threads - 1 : 0);
                 const mask_workspace_scope workspace;
                 std::vector<double> scratch(static_cast<size_t>(topology->n_atoms));
+                std::vector<double> center_areas(centers.size());
 
                 for (;;) {
                     const int frame = next_frame.fetch_add(1);
@@ -1547,7 +1553,15 @@ cpu_calc_trajectory_soa_selection_impl(const fastsasa_topology *topology,
                                               static_cast<size_t>(frame) * static_cast<size_t>(n_selections);
                     int frame_status;
 
-                    if (selected_center) {
+                    if (selected_center && algorithm == FASTSASA_ALGORITHM_EXACT) {
+                        frame_status = fastsasa_cpu_exact_centers(topology->n_atoms, x, y, z, expanded.data(),
+                                                                  atom_threads, centers.data(),
+                                                                  static_cast<int>(centers.size()),
+                                                                  center_areas.data());
+                        for (size_t c = 0; c < centers.size(); ++c) {
+                            scratch[static_cast<size_t>(centers[c])] = center_areas[c];
+                        }
+                    } else if (selected_center) {
                         frame_status = fastsasa_cpu_shrake_rupley_centers(topology->n_atoms,
                                                                           resolution,
                                                                           x,
@@ -1569,6 +1583,9 @@ cpu_calc_trajectory_soa_selection_impl(const fastsasa_topology *topology,
                                                                expanded.data(),
                                                                atom_threads,
                                                                scratch.data());
+                    } else if (algorithm == FASTSASA_ALGORITHM_EXACT) {
+                        frame_status = fastsasa_cpu_exact(topology->n_atoms, x, y, z, expanded.data(),
+                                                          atom_threads, scratch.data());
                     } else {
                         frame_status = fastsasa_cpu_shrake_rupley_precision(topology->n_atoms,
                                                                 resolution,

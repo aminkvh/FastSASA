@@ -82,6 +82,17 @@ int fastsasa_vk_sr_centers(fastsasa_vk_context *context,
                          int use_fp64,
                          double *sasa);
 
+/* Exact SASA, as fastsasa_device_context_exact. */
+int fastsasa_vk_exact(fastsasa_vk_context *context,
+                      int n_atoms,
+                      const double *x,
+                      const double *y,
+                      const double *z,
+                      const double *expanded_radii,
+                      const int *centers,
+                      int n_centers,
+                      int mixed,
+                      double *sasa);
 int fastsasa_vk_lee_richards(fastsasa_vk_context *context,
                            const double *xyz,
                            const double *radii,

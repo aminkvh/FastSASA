@@ -9,6 +9,7 @@ probe radius; FastSASA adds ``probe_radius`` internally.
 from fastsasa_native import (
     SasaEngine,
     SasaResult,
+    exact,
     fibonacci_sphere_points,
     lee_richards,
     sasa,
@@ -57,6 +58,7 @@ __all__ = [
     "aggregate_atom_sasa",
     "canonical_residue_name",
     "embed_sasa_fingerprints",
+    "exact",
     "default_radius_config_path",
     "exposure_kinetics",
     "extract_md_features",

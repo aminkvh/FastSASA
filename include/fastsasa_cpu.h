@@ -165,6 +165,31 @@ int fastsasa_cpu_lee_richards_centers(int n_atoms,
                                       int n_centers,
                                       double *areas);
 
+/*
+ * Exact (analytic) SASA of every atom; expanded_radii include the probe.
+ * Bit-identical for any thread count. Returns FASTSASA_DEGENERATE_GEOMETRY
+ * if an atom's geometry cannot be resolved.
+ */
+int fastsasa_cpu_exact(int n_atoms,
+                       const double *x,
+                       const double *y,
+                       const double *z,
+                       const double *expanded_radii,
+                       int n_threads,
+                       double *sasa);
+
+/* Exact SASA of the listed atoms only (areas[i] for centers[i]); the same
+ * values as fastsasa_cpu_exact. */
+int fastsasa_cpu_exact_centers(int n_atoms,
+                               const double *x,
+                               const double *y,
+                               const double *z,
+                               const double *expanded_radii,
+                               int n_threads,
+                               const int *centers,
+                               int n_centers,
+                               double *areas);
+
 int fastsasa_cpu_calc_trajectory_soa(const fastsasa_topology *topology,
                                    const fastsasa_soa_frames *frames,
                                    const fastsasa_parameters *parameters,

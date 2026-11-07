@@ -128,6 +128,23 @@ fastsasa_device_context_shrake_rupley_cell_list_total_async(fastsasa_device_cont
 }
 
 int
+fastsasa_device_context_exact(fastsasa_device_context *context,
+                            int n_atoms,
+                            const double *x,
+                            const double *y,
+                            const double *z,
+                            const double *expanded_radii,
+                            const int *centers,
+                            int n_centers,
+                            int mixed,
+                            double *sasa)
+{
+    (void)context; (void)n_atoms; (void)x; (void)y; (void)z; (void)expanded_radii;
+    (void)centers; (void)n_centers; (void)mixed; (void)sasa;
+    return FASTSASA_NO_DEVICE;
+}
+
+int
 fastsasa_device_context_lee_richards(fastsasa_device_context *context,
                                    const fastsasa_device_sr_input *input,
                                    double *sasa)

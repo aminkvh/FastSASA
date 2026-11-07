@@ -1,4 +1,5 @@
 #include "fastsasa_device.h"
+#include "fastsasa_exact_cuda.h"
 
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
@@ -154,6 +155,7 @@ struct fastsasa_device_context {
     /* stop a cell-list SR call before the SR launch; the batched
      * launcher runs the frames of several contexts in one mask launch, then their read-back. */
     int defer_sr;
+    struct fastsasa_exact_cuda *exact;   /* exact SASA buffers, created on first use */
     float *d_coord_f;   /* float coordinates as uploaded */
     const float *h_coord_f;   /* next call's float copy of x, y, z (exact), or NULL */
     int h_bbox_valid;   /* h_bbox: that copy's min x, y, z, max x, y, z */
@@ -1442,6 +1444,7 @@ fastsasa_device_context_free(fastsasa_device_context *context)
     if (context == NULL) return;
 
     cudaStreamSynchronize(context->stream);
+    fastsasa_exact_cuda_free(context->exact);
     if (context->deferred_event) cudaEventDestroy(context->deferred_event);
     cudaFree(context->d_coord_f);
     if (context->batch_done_event) cudaEventDestroy(context->batch_done_event);
@@ -5259,6 +5262,24 @@ lr_recompute_overflow_atoms(fastsasa_device_context *context,
     free(split);
     free(flags);
     return status;
+}
+
+int
+fastsasa_device_context_exact(fastsasa_device_context *context,
+                            int n_atoms,
+                            const double *x,
+                            const double *y,
+                            const double *z,
+                            const double *expanded_radii,
+                            const int *centers,
+                            int n_centers,
+                            int mixed,
+                            double *sasa)
+{
+    if (context == NULL) return FASTSASA_INVALID_ARGUMENT;
+    if (cuda_status(cudaStreamSynchronize(context->stream)) != FASTSASA_SUCCESS) return FASTSASA_CUDA_ERROR;
+    return fastsasa_exact_cuda_run(&context->exact, context->stream, n_atoms, x, y, z, expanded_radii,
+                                   centers, n_centers, mixed, sasa);
 }
 
 int

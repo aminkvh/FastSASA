@@ -114,7 +114,7 @@ if(FASTSASA_ENABLE_CUDA)
         set(CMAKE_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}" CACHE STRING
             "CUDA architectures compiled into FastSASA; override for a narrower deployment target" FORCE)
     endif()
-    set(FASTSASA_DEVICE_SOURCE src/sr_cuda.cu)
+    set(FASTSASA_DEVICE_SOURCE src/sr_cuda.cu src/exact_cuda.cu)
 else()
     set(FASTSASA_DEVICE_SOURCE src/fastsasa_device_stub.c)
 endif()
@@ -301,6 +301,7 @@ if(FASTSASA_BUILD_STATIC)
     add_library(fastsasa STATIC
         src/fastsasa_api.c
         src/fastsasa_cpu.cc
+        src/fastsasa_cpu_exact.cc
         src/fastsasa_cpu_mask.cc
         src/fastsasa_radius.c
         src/fastsasa_trajectory.c
@@ -316,7 +317,8 @@ endif()
 add_library(fastsasa_native SHARED
     src/fastsasa_api.c
     src/fastsasa_cpu.cc
-        src/fastsasa_cpu_mask.cc
+    src/fastsasa_cpu_exact.cc
+    src/fastsasa_cpu_mask.cc
     src/fastsasa_radius.c
     src/fastsasa_trajectory.c
     src/gemmi_topology.cc
@@ -889,6 +891,12 @@ if(FASTSASA_BUILD_NATIVE_TESTS)
                 --fastsasa $<TARGET_FILE:fastsasa_cli>
                 --repo-root ${CMAKE_CURRENT_SOURCE_DIR}
     )
+    add_test(NAME fastsasa_exact
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/exact_validation.py
+                --library $<TARGET_FILE:fastsasa_native>
+                --python-dir ${CMAKE_CURRENT_SOURCE_DIR}/python
+                --fastsasa $<TARGET_FILE:fastsasa_cli>
+    )
     set_tests_properties(
         fastsasa_cli_validation
         fastsasa_mmcif_selection
@@ -898,6 +906,7 @@ if(FASTSASA_BUILD_NATIVE_TESTS)
         fastsasa_trajectory_cli_dispatch
         fastsasa_vmd_integration
         fastsasa_scientific_fixtures
+        fastsasa_exact
         PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} LABELS "cpu;release"
     )
     if(TEST fastsasa_external_mmcif_corpus)
