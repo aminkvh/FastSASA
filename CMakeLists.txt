@@ -135,7 +135,8 @@ if(FASTSASA_ENABLE_VULKAN)
                 COMMAND ${FASTSASA_GLSLC} -O ${ARGN} ${source} -o ${output}.spv
                 COMMAND ${CMAKE_COMMAND} -DINPUT=${output}.spv -DOUTPUT=${output}.h -DSYMBOL=${symbol}
                         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake
-                DEPENDS ${source} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake
+                DEPENDS ${source} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/fp64_math.glsl
+                        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_binary.cmake
                 VERBATIM
             )
         endfunction()
@@ -240,6 +241,15 @@ if(FASTSASA_ENABLE_VULKAN)
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_lee_richards_reduce_fp64_spv
             fastsasa_vk_lee_richards_reduce_fp64_spv -DFASTSASA_FP64=1)
 
+        fastsasa_compile_vulkan_shader(
+            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/exact.comp
+            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_exact_spv
+            fastsasa_vk_exact_spv)
+        fastsasa_compile_vulkan_shader(
+            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/exact.comp
+            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_exact_fp32_spv
+            fastsasa_vk_exact_fp32_spv -DEXACT_FP32=1)
+
         set(FASTSASA_VULKAN_HEADERS
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_cell_count_spv.h
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_cell_scan_spv.h
@@ -261,6 +271,8 @@ if(FASTSASA_ENABLE_VULKAN)
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_lee_richards_cell_fp64_spv.h
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_lee_richards_reduce_fp64_spv.h
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_exposed_points_fp64_64_spv.h
+            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_exact_spv.h
+            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_exact_fp32_spv.h
             ${FASTSASA_VULKAN_MASK_HEADERS})
         add_custom_target(fastsasa_vulkan_shaders DEPENDS ${FASTSASA_VULKAN_HEADERS})
         set(FASTSASA_VULKAN_SOURCE

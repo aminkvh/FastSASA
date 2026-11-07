@@ -1,0 +1,441 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : require
+#extension GL_GOOGLE_include_directive : require
+
+// Analytic (exact) SASA, FP64: the per-atom routine of
+// src/fastsasa_exact_core.h (power cell + Gauss-Bonnet) with its SmallCaps
+// workspace, one invocation per atom. The workspace lives in two storage
+// buffers, element-interleaved across invocations. An atom that overflows
+// the workspace or that no jitter attempt resolves is flagged; the host
+// recomputes it with the large workspace.
+//
+// EXACT_FP32 builds the mixed-precision pass: FP32 geometry with FP64 sums
+// (as the CUDA mixed mode) and one attempt; any atom it cannot resolve is
+// flagged for the FP64 pass.
+
+#include "fp64_math.glsl"
+
+#ifdef EXACT_FP32
+#define real float
+#define rvec3 vec3
+#define RSQRT(x) sqrt(x)
+#define RDIV(a, b) ((a) / (b))
+#define RATAN2(y, x) double(atan((y), (x)))
+const real TOL_REL = 4e-6;
+const real BOX_SLACK = 64.0 * TOL_REL;   // as the CUDA FP32 pass
+const real LO_SLACK = 8.0 * TOL_REL;
+const int ATTEMPTS = 1;
+#else
+#define real double
+#define rvec3 dvec3
+#define RSQRT(x) sqrt_rn(x)
+#define RDIV(a, b) div_rn((a), (b))
+#define RATAN2(y, x) exact_atan2((y), (x))
+const real TOL_REL = 1e-13;
+const real BOX_SLACK = 1e-9;
+const real LO_SLACK = 1e-9;
+const int ATTEMPTS = 6;
+#endif
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Xs { double v[]; } xs;        // grid order, x y z
+layout(set = 0, binding = 1, std430) readonly buffer Rs { double v[]; } rs;
+layout(set = 0, binding = 2, std430) readonly buffer Start { int v[]; } cell_start;
+layout(set = 0, binding = 3, std430) readonly buffer DxMax { int v[]; } dxmax;
+layout(set = 0, binding = 4, std430) readonly buffer Jitter { double v[]; } jit;   // jitter(q, a), 3 per atom
+layout(set = 0, binding = 5, std430) readonly buffer List { int v[]; } list;
+layout(set = 0, binding = 6, std430) writeonly buffer Area { double v[]; } area_out;
+layout(set = 0, binding = 7, std430) writeonly buffer Flag { uint v[]; } flag_out;
+layout(set = 0, binding = 8, std430) buffer DWork { real v[]; } dwork;   // geometry workspace
+layout(set = 0, binding = 9, std430) buffer IWork { int v[]; } iwork;
+layout(set = 0, binding = 10, std430) readonly buffer Constants {
+    double lo_x, lo_y, lo_z, cell;
+    int dim_x, dim_y, dim_z, K;
+    int threads;    // invocations sharing the workspace
+    int pad0, pad1, pad2;
+    double est[3 * 64];
+} cst;
+
+// work items [first, end) of this submission; item w is atom list[w] when
+// use_list is set, else atom w
+layout(push_constant) uniform Range {
+    int first;
+    int end;
+    int use_list;
+} range;
+
+const double PI = 3.14159265358979323846;
+const int MP = 128;   // SmallCaps planes
+const int MGV = 96;   // SmallCaps cell vertices
+const int MC = 128;   // SmallCaps crossings
+const int BUCKETS = 32;
+const int EST = 64;
+
+const int OK = 0, DEGENERATE = 1, OVERFLOW = 2;
+const int CUT_NONE = 0, CUT_DONE = 1, CUT_EMPTY = 2, CUT_FAIL = 3;
+
+// double workspace
+const int D_P = 0;                  // planes: nx ny nz h
+const int D_G = D_P + 4 * MP;       // two graphs: [g][coord][vertex]
+const int D_X = D_G + 6 * MGV;      // crossings
+const int D_S = D_X + 3 * MC;       // graph_cut side values
+const int D_KEY = D_S + MGV;
+const int D_CU = D_KEY + MC;
+const int D_CV = D_CU + MC;
+const int D_TOTAL = D_CV + MC;
+// int workspace
+const int I_ORDER = 0;
+const int I_PL = I_ORDER + MP;      // [g][vertex][3]
+const int I_NB = I_PL + 6 * MGV;
+const int I_SLOT = I_NB + 6 * MGV;  // MP + 6
+const int I_XCH = I_SLOT + MP + 6;
+const int I_XCN = I_XCH + MP;
+const int I_XCP = I_XCN + 2 * MC;
+const int I_XCS = I_XCP + 2 * MC;
+const int I_LABH = I_XCS + 2 * MC;
+const int I_LABN = I_LABH + MP;
+const int I_LABP = I_LABN + 3 * MGV;
+const int I_NEXTC = I_LABP + 3 * MGV;
+const int I_ACT = I_NEXTC + MC;
+const int I_MAP = I_ACT + MP;
+const int I_ID = I_MAP + MGV;
+const int I_ST = I_ID + MC;
+const int I_BK = I_ST + MC;
+const int I_TOTAL = I_BK + MP;
+
+uint tid;
+uint T;
+int gnv[2];
+
+#define DW(o) dwork.v[uint(o) * T + tid]
+#define IW(o) iwork.v[uint(o) * T + tid]
+#define GX(g, c, v) DW(D_G + ((g) * 3 + (c)) * MGV + (v))
+#define PL(g, v, j) IW(I_PL + ((g) * MGV + (v)) * 3 + (j))
+#define NB(g, v, j) IW(I_NB + ((g) * MGV + (v)) * 3 + (j))
+
+int graph_cut(int A, int B, rvec3 n, real h, int id, inout real rho2, real tol)
+{
+    const int nv = gnv[A];
+    real smax = -1e30;
+    for (int q = 0; q < nv; ++q) {
+        const real s = dot(n, rvec3(GX(A, 0, q), GX(A, 1, q), GX(A, 2, q))) - h;
+        DW(D_S + q) = s;
+        smax = max(smax, s);
+    }
+    if (smax < -tol) return CUT_NONE;
+    int ns = 0;
+    bool zero = false;
+    for (int q = 0; q < nv; ++q) {
+        const real s = real(DW(D_S + q));
+        zero = zero || abs(s) <= tol;
+        IW(I_MAP + q) = s > 0.0 ? -1 : ns++;
+    }
+    if (zero) return CUT_FAIL;
+    if (ns == 0) return CUT_EMPTY;
+    int nf = ns;
+    real r2 = 0.0;
+    for (int q = 0; q < nv; ++q) {
+        const int t = IW(I_MAP + q);
+        if (t < 0) continue;
+        const rvec3 a = rvec3(GX(A, 0, q), GX(A, 1, q), GX(A, 2, q));
+        GX(B, 0, t) = a.x; GX(B, 1, t) = a.y; GX(B, 2, t) = a.z;
+        r2 = max(r2, dot(a, a));
+        for (int j = 0; j < 3; ++j) {
+            PL(B, t, j) = PL(A, q, j);
+            const int u = NB(A, q, j);
+            const int mu = IW(I_MAP + u);
+            if (mu >= 0) { NB(B, t, j) = mu; continue; }
+            if (nf >= MGV) return CUT_FAIL;
+            const int x = nf++;
+            const real sq = real(DW(D_S + q));
+            const real f = RDIV(sq, sq - real(DW(D_S + u)));
+            const rvec3 b = a + f * (rvec3(GX(A, 0, u), GX(A, 1, u), GX(A, 2, u)) - a);
+            GX(B, 0, x) = b.x; GX(B, 1, x) = b.y; GX(B, 2, x) = b.z;
+            r2 = max(r2, dot(b, b));
+            PL(B, x, 0) = PL(A, q, (j + 1) % 3);   // the edge q-u lies on these two planes
+            PL(B, x, 1) = PL(A, q, (j + 2) % 3);
+            PL(B, x, 2) = id;
+            NB(B, x, 0) = -1;
+            NB(B, x, 1) = -1;
+            NB(B, x, 2) = t;
+            NB(B, t, j) = x;
+        }
+    }
+    // the two new vertices on an old plane p are joined by the edge on (p, id)
+    bool ok = true;
+    for (int x = ns; x < nf; ++x)
+        for (int c = 0; c < 2; ++c) {
+            const int si = I_SLOT + PL(B, x, c) + 6;
+            const int sl = IW(si);
+            if (sl < 0) { IW(si) = 2 * x + c; continue; }
+            const int y = sl >> 1, cy = sl & 1;
+            IW(si) = -1;
+            if (NB(B, x, 1 - c) != -1 || NB(B, y, 1 - cy) != -1) ok = false;   // a plane met more than twice
+            NB(B, x, 1 - c) = y;
+            NB(B, y, 1 - cy) = x;
+        }
+    for (int x = ns; x < nf; ++x)
+        for (int c = 0; c < 2; ++c) {
+            const int si = I_SLOT + PL(B, x, c) + 6;
+            if (IW(si) >= 0) { ok = false; IW(si) = -1; }
+        }
+    if (!ok) return CUT_FAIL;
+    gnv[B] = nf;
+    rho2 = r2;
+    return CUT_DONE;
+}
+
+rvec3 plane_n(int k) { return rvec3(DW(D_P + 4 * k), DW(D_P + 4 * k + 1), DW(D_P + 4 * k + 2)); }
+real plane_h(int k) { return real(DW(D_P + 4 * k + 3)); }
+
+int atom_area_once(int i, double eps, out double area)
+{
+    area = 0.0;
+    const dvec3 ci = dvec3(xs.v[3 * i], xs.v[3 * i + 1], xs.v[3 * i + 2]);
+    const double Rid = rs.v[i];
+    const real Ri = real(Rid), R2 = Ri * Ri;
+    const dvec3 lo = dvec3(cst.lo_x, cst.lo_y, cst.lo_z);
+    const ivec3 dims = ivec3(cst.dim_x, cst.dim_y, cst.dim_z);
+    ivec3 c0;
+    for (int a = 0; a < 3; ++a) {
+        const int c = int((ci[a] - lo[a]) / cst.cell);
+        c0[a] = c < dims[a] - 1 ? c : dims[a] - 1;
+    }
+    const dvec3 ji = dvec3(jit.v[3 * i], jit.v[3 * i + 1], jit.v[3 * i + 2]);
+    int m = 0;
+    const int K = cst.K, w = 2 * K + 1;
+    for (int dz = -K; dz <= K; ++dz) {
+        const int cz = c0.z + dz;
+        if (cz < 0 || cz >= dims.z) continue;
+        for (int dy = -K; dy <= K; ++dy) {
+            const int cy = c0.y + dy;
+            const int dxm = dxmax.v[(dz + K) * w + dy + K];
+            if (dxm < 0 || cy < 0 || cy >= dims.y) continue;
+            const int row = (cz * dims.y + cy) * dims.x;
+            const int x0 = c0.x - dxm > 0 ? c0.x - dxm : 0;
+            const int x1 = c0.x + dxm < dims.x - 1 ? c0.x + dxm : dims.x - 1;
+            const int b0 = cell_start.v[row + x0], b1 = cell_start.v[row + x1 + 1];
+            for (int j = b0; j < b1; ++j) {
+                if (j == i) continue;
+                dvec3 vd = dvec3(xs.v[3 * j], xs.v[3 * j + 1], xs.v[3 * j + 2]) - ci;
+                if (eps != 0.0) {
+                    vd += eps * (dvec3(jit.v[3 * j], jit.v[3 * j + 1], jit.v[3 * j + 2]) - ji);
+                }
+                const rvec3 v = rvec3(vd);
+                const real d2 = dot(v, v);
+                const real Rj = real(rs.v[j]);
+                const real reach = Ri + Rj;
+                if (d2 >= reach * reach) continue;
+                if (d2 < TOL_REL * TOL_REL * R2) return DEGENERATE;
+                const real d = RSQRT(d2);
+                const real h = RDIV(d2 + R2 - Rj * Rj, 2.0 * d);
+                if (h <= -Ri) { area = 0.0; return OK; }
+                if (h >= Ri) continue;
+                if (m >= MP) return OVERFLOW;
+                DW(D_P + 4 * m) = RDIV(v.x, d);
+                DW(D_P + 4 * m + 1) = RDIV(v.y, d);
+                DW(D_P + 4 * m + 2) = RDIV(v.z, d);
+                DW(D_P + 4 * m + 3) = h;
+                ++m;
+            }
+        }
+    }
+    if (m == 0) { area = 4.0 * PI * Rid * Rid; return OK; }
+    {   // nearest planes first: counting sort into BUCKETS slices of [-R, R]
+        int cnt[BUCKETS + 1];
+        for (int b = 0; b <= BUCKETS; ++b) cnt[b] = 0;
+        for (int k = 0; k < m; ++k) {
+            int b = int((plane_h(k) + Ri) * (0.5 / Ri) * BUCKETS);
+            b = b < 0 ? 0 : b >= BUCKETS ? BUCKETS - 1 : b;
+            IW(I_BK + k) = b;
+            ++cnt[b + 1];
+        }
+        for (int b = 0; b < BUCKETS; ++b) cnt[b + 1] += cnt[b];
+        for (int k = 0; k < m; ++k) {
+            const int b = IW(I_BK + k);
+            IW(I_ORDER + cnt[b]++) = (b << 16) | k;
+        }
+    }
+    for (int k = 0; k < m + 6; ++k) IW(I_SLOT + k) = -1;
+    int gc = 0, gn = 1;
+    const real L = Ri * (1.0 + BOX_SLACK);
+    gnv[0] = 8;
+    for (int c = 0; c < 8; ++c) {
+        GX(0, 0, c) = (c & 1) != 0 ? L : -L;
+        GX(0, 1, c) = (c & 2) != 0 ? L : -L;
+        GX(0, 2, c) = (c & 4) != 0 ? L : -L;
+        PL(0, c, 0) = (c & 1) != 0 ? -2 : -1;
+        PL(0, c, 1) = (c & 2) != 0 ? -4 : -3;
+        PL(0, c, 2) = (c & 4) != 0 ? -6 : -5;
+        NB(0, c, 0) = c ^ 1;
+        NB(0, c, 1) = c ^ 2;
+        NB(0, c, 2) = c ^ 4;
+    }
+    real rho2 = 3.0 * L * L;
+    for (int q = 0; q < m; ++q) {
+        const int ord = IW(I_ORDER + q);
+        const int k = ord & 0xffff;
+        // every later plane has h >= lo; once lo is past the cell's farthest vertex none can cut
+        const real lo_h = -Ri + real(ord >> 16) * (2.0 * Ri / BUCKETS) - LO_SLACK * Ri;
+        if (lo_h >= 0.0 && lo_h * lo_h >= rho2) break;
+        const int r = graph_cut(gc, gn, plane_n(k), plane_h(k), k, rho2, TOL_REL * Ri);
+        if (r == CUT_FAIL) return DEGENERATE;
+        if (r == CUT_EMPTY) { area = 0.0; return OK; }
+        if (r == CUT_NONE) continue;
+        const int t = gc; gc = gn; gn = t;
+        if (rho2 < R2) { area = 0.0; return OK; }   // cell inside the sphere: buried
+    }
+    const int G = gc;
+    // cell edges: where one pierces the sphere the boundary passes from one face circle to the other
+    for (int k = 0; k < m; ++k) { IW(I_XCH + k) = -1; IW(I_LABH + k) = -1; IW(I_ACT + k) = 0; }
+    double sum_ext = 0.0;
+    int ncross = 0, nxc = 0, nlab = 0;
+    for (int u = 0; u < gnv[G]; ++u) {
+        for (int c = 0; c < 3; ++c) {
+            const int v = NB(G, u, c);
+            if (v < u) continue;
+            const int pa = PL(G, u, (c + 1) % 3), pb = PL(G, u, (c + 2) % 3);
+            if (pa >= 0) { IW(I_ACT + pa) = 1; IW(I_LABP + nlab) = pb; IW(I_LABN + nlab) = IW(I_LABH + pa); IW(I_LABH + pa) = nlab++; }
+            if (pb >= 0) { IW(I_ACT + pb) = 1; IW(I_LABP + nlab) = pa; IW(I_LABN + nlab) = IW(I_LABH + pb); IW(I_LABH + pb) = nlab++; }
+            const rvec3 A = rvec3(GX(G, 0, u), GX(G, 1, u), GX(G, 2, u));
+            const rvec3 D = rvec3(GX(G, 0, v), GX(G, 1, v), GX(G, 2, v)) - A;
+            const real qa = dot(D, D);
+            const real qb = 2.0 * dot(A, D);
+            const real qc = dot(A, A) - R2;
+            const real disc = qb * qb - 4.0 * qa * qc;
+            if (disc <= 0.0) continue;
+            const real sq = RSQRT(disc);
+            const real ts0 = RDIV(-qb - sq, 2.0 * qa), ts1 = RDIV(-qb + sq, 2.0 * qa);
+            // near-degenerate: an edge almost tangent to the sphere, or a cell vertex almost on it
+            const real tol_t = RDIV(TOL_REL * Ri, RSQRT(qa));
+            if (ts1 - ts0 < tol_t && ts1 > -tol_t && ts0 < 1.0 + tol_t) return DEGENERATE;
+            for (int r = 0; r < 2; ++r) {
+                const real t = r == 0 ? ts0 : ts1;
+                if (abs(t) < tol_t || abs(1.0 - t) < tol_t) return DEGENERATE;
+                if (!(t > 0.0 && t < 1.0)) continue;
+                if (pa < 0 || pb < 0) return DEGENERATE;   // a box edge cannot reach the sphere
+                if (ncross >= MC) return OVERFLOW;
+                const rvec3 X = A + t * D;
+                DW(D_X + 3 * ncross) = X.x; DW(D_X + 3 * ncross + 1) = X.y; DW(D_X + 3 * ncross + 2) = X.z;
+                const rvec3 na = plane_n(pa), nb = plane_n(pb);
+                const real dn = dot(nb, cross(na, X));
+                if (abs(dn) < TOL_REL * Ri) return DEGENERATE;
+                // exterior angle between the two circles at X
+                const rvec3 uu = rvec3(RDIV(X.x, Ri), RDIV(X.y, Ri), RDIV(X.z, Ri));
+                const rvec3 va = na - dot(na, uu) * uu, vb = nb - dot(nb, uu) * uu;
+                const rvec3 cx = cross(va, vb);
+                sum_ext += RATAN2(RSQRT(dot(cx, cx)), dot(va, vb));
+                // seen from face a the arc starts here when dn < 0; from face b the sense is reversed
+                IW(I_XCP + nxc) = ncross; IW(I_XCS + nxc) = dn < 0.0 ? 1 : 0; IW(I_XCN + nxc) = IW(I_XCH + pa); IW(I_XCH + pa) = nxc++;
+                IW(I_XCP + nxc) = ncross; IW(I_XCS + nxc) = dn > 0.0 ? 1 : 0; IW(I_XCN + nxc) = IW(I_XCH + pb); IW(I_XCH + pb) = nxc++;
+                IW(I_NEXTC + ncross) = -1;
+                ++ncross;
+            }
+        }
+    }
+    double sum_h_phi = 0.0;
+    bool any_arc = false;
+    int full_circles = 0;
+    for (int k = 0; k < m; ++k) {
+        if (IW(I_ACT + k) == 0) continue;
+        const rvec3 nk = plane_n(k);
+        const real hk = plane_h(k);
+        rvec3 e1 = abs(nk.x) < 0.9 ? rvec3(0.0, nk.z, -nk.y) : rvec3(-nk.z, 0.0, nk.x);
+        e1 *= RDIV(1.0, RSQRT(dot(e1, e1)));
+        const rvec3 e2 = cross(nk, e1);
+        double phi = 0.0;
+        if (IW(I_XCH + k) < 0) {
+            // circle wholly inside or outside the face: test one circle point against the face's edges
+            const real rk = RSQRT(R2 - hk * hk);
+            const rvec3 X = hk * nk + rk * e1;
+            bool inside = true;
+            for (int s = IW(I_LABH + k); s >= 0 && inside; s = IW(I_LABN + s)) {
+                const int q = IW(I_LABP + s);
+                if (q < 0) continue;
+                inside = dot(plane_n(q), X) <= plane_h(q);
+            }
+            if (inside) { phi = 2.0 * PI; ++full_circles; }
+        } else {
+            int nc = 0;
+            for (int s = IW(I_XCH + k); s >= 0; s = IW(I_XCN + s)) {
+                const int pi_ = IW(I_XCP + s);
+                const rvec3 X = rvec3(DW(D_X + 3 * pi_), DW(D_X + 3 * pi_ + 1), DW(D_X + 3 * pi_ + 2));
+                const real u = dot(X, e1);
+                const real v = dot(X, e2);
+                const real l = abs(u) + abs(v);
+                const real kk = v >= 0.0 ? 1.0 - RDIV(u, l) : 3.0 + RDIV(u, l);   // monotone in the angle
+                int b = nc++;   // insertion by angle
+                while (b > 0 && DW(D_KEY + b - 1) > kk) {
+                    DW(D_KEY + b) = DW(D_KEY + b - 1); DW(D_CU + b) = DW(D_CU + b - 1); DW(D_CV + b) = DW(D_CV + b - 1);
+                    IW(I_ID + b) = IW(I_ID + b - 1); IW(I_ST + b) = IW(I_ST + b - 1);
+                    --b;
+                }
+                DW(D_KEY + b) = kk; DW(D_CU + b) = u; DW(D_CV + b) = v; IW(I_ID + b) = pi_; IW(I_ST + b) = IW(I_XCS + s);
+            }
+            if ((nc & 1) != 0) return DEGENERATE;
+            for (int a = 0; a < nc; ++a) {
+                if (IW(I_ST + a) == 0) continue;
+                const int e = a + 1 < nc ? a + 1 : 0;
+                if (IW(I_ST + e) != 0) return DEGENERATE;
+                const real cua = real(DW(D_CU + a)), cva = real(DW(D_CV + a)), cue = real(DW(D_CU + e)),
+                           cve = real(DW(D_CV + e));
+                double d = RATAN2(cua * cve - cva * cue, cua * cue + cva * cve);
+                if (d <= 0.0) d += 2.0 * PI;
+                phi += d;
+                IW(I_NEXTC + IW(I_ID + a)) = IW(I_ID + e);
+            }
+        }
+        if (phi > 0.0) any_arc = true;
+        sum_h_phi += double(hk) * phi;
+    }
+    if (!any_arc) { area = 0.0; return OK; }
+    const double a0 = Rid * sum_h_phi - Rid * Rid * sum_ext;
+    const double unit = 2.0 * PI * Rid * Rid, full = 4.0 * PI * Rid * Rid;
+    // boundary loops: a single loop bounds a disc, so chi = 1 without sampling
+    int loops = full_circles;
+    for (int c = 0; c < ncross && loops <= 1; ++c) {
+        if (IW(I_NEXTC + c) < 0) continue;
+        ++loops;
+        int v = c;
+        while (IW(I_NEXTC + v) >= 0) { const int nx = IW(I_NEXTC + v); IW(I_NEXTC + v) = -1; v = nx; }
+    }
+    double chi = 1.0;
+    if (loops != 1) {   // chi from a coarse point estimate (the area is in [0, 4 pi R^2])
+        int inside = 0;
+        for (int p = 0; p < EST; ++p) {
+            const dvec3 u = dvec3(cst.est[3 * p], cst.est[3 * p + 1], cst.est[3 * p + 2]);
+            bool ok = true;
+            for (int k = 0; k < m && ok; ++k) ok = IW(I_ACT + k) == 0 || Ri * dot(plane_n(k), rvec3(u)) <= plane_h(k);
+            inside += ok ? 1 : 0;
+        }
+        chi = floor(div_rn(full * double(inside) / double(EST) - a0, unit) + 0.5);
+    }
+    const double a = a0 + unit * chi;
+    area = a < 0.0 ? 0.0 : a > full ? full : a;
+    return OK;
+}
+
+void main()
+{
+    tid = gl_GlobalInvocationID.x;
+    T = uint(cst.threads);
+    if (tid >= T) return;
+    const double eps_ladder[6] = double[6](0.0, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4);
+    for (int w = range.first + int(tid); w < range.end; w += int(T)) {
+        const int q = range.use_list != 0 ? list.v[w] : w;
+        double a = 0.0;
+        uint flag = 1u;   // recompute on the host unless an attempt succeeds
+        if (rs.v[q] > 0.0) {
+            for (int e = 0; e < ATTEMPTS; ++e) {
+                const int s = atom_area_once(q, eps_ladder[e], a);
+                if (s == OK) { flag = 0u; break; }
+                if (s == OVERFLOW) break;
+            }
+        } else {
+            flag = 0u;
+        }
+        area_out.v[w] = a;
+        flag_out.v[w] = flag;
+    }
+}

@@ -1,5 +1,6 @@
 #include "fastsasa_vulkan_internal.h"
 #include "fastsasa_cpu.h"
+#include "fastsasa_exact_host.h"
 
 /* volk loads the Vulkan loader at runtime so FastSASA binaries do not carry a
  * hard DT_NEEDED dependency on libvulkan.so.1. */
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -41,6 +43,8 @@ namespace {
 #include "fastsasa_vk_lee_richards_cell_fp64_spv.h"
 #include "fastsasa_vk_lee_richards_reduce_fp64_spv.h"
 #include "fastsasa_vk_sr_exposed_points_fp64_64_spv.h"
+#include "fastsasa_vk_exact_spv.h"
+#include "fastsasa_vk_exact_fp32_spv.h"
 #include "fastsasa_vk_sr_mask_fp64_w1_spv.h"
 #include "fastsasa_vk_sr_mask_fp32_w1_spv.h"
 #include "fastsasa_vk_sr_mask_fp64_w2_spv.h"
@@ -103,6 +107,16 @@ constexpr VkDeviceSize kVkFrameSlotBytes = 512ull * 1024ull * 1024ull;   /* cap 
 /* Storage-buffer bindings of the shared descriptor layout (13-15: float frame
  * upload, see widen.comp). */
 constexpr uint32_t kVkBindings = 16;
+/* exact.comp: storage bindings; invocations sharing the workspace, each
+ * holding at least the shader's D_TOTAL (1952) reals and I_TOTAL (3750)
+ * ints, about 31 KB, so 8192 invocations take about 250 MB (fewer when
+ * maxStorageBufferRange is smaller); work items per submission, so no single
+ * dispatch runs long enough to trip a driver watchdog. */
+constexpr uint32_t kVkExactBindings = 11;
+constexpr uint32_t kVkExactThreads = 8192;
+constexpr uint32_t kVkExactDoubles = 2048;
+constexpr uint32_t kVkExactInts = 3840;
+constexpr int kVkExactChunk = 131072;
 /* Below this many centres per dispatch the point-parallel reference shaders
  * win (FASTSASA_MASK_MIN_CENTERS overrides it); below this many centre-frames
  * per context the table setup does not pay for itself. Both measured on an
@@ -433,6 +447,16 @@ struct fastsasa_vk_context {
         VkDescriptorSet set = VK_NULL_HANDLE;
     };
     FrameSlot frame_slots[kVkFrameSlots - 1];
+    /* exact mode (exact.comp): its own descriptor set and pipeline, created on first use */
+    VkDescriptorSetLayout exact_layout = VK_NULL_HANDLE;
+    VkDescriptorPool exact_pool = VK_NULL_HANDLE;
+    VkDescriptorSet exact_set = VK_NULL_HANDLE;
+    VkPipelineLayout exact_pipeline_layout = VK_NULL_HANDLE;
+    VkShaderModule exact_shader[2]{};     /* [fp64/fp32 geometry] */
+    VkPipeline exact_pipeline[2]{};
+    Buffer exact_buffers[kVkExactBindings];
+    Buffer exact_staging;
+    Buffer exact_readback;
     std::string error;
 };
 
@@ -2380,6 +2404,10 @@ extern "C" const char *fastsasa_vk_create_error(void)
     return create_error.c_str();
 }
 
+namespace {
+void exact_free(fastsasa_vk_context *context);
+}  // namespace
+
 extern "C" void fastsasa_vk_context_free(fastsasa_vk_context *context)
 {
     if (context == nullptr) return;
@@ -2392,6 +2420,7 @@ extern "C" void fastsasa_vk_context_free(fastsasa_vk_context *context)
     destroy_buffer(context, &context->mask_pending_slot);
     destroy_buffer(context, &context->placeholder);
     if (context->profile_pool != VK_NULL_HANDLE) vkDestroyQueryPool(context->device, context->profile_pool, nullptr);
+    if (context->device != VK_NULL_HANDLE) exact_free(context);
     for (int pr = 0; pr < 2; ++pr) for (int w = 0; w < kVkMaskMaxWords; ++w) {
         if (context->sr_mask_pipeline[pr][w] != VK_NULL_HANDLE) vkDestroyPipeline(context->device, context->sr_mask_pipeline[pr][w], nullptr);
         if (context->sr_mask_shader[pr][w] != VK_NULL_HANDLE) vkDestroyShaderModule(context->device, context->sr_mask_shader[pr][w], nullptr);
@@ -2754,11 +2783,331 @@ extern "C" int fastsasa_vk_lee_richards_frames(fastsasa_vk_context *context,
                                   frame_sasa, true);
 }
 
+namespace {
+
+/* std430 layout of exact.comp's Constants buffer */
+struct ExactConstants {
+    double lo[3];
+    double cell;
+    int32_t dims[3];
+    int32_t K;
+    int32_t threads;
+    int32_t pad[3];
+    double est[3 * fastsasa_exact::kEstimatePoints];
+};
+
+void exact_initialize(fastsasa_vk_context *context)
+{
+    if (context->exact_pipeline[0] != VK_NULL_HANDLE) return;
+    VkDescriptorSetLayoutBinding bindings[kVkExactBindings]{};
+    for (uint32_t i = 0; i < kVkExactBindings; ++i) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layout_info.bindingCount = kVkExactBindings;
+    layout_info.pBindings = bindings;
+    check(vkCreateDescriptorSetLayout(context->device, &layout_info, nullptr, &context->exact_layout),
+          "vkCreateDescriptorSetLayout");
+    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kVkExactBindings};
+    VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+    check(vkCreateDescriptorPool(context->device, &pool_info, nullptr, &context->exact_pool),
+          "vkCreateDescriptorPool");
+    VkDescriptorSetAllocateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    set_info.descriptorPool = context->exact_pool;
+    set_info.descriptorSetCount = 1;
+    set_info.pSetLayouts = &context->exact_layout;
+    check(vkAllocateDescriptorSets(context->device, &set_info, &context->exact_set), "vkAllocateDescriptorSets");
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 3u * sizeof(int32_t)};
+    VkPipelineLayoutCreateInfo pipeline_layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipeline_layout_info.setLayoutCount = 1;
+    pipeline_layout_info.pSetLayouts = &context->exact_layout;
+    pipeline_layout_info.pushConstantRangeCount = 1;
+    pipeline_layout_info.pPushConstantRanges = &range;
+    check(vkCreatePipelineLayout(context->device, &pipeline_layout_info, nullptr, &context->exact_pipeline_layout),
+          "vkCreatePipelineLayout");
+    context->exact_shader[0] = make_shader(context, fastsasa_vk_exact_spv, fastsasa_vk_exact_spv_len);
+    context->exact_shader[1] = make_shader(context, fastsasa_vk_exact_fp32_spv, fastsasa_vk_exact_fp32_spv_len);
+    for (int precision = 0; precision < 2; ++precision) {
+        VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        info.stage.module = context->exact_shader[precision];
+        info.stage.pName = "main";
+        info.layout = context->exact_pipeline_layout;
+        check(vkCreateComputePipelines(context->device, VK_NULL_HANDLE, 1, &info, nullptr,
+                                       &context->exact_pipeline[precision]),
+              "vkCreateComputePipelines");
+    }
+}
+
+void exact_free(fastsasa_vk_context *context)
+{
+    for (Buffer &buffer : context->exact_buffers) destroy_buffer(context, &buffer);
+    destroy_buffer(context, &context->exact_staging);
+    destroy_buffer(context, &context->exact_readback);
+    for (int precision = 0; precision < 2; ++precision) {
+        if (context->exact_pipeline[precision] != VK_NULL_HANDLE) {
+            vkDestroyPipeline(context->device, context->exact_pipeline[precision], nullptr);
+        }
+        if (context->exact_shader[precision] != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(context->device, context->exact_shader[precision], nullptr);
+        }
+    }
+    if (context->exact_pipeline_layout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(context->device, context->exact_pipeline_layout, nullptr);
+    }
+    if (context->exact_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(context->device, context->exact_pool, nullptr);
+    if (context->exact_layout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(context->device, context->exact_layout, nullptr);
+    }
+}
+
+/* One pass of exact.comp over work items [0, items), each atom list[w] (or
+ * atom w), in submissions of kVkExactChunk; reads back areas and flags. The
+ * inputs must already be on the device. */
+void exact_pass(fastsasa_vk_context *context, int precision, int items, bool use_list, uint32_t threads,
+                std::vector<double> &area, std::vector<uint32_t> &flag)
+{
+    const Buffer *const buffers = context->exact_buffers;
+    const VkDeviceSize area_bytes = sizeof(double) * static_cast<VkDeviceSize>(items);
+    const VkDeviceSize flag_bytes = sizeof(uint32_t) * static_cast<VkDeviceSize>(items);
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    for (int first = 0; first < items; first += kVkExactChunk) {
+        const int32_t range[3] = {first, std::min(items, first + kVkExactChunk), use_list ? 1 : 0};
+        check(vkResetCommandBuffer(context->command, 0), "vkResetCommandBuffer");
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(vkBeginCommandBuffer(context->command, &begin), "vkBeginCommandBuffer");
+        vkCmdBindPipeline(context->command, VK_PIPELINE_BIND_POINT_COMPUTE, context->exact_pipeline[precision]);
+        vkCmdBindDescriptorSets(context->command, VK_PIPELINE_BIND_POINT_COMPUTE, context->exact_pipeline_layout, 0, 1,
+                                &context->exact_set, 0, nullptr);
+        vkCmdPushConstants(context->command, context->exact_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           sizeof(range), range);
+        vkCmdDispatch(context->command, threads / 64u, 1, 1);
+        const bool last = range[1] == items;
+        if (last) {
+            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(context->command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 1, &barrier, 0, nullptr, 0, nullptr);
+            const VkBufferCopy area_copy{0, 0, area_bytes};
+            const VkBufferCopy flag_copy{0, area_bytes, flag_bytes};
+            vkCmdCopyBuffer(context->command, buffers[6].handle, context->exact_readback.handle, 1, &area_copy);
+            vkCmdCopyBuffer(context->command, buffers[7].handle, context->exact_readback.handle, 1, &flag_copy);
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vkCmdPipelineBarrier(context->command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+                                 &barrier, 0, nullptr, 0, nullptr);
+            poison_readback(&context->exact_readback, area_bytes);
+        }
+        check(vkEndCommandBuffer(context->command), "vkEndCommandBuffer");
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &context->command;
+        check(vkQueueSubmit(context->queue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit");
+        check(vkQueueWaitIdle(context->queue), "vkQueueWaitIdle");
+    }
+    const double *mapped = static_cast<const double *>(context->exact_readback.mapped);
+    require_readback(mapped, static_cast<size_t>(items));
+    area.assign(mapped, mapped + items);
+    const uint32_t *flags = reinterpret_cast<const uint32_t *>(mapped + items);
+    flag.assign(flags, flags + items);
+}
+
+/* Copies the staged ranges [offset, offset + bytes) into the given bindings. */
+void exact_upload(fastsasa_vk_context *context, const uint32_t *bindings, const VkDeviceSize *offsets,
+                  const VkDeviceSize *bytes, size_t count)
+{
+    check(vkResetCommandBuffer(context->command, 0), "vkResetCommandBuffer");
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(context->command, &begin), "vkBeginCommandBuffer");
+    for (size_t i = 0; i < count; ++i) {
+        const VkBufferCopy copy{offsets[i], 0, bytes[i]};
+        vkCmdCopyBuffer(context->command, context->exact_staging.handle, context->exact_buffers[bindings[i]].handle, 1,
+                        &copy);
+    }
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(context->command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                         &barrier, 0, nullptr, 0, nullptr);
+    check(vkEndCommandBuffer(context->command), "vkEndCommandBuffer");
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &context->command;
+    check(vkQueueSubmit(context->queue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit");
+    check(vkQueueWaitIdle(context->queue), "vkQueueWaitIdle");
+}
+
+/* Areas of all atoms (centers == nullptr) or of the listed ones, written to
+ * sasa[atom]. mixed: an FP32-geometry pass first, then FP64 for the atoms it
+ * flags (as the CUDA mixed mode). Atoms the FP64 pass flags (workspace
+ * overflow, or no jitter attempt resolved them) are recomputed here with the
+ * large workspace, as on the CPU. */
+int exact_run(fastsasa_vk_context *context, int n, const double *x, const double *y, const double *z,
+              const double *R, const int *centers, int n_centers, bool mixed, double *sasa)
+{
+    const int count = centers != nullptr ? n_centers : n;
+    if (count == 0) return FASTSASA_SUCCESS;
+    fastsasa_exact::SortedFrame f;
+    if (!fastsasa_exact::sort_frame(n, x, y, z, R, f)) return FASTSASA_INVALID_ARGUMENT;
+    /* work item w is sorted atom list[w]; the FP64 re-pass reuses the buffer */
+    std::vector<int32_t> list(static_cast<size_t>(count));
+    if (centers != nullptr) {
+        std::vector<int32_t> sorted_of(static_cast<size_t>(n));
+        for (int q = 0; q < n; ++q) sorted_of[static_cast<size_t>(f.orig[static_cast<size_t>(q)])] = q;
+        for (int c = 0; c < count; ++c) {
+            if (centers[c] < 0 || centers[c] >= n) return FASTSASA_INVALID_ARGUMENT;
+            list[static_cast<size_t>(c)] = sorted_of[static_cast<size_t>(centers[c])];
+        }
+    } else {
+        for (int w = 0; w < count; ++w) list[static_cast<size_t>(w)] = w;
+    }
+    const size_t un = static_cast<size_t>(n);
+    std::vector<double> jitter(3u * un);
+    for (int q = 0; q < n; ++q)
+        for (int a = 0; a < 3; ++a) jitter[3u * static_cast<size_t>(q) + static_cast<size_t>(a)] = fastsasa_exact::jitter(q, a);
+    const uint32_t range_threads = static_cast<uint32_t>(std::min<uint64_t>(
+        kVkExactThreads, context->properties.limits.maxStorageBufferRange / (sizeof(double) * kVkExactDoubles)));
+    const uint32_t threads = std::max<uint32_t>(64u, std::min<uint32_t>(range_threads / 64u * 64u,
+                                                                       (static_cast<uint32_t>(count) + 63u) / 64u * 64u));
+    ExactConstants constants{};
+    for (int a = 0; a < 3; ++a) {
+        constants.lo[a] = f.g.lo[a];
+        constants.dims[a] = f.g.dims[a];
+    }
+    constants.cell = f.g.cell;
+    constants.K = f.g.K;
+    constants.threads = static_cast<int32_t>(threads);
+    fastsasa_exact::estimate_points(constants.est);
+
+    exact_initialize(context);
+    /* inputs 0-5 and 10 go through one staging buffer */
+    struct Upload { uint32_t binding; const void *data; size_t bytes; };
+    const Upload uploads[] = {
+        {0, f.xs.data(), sizeof(double) * f.xs.size()},
+        {1, f.Rs.data(), sizeof(double) * f.Rs.size()},
+        {2, f.g.start.data(), sizeof(int) * f.g.start.size()},
+        {3, f.g.dxmax.data(), sizeof(int) * f.g.dxmax.size()},
+        {4, jitter.data(), sizeof(double) * jitter.size()},
+        {5, list.data(), sizeof(int32_t) * list.size()},
+        {10, &constants, sizeof(constants)},
+    };
+    constexpr size_t kUploads = sizeof(uploads) / sizeof(uploads[0]);
+    VkDeviceSize bytes[kVkExactBindings]{};
+    for (const Upload &u : uploads) bytes[u.binding] = u.bytes;
+    bytes[6] = sizeof(double) * static_cast<VkDeviceSize>(count);
+    bytes[7] = sizeof(uint32_t) * static_cast<VkDeviceSize>(count);
+    bytes[8] = sizeof(double) * static_cast<VkDeviceSize>(kVkExactDoubles) * threads;
+    bytes[9] = sizeof(int32_t) * static_cast<VkDeviceSize>(kVkExactInts) * threads;
+    uint32_t upload_binding[kUploads];
+    VkDeviceSize upload_offset[kUploads], upload_bytes[kUploads];
+    VkDeviceSize staging_bytes = 0;
+    for (size_t i = 0; i < kUploads; ++i) {
+        upload_binding[i] = uploads[i].binding;
+        upload_offset[i] = staging_bytes;
+        upload_bytes[i] = uploads[i].bytes;
+        staging_bytes += (uploads[i].bytes + 15u) / 16u * 16u;
+    }
+    const VkMemoryPropertyFlags host_memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t b = 0; b < kVkExactBindings; ++b) {
+        check_storage_range(context, bytes[b], "exact buffer");
+        ensure_buffer(context, &context->exact_buffers[b], bytes[b],
+                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    }
+    ensure_buffer(context, &context->exact_staging, staging_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, host_memory);
+    ensure_buffer(context, &context->exact_readback, bytes[6] + bytes[7], VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                  readback_memory_flags(context->physical));
+    unsigned char *const staging = static_cast<unsigned char *>(context->exact_staging.mapped);
+    for (size_t i = 0; i < kUploads; ++i) std::memcpy(staging + upload_offset[i], uploads[i].data, uploads[i].bytes);
+    VkDescriptorBufferInfo infos[kVkExactBindings];
+    VkWriteDescriptorSet writes[kVkExactBindings];
+    for (uint32_t b = 0; b < kVkExactBindings; ++b) {
+        infos[b] = {context->exact_buffers[b].handle, 0, VK_WHOLE_SIZE};
+        writes[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[b].dstSet = context->exact_set;
+        writes[b].dstBinding = b;
+        writes[b].descriptorCount = 1;
+        writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[b].pBufferInfo = &infos[b];
+    }
+    vkUpdateDescriptorSets(context->device, kVkExactBindings, writes, 0, nullptr);
+    exact_upload(context, upload_binding, upload_offset, upload_bytes, kUploads);
+
+    std::vector<double> area;
+    std::vector<uint32_t> flag;
+    exact_pass(context, mixed ? 1 : 0, count, centers != nullptr, threads, area, flag);
+    if (mixed) {
+        /* FP64 for the work items the FP32 pass could not resolve */
+        std::vector<int> again;
+        for (int w = 0; w < count; ++w) {
+            if (flag[static_cast<size_t>(w)] != 0u) again.push_back(w);
+        }
+        if (!again.empty()) {
+            int32_t *const staged_list = reinterpret_cast<int32_t *>(staging + upload_offset[5]);
+            for (size_t i = 0; i < again.size(); ++i) staged_list[i] = list[static_cast<size_t>(again[i])];
+            const uint32_t binding = 5;
+            const VkDeviceSize list_bytes = sizeof(int32_t) * again.size();
+            exact_upload(context, &binding, &upload_offset[5], &list_bytes, 1);
+            std::vector<double> area64;
+            std::vector<uint32_t> flag64;
+            exact_pass(context, 0, static_cast<int>(again.size()), true, threads, area64, flag64);
+            for (size_t i = 0; i < again.size(); ++i) {
+                area[static_cast<size_t>(again[i])] = area64[i];
+                flag[static_cast<size_t>(again[i])] = flag64[i];
+            }
+        }
+    }
+    std::unique_ptr<fastsasa_exact::Work<fastsasa_exact::LargeCaps> > big;
+    const fastsasa_exact::GridView g = f.g.view();
+    double est[3 * fastsasa_exact::kEstimatePoints];
+    fastsasa_exact::estimate_points(est);
+    for (int w = 0; w < count; ++w) {
+        const int q = list[static_cast<size_t>(w)];
+        double a = area[static_cast<size_t>(w)];
+        if (flag[static_cast<size_t>(w)] != 0u) {
+            if (!big) big.reset(new fastsasa_exact::Work<fastsasa_exact::LargeCaps>());
+            int retries = 0, overflow = 0;
+            a = fastsasa_exact::atom_area(q, f.xs.data(), f.Rs.data(), g, est, *big, &retries, &overflow);
+        }
+        if (std::isnan(a)) return FASTSASA_DEGENERATE_GEOMETRY;
+        sasa[f.orig[static_cast<size_t>(q)]] = a;
+    }
+    return FASTSASA_SUCCESS;
+}
+
+}  // namespace
+
+/* FP64, or mixed (FP32 geometry, FP64 sums and re-pass); both need
+ * shaderFloat64, and devices without it report DEVICE_UNSUPPORTED so the
+ * caller runs the CPU backend. */
 extern "C" int fastsasa_vk_exact(fastsasa_vk_context *context, int n_atoms, const double *x, const double *y,
                                  const double *z, const double *expanded_radii, const int *centers, int n_centers,
                                  int mixed, double *sasa)
 {
-    (void)context; (void)n_atoms; (void)x; (void)y; (void)z; (void)expanded_radii;
-    (void)centers; (void)n_centers; (void)mixed; (void)sasa;
-    return FASTSASA_DEVICE_UNSUPPORTED;
+    if (context == nullptr || n_atoms < 0 || sasa == nullptr ||
+        (n_atoms > 0 && (x == nullptr || y == nullptr || z == nullptr || expanded_radii == nullptr)) ||
+        (centers != nullptr && n_centers < 0)) {
+        return FASTSASA_INVALID_ARGUMENT;
+    }
+    if (!fastsasa_vk_supports_fp64(context)) return FASTSASA_DEVICE_UNSUPPORTED;
+    try {
+        const int status = exact_run(context, n_atoms, x, y, z, expanded_radii, centers, n_centers, mixed != 0, sasa);
+        if (status == FASTSASA_SUCCESS) context->error.clear();
+        return status;
+    } catch (const std::bad_alloc &) {
+        return FASTSASA_MEMORY_ERROR;
+    } catch (const std::exception &error) {
+        context->error = error.what();
+        return FASTSASA_VULKAN_ERROR;
+    }
 }
