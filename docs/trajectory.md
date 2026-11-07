@@ -45,7 +45,8 @@ Older positional trajectory commands are still accepted for compatibility, but
 new workflows should use explicit `--topology` and `--trajectory` options.
 Trajectory resolution follows the same defaults as the structure CLI:
 Shrake-Rupley uses 100 points and Lee-Richards uses 20 slices unless
-`--resolution` is provided.
+`--resolution` is provided. `--exact` computes the exact analytic area,
+which has no resolution.
 
 The solvent probe radius also follows the structure CLI default of `1.4`
 Angstrom. Change it explicitly when needed:
@@ -54,9 +55,10 @@ Angstrom. Change it explicitly when needed:
 --probe-radius 1.2
 ```
 
-Both GPU algorithms use FP64 by default; in FP64, Vulkan and CUDA results
-are bit-identical to the CPU reference. Add `--precision fp32` to opt into
-the faster single-precision kernels. See the
+All GPU algorithms use FP64 by default. In FP64, Vulkan and CUDA
+Shrake-Rupley and Lee-Richards results are bit-identical to the CPU
+reference, and exact results agree with it to about 1e-10 Å² per atom. Add
+`--precision fp32` to opt into the faster reduced-precision kernels. See the
 [precision section of the CLI reference](cli.md) for the FP32 accuracy
 bounds and the `shaderFloat64` requirement for Vulkan FP64.
 
@@ -141,7 +143,9 @@ than PDB chain — see the PSF segment naming notes in
 reported). When only `--select` results are written, every backend computes
 surface points for the selected atoms alone, with the rest of the system
 still blocking solvent, so small selections run much faster than the whole
-system; the selected atoms' values are identical either way.
+system; the selected atoms' values are identical either way. On the GPU
+backends, several frames of such a run are in flight at once, which keeps
+the device busy even when each frame's selection is small.
 
 If you are comparing against VMD `measure sasa`, check the atom radii
 first — see the radius note in the [CLI Reference](cli.md).

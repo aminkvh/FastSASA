@@ -2,8 +2,9 @@
 
 FastSASA accepts NumPy-compatible coordinate and radius arrays. It does not
 require a particular structure or trajectory reader. The simplest entry points
-are `sasa()` for Shrake-Rupley and `lee_richards()` for Lee-Richards; both use
-the available CUDA, Vulkan, or threaded CPU backend automatically.
+are `sasa()` for Shrake-Rupley, `lee_richards()` for Lee-Richards, and
+`exact()` for the exact analytic area; all use the available CUDA, Vulkan, or
+threaded CPU backend automatically.
 
 ## CLI Or Python?
 
@@ -47,7 +48,9 @@ Precision:
 - use `precision="fp32"` for faster reduced-precision kernels, on GPU or CPU
 - CPU Shrake-Rupley supports fp32; CPU Lee-Richards is fp64-only — requesting
   fp32 with `lee_richards()` on the CPU backend emits a `RuntimeWarning` and
-  computes at fp64 (the CLI prints an equivalent warning to stderr)
+  computes at fp64 (the CLI prints an equivalent warning to stderr); the same
+  applies to `exact()`, whose GPU fp32 mode is mixed precision (FP32
+  geometry, FP64 sums)
 
 Native C contexts are available for Vulkan and CUDA and default to
 `FASTSASA_PRECISION_FP64`. The CPU backend uses the separate
@@ -117,6 +120,30 @@ Use `n_slices` instead of `n_points`.
 
 Shrake-Rupley remains the recommended high-throughput trajectory algorithm.
 Lee-Richards is useful when an LR-style reference is required.
+
+## `exact()`
+
+```python
+from fastsasa import exact
+
+total = exact(positions, radii, probe_radius=1.4)
+total, per_atom = exact(positions, radii, atom_sasa=True)
+```
+
+Computes the exact area of the probe-expanded spheres analytically, from
+each atom's power-diagram cell and the Gauss-Bonnet theorem. There are no
+test points or slices, so the call takes no `n_points` or `n_slices` and
+the result carries no sampling error. Input and return shapes, residue
+sums, selection masks and `as_result` match `sasa()`.
+`SasaEngine.exact()` is the engine method.
+
+With `precision="fp32"`, the CUDA and Vulkan backends use FP32 geometry with
+FP64 sums. Atoms near a degeneracy are recomputed in FP64, and the per-atom
+error stays below 1e-4 Å². The CPU is FP64-only. Vulkan needs
+`shaderFloat64`; without it the CPU computes the same areas. FP64 results
+agree across backends to about 1e-10 Å² per atom but are not bit-identical
+(see [CLI Reference](cli.md#exact-analytic-sasa)). A geometry that no
+jitter retry resolves raises `RuntimeError` with "degenerate geometry".
 
 ## Advanced: `SasaEngine`
 
@@ -326,6 +353,15 @@ the selected atoms. See the
 - `fastsasa_cpu_shrake_rupley_precision(...)` — same, with an added
   `precision` argument (`FASTSASA_PRECISION_FP64` or `FASTSASA_PRECISION_FP32`)
 - `fastsasa_cpu_lee_richards(...)` — fp64 only, no fp32 variant
+- `fastsasa_cpu_exact(...)` and `fastsasa_cpu_exact_centers(...)` — exact
+  analytic SASA of every atom or of listed atoms, fp64 only; radii include
+  the probe, and the result does not depend on the thread count
+
+The device context API (`fastsasa.h`) adds `fastsasa_context_exact()`, which
+takes the same `fastsasa_sr_input` as the Shrake-Rupley calls (radii include
+the probe; `n_points` and `test_points` are ignored). The trajectory API
+(`fastsasa_trajectory.h`) accepts `FASTSASA_ALGORITHM_EXACT`. Both can return
+`FASTSASA_DEGENERATE_GEOMETRY`.
 
 The CPU functions use FastSASA's own cell-list implementations. Passing
 `n_threads=0` selects `max(1, detected CPU threads - 1)`. The CLI uses that

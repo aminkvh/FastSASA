@@ -5,9 +5,9 @@
 </p>
 
 FastSASA calculates solvent-accessible surface area (SASA) for molecular
-structures and molecular dynamics trajectories. It provides Shrake-Rupley and
-Lee-Richards calculations through a command-line tool, a Python array API, and
-VMD integration.
+structures and molecular dynamics trajectories. It provides Shrake-Rupley,
+Lee-Richards, and exact analytic calculations through a command-line tool, a
+Python array API, and VMD integration.
 
 FastSASA is designed for repeated calculations. Trajectory coordinates are
 streamed in batches while reusable data stays on the selected backend. CUDA,
@@ -51,8 +51,8 @@ Platform-specific build options and test commands are in
 ```
 
 Shrake-Rupley with 100 points and a 1.4 Å probe is the default. Use
-`--lee-richards` for Lee-Richards or `--backend cpu|vulkan|cuda` to choose a
-backend explicitly.
+`--lee-richards` for Lee-Richards, `--exact` for the exact analytic surface
+area, or `--backend cpu|vulkan|cuda` to choose a backend explicitly.
 
 ## Calculate A Trajectory
 

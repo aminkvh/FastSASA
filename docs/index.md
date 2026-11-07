@@ -5,8 +5,8 @@
 </p>
 
 FastSASA calculates solvent-accessible surface area for molecular structures
-and molecular dynamics trajectories. It includes Shrake-Rupley and
-Lee-Richards algorithms, direct DCD/XTC trajectory processing, a Python array
+and molecular dynamics trajectories. It includes Shrake-Rupley, Lee-Richards,
+and exact analytic algorithms, direct DCD/XTC trajectory processing, a Python array
 API, and feature extraction for exposure and interface analysis.
 
 FastSASA uses an available CUDA, Vulkan, or threaded CPU backend automatically.
@@ -84,11 +84,12 @@ Python cannot find the native library after building from source, set
 ```sh
 ./build/fastsasa --shrake-rupley --format log tests/data/1ubq.pdb
 ./build/fastsasa --lee-richards --resolution 20 --format log tests/data/1ubq.pdb
+./build/fastsasa --exact --format log tests/data/1ubq.pdb
 ./build/fastsasa --format json tests/data/2isk.cif --output 2isk_sasa.json
 ```
 
 Defaults: Shrake-Rupley 100 points, Lee-Richards 20 slices, 1.4 Å probe
-radius. See [CLI Reference](cli.md).
+radius. The exact method has no resolution. See [CLI Reference](cli.md).
 
 ## Run A Trajectory
 

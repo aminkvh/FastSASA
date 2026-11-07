@@ -64,7 +64,9 @@ the CPU or FastSASA stops with an error; it never returns incomplete results.
 
 `--backend cpu --precision fp32` is also supported, for Shrake-Rupley only;
 CPU Lee-Richards is fp64-only and prints a warning (computing at fp64) if
-`--precision fp32 --lee-richards` is combined with `--backend cpu`.
+`--precision fp32 --lee-richards` is combined with `--backend cpu`. The same
+holds for `--exact` on the CPU. Exact results are not bit-identical across
+backends (see below).
 
 Matching backends use the same algorithm, radii, probe radius, resolution,
 and reduction order. See [Radius Configuration](classifier_config.md) when
@@ -79,7 +81,7 @@ points near a cap boundary go through the exact distance test, in the
 reference kernel's own arithmetic. Results are identical to the reference
 kernels bit for bit (FP64 on every backend; FP32 within its documented
 tolerance), and the kernels are checked against each other in the test
-suite, including systems 3,000 Å across. Point counts above 255, and small inputs where the reference
+suite, including systems 3,000 Å across. Point counts above 1,024, and small inputs where the reference
 kernels are faster, use the reference kernels (the GPU thresholds are
 2048 centres; Vulkan FP64 also times both kernels once per context and keeps
 the faster). To force one kernel:
@@ -92,6 +94,38 @@ own thread or team of threads. The number of concurrent frames follows the
 system size, the last-level cache and the batch length;
 `FASTSASA_CPU_FRAME_THREADS=N` fixes it. Results do not depend on it.
 
+On the GPU backends, a selection trajectory (`--select`, or selection masks in
+the API) computes areas only for the selected atoms; every atom still
+occludes them. Several frames are in flight on the device at once, and
+coordinates read from float trajectory files (DCD, XTC) are sent to the
+device as floats and widened there. Results are bit-identical to computing
+every atom.
+
+### Exact (analytic) SASA
+
+`--exact` computes the exact area of the probe-expanded spheres
+analytically (power-diagram cells and the Gauss-Bonnet theorem) instead of
+sampling it, so it has no resolution parameter and no sampling error.
+Configurations where the geometry is degenerate to rounding (for example a
+cell vertex lying exactly on a sphere) are retried with a deterministic
+coordinate jitter of 10⁻⁸ to 10⁻⁴ Å. If no retry resolves an atom, the call
+fails with "degenerate geometry"; it never returns a silently wrong value.
+
+| Backend | `--precision fp64` (default) | `--precision fp32` |
+| --- | --- | --- |
+| CPU | FP64 | FP64 (warning: fp32 ignored) |
+| CUDA | FP64 | mixed: FP32 geometry, FP64 sums, FP64 re-pass for atoms near a degeneracy |
+| Vulkan | FP64 | mixed, as on CUDA |
+
+Vulkan exact needs `shaderFloat64` in both modes. Without it, the CPU
+computes the same areas. FP64 results agree with an independent analytic
+implementation to within 10⁻⁸ Å² per atom, and the backends agree with
+one another to about 10⁻¹⁰ Å² per atom in the test suite. They are not
+bit-identical: the kernels use different summation orders and math
+routines. Mixed
+precision stays within 10⁻⁴ Å² per atom. The CPU result does not depend on
+the thread count.
+
 ## Core Options
 
 | Option | Meaning |
@@ -100,6 +134,7 @@ system size, the last-level cache and the batch length;
 | `--version` | print the FastSASA version |
 | `--shrake-rupley`, `-S` | use Shrake-Rupley, default structure algorithm |
 | `--lee-richards`, `-L` | use Lee-Richards |
+| `--exact` | use the exact analytic method (no resolution) |
 | `--probe-radius N`, `-p N` | solvent probe radius, default `1.4` |
 | `--resolution N`, `-n N` | SR points or LR slices; defaults are SR `100`, LR `20` |
 | `--backend auto\|vulkan\|cuda\|cpu` | select the compute backend, default `auto` |
@@ -254,6 +289,7 @@ Options:
 | `--cpu` | shorthand for `--backend cpu` |
 | `--shrake-rupley`, `-S` | use Shrake-Rupley, the default |
 | `--lee-richards`, `-L` | use Lee-Richards |
+| `--exact` | use the exact analytic method |
 | `--classes` | report polar, apolar, and unknown SASA classes |
 | `--filter EXPR` | define the calculation universe |
 | `--select 'expression\|name, expression'` | selected SASA |
