@@ -1129,3 +1129,43 @@ fastsasa_sum_selections(const double *atom_sasa,
     }
     return FASTSASA_SUCCESS;
 }
+
+int
+fastsasa_context_set_defer_sr(fastsasa_context *context, int on)
+{
+    if (context == NULL || context->backend != FASTSASA_BACKEND_CUDA) return FASTSASA_INVALID_ARGUMENT;
+    return fastsasa_device_context_set_defer_sr(context->cuda, on);
+}
+
+int
+fastsasa_context_batched_sr(fastsasa_context **lanes, int n)
+{
+    fastsasa_device_context *devices[16];
+    if (lanes == NULL || n <= 0 || n > 16) return FASTSASA_INVALID_ARGUMENT;
+    for (int i = 0; i < n; ++i) {
+        if (lanes[i] == NULL || lanes[i]->backend != FASTSASA_BACKEND_CUDA) return FASTSASA_INVALID_ARGUMENT;
+        devices[i] = lanes[i]->cuda;
+    }
+    return fastsasa_device_contexts_batched_sr(devices, n);
+}
+
+int
+fastsasa_context_set_f32_coords(fastsasa_context *context, const float *xyz_blocks, const double *bbox)
+{
+    if (context == NULL || context->backend != FASTSASA_BACKEND_CUDA) return FASTSASA_INVALID_ARGUMENT;
+    return fastsasa_device_context_set_f32_coords(context->cuda, xyz_blocks, bbox);
+}
+
+void
+fastsasa_set_last_error(const char *message)
+{
+    set_api_error(message != NULL ? message : "");
+}
+
+int
+fastsasa_context_reset_static(fastsasa_context *context)
+{
+    if (context == NULL) return FASTSASA_INVALID_ARGUMENT;
+    if (context->backend != FASTSASA_BACKEND_CUDA) return FASTSASA_SUCCESS;
+    return fastsasa_device_context_reset_static(context->cuda);
+}

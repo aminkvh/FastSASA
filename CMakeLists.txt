@@ -208,38 +208,21 @@ if(FASTSASA_ENABLE_VULKAN)
             ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/sr_exposed_points_cell_list.comp
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_exposed_points_fp64_64_spv
             fastsasa_vk_sr_exposed_points_fp64_64_spv -DFASTSASA_FP64=1 -DSR_LOCAL_SIZE=64)
-        fastsasa_compile_vulkan_shader(
-            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/sr_mask.comp
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp64_w1_spv
-            fastsasa_vk_sr_mask_fp64_w1_spv -DSR_MASK_WORDS=1 -DFASTSASA_FP64=1 --target-env=vulkan1.1)
-        fastsasa_compile_vulkan_shader(
-            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/sr_mask.comp
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp32_w1_spv
-            fastsasa_vk_sr_mask_fp32_w1_spv -DSR_MASK_WORDS=1 --target-env=vulkan1.1)
-        fastsasa_compile_vulkan_shader(
-            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/sr_mask.comp
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp64_w2_spv
-            fastsasa_vk_sr_mask_fp64_w2_spv -DSR_MASK_WORDS=2 -DFASTSASA_FP64=1 --target-env=vulkan1.1)
-        fastsasa_compile_vulkan_shader(
-            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/sr_mask.comp
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp32_w2_spv
-            fastsasa_vk_sr_mask_fp32_w2_spv -DSR_MASK_WORDS=2 --target-env=vulkan1.1)
-        fastsasa_compile_vulkan_shader(
-            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/sr_mask.comp
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp64_w3_spv
-            fastsasa_vk_sr_mask_fp64_w3_spv -DSR_MASK_WORDS=3 -DFASTSASA_FP64=1 --target-env=vulkan1.1)
-        fastsasa_compile_vulkan_shader(
-            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/sr_mask.comp
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp32_w3_spv
-            fastsasa_vk_sr_mask_fp32_w3_spv -DSR_MASK_WORDS=3 --target-env=vulkan1.1)
-        fastsasa_compile_vulkan_shader(
-            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/sr_mask.comp
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp64_w4_spv
-            fastsasa_vk_sr_mask_fp64_w4_spv -DSR_MASK_WORDS=4 -DFASTSASA_FP64=1 --target-env=vulkan1.1)
-        fastsasa_compile_vulkan_shader(
-            ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/sr_mask.comp
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp32_w4_spv
-            fastsasa_vk_sr_mask_fp32_w4_spv -DSR_MASK_WORDS=4 --target-env=vulkan1.1)
+        # Mask SR shaders, one per 64-point word count (1-16 words: up to 1,024 points).
+        set(FASTSASA_VULKAN_MASK_HEADERS)
+        foreach(words RANGE 1 16)
+            fastsasa_compile_vulkan_shader(
+                ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/sr_mask.comp
+                ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp64_w${words}_spv
+                fastsasa_vk_sr_mask_fp64_w${words}_spv -DSR_MASK_WORDS=${words} -DFASTSASA_FP64=1 --target-env=vulkan1.1)
+            fastsasa_compile_vulkan_shader(
+                ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/sr_mask.comp
+                ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp32_w${words}_spv
+                fastsasa_vk_sr_mask_fp32_w${words}_spv -DSR_MASK_WORDS=${words} --target-env=vulkan1.1)
+            list(APPEND FASTSASA_VULKAN_MASK_HEADERS
+                ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp64_w${words}_spv.h
+                ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp32_w${words}_spv.h)
+        endforeach()
         fastsasa_compile_vulkan_shader(
             ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/lee_richards_cell.comp
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_lee_richards_cell_fp64_spv
@@ -268,14 +251,7 @@ if(FASTSASA_ENABLE_VULKAN)
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_lee_richards_cell_fp64_spv.h
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_lee_richards_reduce_fp64_spv.h
             ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_exposed_points_fp64_64_spv.h
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp64_w1_spv.h
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp32_w1_spv.h
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp64_w2_spv.h
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp32_w2_spv.h
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp64_w3_spv.h
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp32_w3_spv.h
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp64_w4_spv.h
-            ${FASTSASA_VULKAN_GENERATED_DIR}/fastsasa_vk_sr_mask_fp32_w4_spv.h)
+            ${FASTSASA_VULKAN_MASK_HEADERS})
         add_custom_target(fastsasa_vulkan_shaders DEPENDS ${FASTSASA_VULKAN_HEADERS})
         set(FASTSASA_VULKAN_SOURCE
             src/fastsasa_vulkan.cc
@@ -649,6 +625,16 @@ if(FASTSASA_BUILD_NATIVE_TESTS)
                 $<$<NOT:$<PLATFORM_ID:Windows>>:m>
         )
     endif()
+    if(FASTSASA_ENABLE_CUDA OR FASTSASA_HAVE_VULKAN)
+        add_executable(fastsasa_trajectory_lanes_validate
+            tests/trajectory_lanes_validation.c
+        )
+        target_link_libraries(fastsasa_trajectory_lanes_validate
+            PRIVATE
+                fastsasa
+                $<$<NOT:$<PLATFORM_ID:Windows>>:m>
+        )
+    endif()
     if(FASTSASA_HAVE_VULKAN)
         add_executable(fastsasa_vulkan_batch_validate
             tests/vulkan_batch_validation.c
@@ -862,6 +848,12 @@ if(FASTSASA_BUILD_NATIVE_TESTS)
         add_test(NAME fastsasa_vulkan_batch
             COMMAND $<TARGET_FILE:fastsasa_vulkan_batch_validate>
         )
+        add_test(NAME fastsasa_trajectory_lanes_vulkan
+            COMMAND $<TARGET_FILE:fastsasa_trajectory_lanes_validate>
+        )
+        set_tests_properties(fastsasa_trajectory_lanes_vulkan
+            PROPERTIES ENVIRONMENT "FASTSASA_BACKEND=vulkan" LABELS "vulkan"
+        )
         set_tests_properties(fastsasa_vulkan_batch
             PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
                        SKIP_RETURN_CODE 77
@@ -921,6 +913,9 @@ if(FASTSASA_BUILD_NATIVE_TESTS)
         add_test(NAME fastsasa_selected_center
             COMMAND $<TARGET_FILE:fastsasa_selected_center_validate>
         )
+        add_test(NAME fastsasa_trajectory_lanes
+            COMMAND $<TARGET_FILE:fastsasa_trajectory_lanes_validate>
+        )
         add_test(NAME fastsasa_context_isolation
             COMMAND $<TARGET_FILE:fastsasa_context_isolation_validate>
         )
@@ -946,6 +941,7 @@ if(FASTSASA_BUILD_NATIVE_TESTS)
         set_tests_properties(
             fastsasa_cuda_boundary
             fastsasa_selected_center
+            fastsasa_trajectory_lanes
             fastsasa_context_isolation
             fastsasa_autotune_dispatch
             fastsasa_python_feature_gpu

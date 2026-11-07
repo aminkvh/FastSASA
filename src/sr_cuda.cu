@@ -57,6 +57,9 @@ typedef struct {
     const unsigned int *selection_masks;
     int n_selections;
     double *selection_sasa;
+    /* h_sasa holds only these atoms' areas, in this order. */
+    const int *gather_indices;
+    int n_gather;
 } fastsasa_pending_aggregate;
 
 /* Bound on queued launches before the stream is drained, which also bounds
@@ -144,6 +147,39 @@ struct fastsasa_device_context {
     size_t cell_sort_storage_capacity;
     int reusable_test_points_n;
     int reusable_const_test_points_n;
+    /* static inputs (radii, selection masks, centre list) already
+     * on the device, keyed by host and device pointers. */
+    const void *static_key[6];
+    int static_n;
+    /* stop a cell-list SR call before the SR launch; the batched
+     * launcher runs the frames of several contexts in one mask launch, then their read-back. */
+    int defer_sr;
+    float *d_coord_f;   /* float coordinates as uploaded */
+    const float *h_coord_f;   /* next call's float copy of x, y, z (exact), or NULL */
+    int h_bbox_valid;   /* h_bbox: that copy's min x, y, z, max x, y, z */
+    double h_bbox[6];
+    const double *max_radius_key;   /* radii pointer of max_radius_cached (constant inputs only) */
+    int max_radius_n;
+    double max_radius_cached;
+    int derived_mode;   /* float/squared radii and float points left by the last call (0: none) */
+    const void *derived_key[4];   /* the buffers that hold them */
+    /* d_cell_counts[0, counts_zero_cells) and d_cell_offsets[0] are known to be zero while the
+     * buffers are these (a reallocation can return the same address, so the capacity is kept too) */
+    const int *counts_zero_ptr;
+    size_t counts_zero_capacity;
+    int counts_zero_cells;
+    const int *offsets_zero_ptr;
+    size_t offsets_zero_capacity;
+    size_t coord_f_capacity;
+    int deferred_ready;
+    int deferred_words, deferred_float;
+    unsigned char deferred_args[256];   /* MaskFrameArgs */
+    fastsasa_device_sr_input deferred_input;
+    double *deferred_sasa, *deferred_total;
+    int deferred_aggregate_host, deferred_aggregate_total, deferred_aggregate_residues, deferred_compact;
+    cudaEvent_t deferred_event, batch_done_event;
+    double *d_gather;
+    size_t gather_capacity;
     cudaStream_t stream;
     int profile_enabled;
     fastsasa_device_cell_profile last_cell_profile;
@@ -612,6 +648,34 @@ host_aggregate_sasa(const double *sasa,
     return FASTSASA_SUCCESS;
 }
 
+__global__ static void
+gather_kernel(int n, const int *__restrict__ indices, const double *__restrict__ src, double *__restrict__ dst)
+{
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k < n) dst[k] = src[indices[k]];
+}
+
+/* selection sums from gathered areas, visiting atoms in the order
+ * of indices (ascending), which is the order host_aggregate_sasa uses. */
+static int
+host_aggregate_gathered(const fastsasa_pending_aggregate *entry)
+{
+    double compensation[32];
+
+    if (entry->n_selections > 31) return FASTSASA_INVALID_ARGUMENT;
+    memset(compensation, 0, sizeof(compensation));
+    memset(entry->selection_sasa, 0, sizeof(double) * (size_t)entry->n_selections);
+    for (int k = 0; k < entry->n_gather; ++k) {
+        const unsigned int mask = entry->selection_masks[entry->gather_indices[k]];
+        for (int selection = 0; selection < entry->n_selections; ++selection) {
+            if ((mask & (1u << selection)) != 0u) {
+                fastsasa_exact_kahan_add(entry->h_sasa[k], &entry->selection_sasa[selection], &compensation[selection]);
+            }
+        }
+    }
+    return FASTSASA_SUCCESS;
+}
+
 static int
 flush_pending_aggregates(fastsasa_device_context *context)
 {
@@ -619,7 +683,7 @@ flush_pending_aggregates(fastsasa_device_context *context)
 
     for (int i = 0; i < context->n_pending; ++i) {
         const fastsasa_pending_aggregate *entry = &context->pending[i];
-        const int entry_status = host_aggregate_sasa(entry->h_sasa,
+        const int entry_status = entry->gather_indices != NULL ? host_aggregate_gathered(entry) : host_aggregate_sasa(entry->h_sasa,
                                                      entry->n_atoms,
                                                      entry->total_sasa,
                                                      entry->residue_ids,
@@ -694,6 +758,8 @@ pending_aggregate_push(fastsasa_device_context *context,
     entry->selection_masks = input->selection_masks;
     entry->n_selections = input->n_selections;
     entry->selection_sasa = input->selection_sasa;
+    entry->gather_indices = NULL;
+    entry->n_gather = 0;
     ++context->n_pending;
     *entry_out = entry;
     return FASTSASA_SUCCESS;
@@ -1376,6 +1442,9 @@ fastsasa_device_context_free(fastsasa_device_context *context)
     if (context == NULL) return;
 
     cudaStreamSynchronize(context->stream);
+    if (context->deferred_event) cudaEventDestroy(context->deferred_event);
+    cudaFree(context->d_coord_f);
+    if (context->batch_done_event) cudaEventDestroy(context->batch_done_event);
     cudaFree(context->d_xyz);
     cudaFree(context->d_x);
     cudaFree(context->d_y);
@@ -1401,6 +1470,7 @@ fastsasa_device_context_free(fastsasa_device_context *context)
     cudaFree(context->d_selection_masks);
     cudaFree(context->d_selection_sasa);
     cudaFree(context->d_active_center_indices);
+    cudaFree(context->d_gather);
     cudaFree(context->d_neighbor_offsets);
     cudaFree(context->d_neighbor_indices);
     cudaFree(context->d_atom_cells);
@@ -2625,6 +2695,23 @@ cell_fill_kernel(int n_atoms,
     cell_atoms[slot] = atom;
 }
 
+/* fill each cell by counting it back down, leaving the counts
+ * zero for the next frame (no memset, no copy of the offsets). Order within a cell is arbitrary,
+ * as with cell_fill_kernel. */
+__global__ static void
+cell_drain_fill_kernel(int n_atoms,
+                       const int *atom_cells,
+                       const int *cell_offsets,
+                       int *cell_counts,
+                       int *cell_atoms)
+{
+    const int atom = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (atom >= n_atoms) return;
+    const int cell = atom_cells[atom];
+    cell_atoms[cell_offsets[cell] + atomicSub(&cell_counts[cell], 1) - 1] = atom;
+}
+
 __global__ static void
 shrake_rupley_cell_kernel(int n_atoms,
                           int n_points,
@@ -2757,6 +2844,8 @@ shrake_rupley_cell_kernel(int n_atoms,
  * scratch memory (32 * W * 8 B per atom). Measured on a 6x-density random
  * packing and at 255 points with no slowdown from overflow. */
 #define FASTSASA_MASK_PENDING 32
+/* Widest mask: 16 64-bit words, the CPU kernel's limit (fastsasa_cpu_mask.cc). */
+#define FASTSASA_CUDA_MASK_MAX_WORDS 16
 
 /* One boundary point decided exactly. FP64: shrake_rupley_cell_kernel's
  * expression. FP32: the float kernels' expression on the box-local shadows
@@ -2789,8 +2878,9 @@ mask_point_buried(double xi, double yi, double zi, double ri,
 }
 
 template <int W, bool kFloat>
-__global__ static void
-shrake_rupley_cell_mask_kernel(int n_atoms,
+__device__ __forceinline__ static void
+mask_body(int center,
+          int n_atoms,
                                int n_points,
                                const double *__restrict__ x,
                                const double *__restrict__ y,
@@ -2824,7 +2914,6 @@ shrake_rupley_cell_mask_kernel(int n_atoms,
                                double *__restrict__ sasa,
                                double *__restrict__ total_sasa)
 {
-    const int center = blockIdx.x * blockDim.x + threadIdx.x;
     if (center >= n_centers) return;
     /* Lanes take atoms in cell-list order when running over all atoms, so a
      * warp's 32 atoms share (nearly) the same neighbourhood and the
@@ -3029,6 +3118,96 @@ shrake_rupley_cell_mask_kernel(int n_atoms,
     const double atom_sasa = sr_atom_area(ri, exposed, n_points);
     if (sasa != NULL) sasa[atom] = atom_sasa;
     if (total_sasa != NULL) atomic_add_double(total_sasa, atom_sasa);
+}
+
+template <int W, bool kFloat>
+__global__ static void
+shrake_rupley_cell_mask_kernel(int n_atoms,
+                               int n_points,
+                               const double *__restrict__ x,
+                               const double *__restrict__ y,
+                               const double *__restrict__ z,
+                               const double *__restrict__ radii,
+                               const double *__restrict__ radii2,
+                               const double *__restrict__ test_points,
+                               const float *__restrict__ xf,        /* box-local float shadows */
+                               const float *__restrict__ yf,
+                               const float *__restrict__ zf,
+                               const float *__restrict__ radii_f,
+                               const float *__restrict__ radii2_f,      /* FP32 exact tests */
+                               const float *__restrict__ test_points_f,
+                               const unsigned long long *__restrict__ table,
+                               int table_res,
+                               int table_tbins,
+                               double table_max_delta,
+                               double table_dot_pad,
+                               int nx,
+                               int ny,
+                               int nz,
+                               const int *__restrict__ atom_cells,
+                               const int *__restrict__ cell_offsets,
+                               const int *__restrict__ cell_atoms,
+                               const int *__restrict__ center_indices,
+                               int n_centers,
+                               const unsigned int *__restrict__ center_masks,
+                               unsigned int active_center_mask,
+                               unsigned long long *__restrict__ pending_words,   /* n_centers * PENDING * W */
+                               int *__restrict__ pending_slot,                    /* n_centers * PENDING */
+                               double *__restrict__ sasa,
+                               double *__restrict__ total_sasa)
+{
+    mask_body<W, kFloat>(blockIdx.x * blockDim.x + threadIdx.x, n_atoms, n_points, x, y, z, radii, radii2, test_points, xf, yf, zf, radii_f, radii2_f, test_points_f, table, table_res, table_tbins, table_max_delta, table_dot_pad, nx, ny, nz, atom_cells, cell_offsets, cell_atoms, center_indices, n_centers, center_masks, active_center_mask, pending_words, pending_slot, sasa, total_sasa);
+}
+
+/* one mask launch for the frames of several lane contexts;
+ * blockIdx.y picks the frame, each frame keeps its own buffers (prepared by its lane). */
+struct MaskFrameArgs {
+    int n_atoms;
+    int n_points;
+    const double *x;
+    const double *y;
+    const double *z;
+    const double *radii;
+    const double *radii2;
+    const double *test_points;
+    const float *xf;
+    const float *yf;
+    const float *zf;
+    const float *radii_f;
+    const float *radii2_f;
+    const float *test_points_f;
+    const unsigned long long *table;
+    int table_res;
+    int table_tbins;
+    double table_max_delta;
+    double table_dot_pad;
+    int nx;
+    int ny;
+    int nz;
+    const int *atom_cells;
+    const int *cell_offsets;
+    const int *cell_atoms;
+    const int *center_indices;
+    int n_centers;
+    const unsigned int *center_masks;
+    unsigned int active_center_mask;
+    unsigned long long *pending_words;
+    int *pending_slot;
+    double *sasa;
+    double *total_sasa;
+};
+#define FASTSASA_MASK_BATCH_MAX 16
+struct MaskBatch {
+    MaskFrameArgs f[FASTSASA_MASK_BATCH_MAX];
+};
+
+template <int W, bool kFloat>
+__global__ static void
+shrake_rupley_cell_mask_batch_kernel(const __grid_constant__ MaskBatch batch)
+{
+    const MaskFrameArgs &a = batch.f[blockIdx.y];
+    if ((int)(blockIdx.x * blockDim.x) >= a.n_centers) return;
+    mask_body<W, kFloat>(blockIdx.x * blockDim.x + threadIdx.x, a.n_atoms, a.n_points, a.x, a.y, a.z, a.radii, a.radii2, a.test_points, a.xf, a.yf, a.zf, a.radii_f, a.radii2_f, a.test_points_f, a.table, a.table_res, a.table_tbins, a.table_max_delta, a.table_dot_pad, a.nx, a.ny, a.nz, a.atom_cells, a.cell_offsets, a.cell_atoms, a.center_indices, a.n_centers, a.center_masks, a.active_center_mask, a.pending_words, a.pending_slot, a.sasa, a.total_sasa);
 }
 
 /*
@@ -3962,6 +4141,9 @@ fastsasa_device_context_shrake_rupley_csr(fastsasa_device_context *context,
     }
 
     if (cuda_status(cudaMemcpyAsync(context->d_xyz, input->xyz, xyz_bytes, cudaMemcpyHostToDevice, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
+    context->static_n = -1;
+    context->derived_mode = 0;
+    context->counts_zero_ptr = NULL;
     if (cuda_status(cudaMemcpyAsync(context->d_radii, input->radii, radii_bytes, cudaMemcpyHostToDevice, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
     if (use_const_test_points) {
         if (context->reusable_const_test_points_n != input->n_points) {
@@ -4050,6 +4232,84 @@ fastsasa_device_shrake_rupley_csr(const fastsasa_device_sr_input *input,
     return status;
 }
 
+/* float -> double is exact, so the doubles equal the host's. */
+__global__ static void
+widen_coords_kernel(int n, const float *__restrict__ f, double *__restrict__ x, double *__restrict__ y, double *__restrict__ z,
+                    double ox, double oy, double oz, float *__restrict__ xf, float *__restrict__ yf, float *__restrict__ zf)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const double dx = (double)f[i], dy = (double)f[n + i], dz = (double)f[2 * n + i];
+    x[i] = dx;
+    y[i] = dy;
+    z[i] = dz;
+    /* the box-local shadows of double_to_shifted_float_kernel, when xf is set */
+    if (xf != NULL) {
+        xf[i] = (float)(dx - ox);
+        yf[i] = (float)(dy - oy);
+        zf[i] = (float)(dz - oz);
+    }
+}
+
+/* Read-back after the SR kernel: per-atom areas, or the host aggregation entry (selection-only
+ * launches gather just the selected atoms). Shared by the per-frame path and the batched launcher. */
+static int
+enqueue_sr_readback(fastsasa_device_context *context,
+                    const fastsasa_device_sr_input *input,
+                    double *sasa,
+                    double *total_sasa,
+                    int aggregate_host,
+                    int aggregate_total,
+                    int aggregate_residues,
+                    int compact_active_centers)
+{
+    int status = FASTSASA_SUCCESS;
+    const size_t sasa_bytes = sizeof(double) * (size_t)input->n_atoms;
+    if (sasa != NULL &&
+        cuda_status(cudaMemcpyAsync(sasa, context->d_sasa, sasa_bytes, cudaMemcpyDeviceToHost, context->stream)) != FASTSASA_SUCCESS) {
+        return FASTSASA_CUDA_ERROR;
+    }
+    if (aggregate_host) {
+        fastsasa_pending_aggregate *entry = NULL;
+        /* selection-only launches read back only the selected
+         * atoms' areas (the host sum visits the same atoms in the same order). */
+        const int gather = !aggregate_total && !aggregate_residues &&
+                           sasa == NULL && compact_active_centers && input->active_center_indices != NULL;
+
+        status = pending_aggregate_push(context, input, total_sasa, &entry);
+        if (status != FASTSASA_SUCCESS) return status;
+        if (gather) {
+            const int n = input->n_active_centers;
+            status = ensure_device_capacity((void **)&context->d_gather, &context->gather_capacity, sizeof(double) * (size_t)n);
+            if (status != FASTSASA_SUCCESS) return status;
+            gather_kernel<<<(n + 255) / 256, 256, 0, context->stream>>>(n, context->d_active_center_indices,
+                                                                         context->d_sasa, context->d_gather);
+            entry->gather_indices = input->active_center_indices;
+            entry->n_gather = n;
+            if (cuda_status(cudaMemcpyAsync(entry->h_sasa, context->d_gather, sizeof(double) * (size_t)n,
+                                            cudaMemcpyDeviceToHost, context->stream)) != FASTSASA_SUCCESS) {
+                return FASTSASA_CUDA_ERROR;
+            }
+        } else if (cuda_status(cudaMemcpyAsync(entry->h_sasa, context->d_sasa, sasa_bytes,
+                                               cudaMemcpyDeviceToHost, context->stream)) != FASTSASA_SUCCESS) {
+            return FASTSASA_CUDA_ERROR;
+        }
+    }
+    return FASTSASA_SUCCESS;
+}
+
+/* after a failed call (a buffer may have been freed and reallocated) keep nothing */
+static void
+forget_kept_state(fastsasa_device_context *context)
+{
+    context->static_n = -1;
+    context->derived_mode = 0;
+    context->max_radius_key = NULL;
+    context->counts_zero_ptr = NULL;
+    context->offsets_zero_ptr = NULL;
+    context->deferred_ready = 0;
+}
+
 static int
 context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
                                      const fastsasa_device_sr_input *input,
@@ -4072,8 +4332,22 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
     };
     cudaEvent_t profile_events[PROFILE_EVENT_COUNT] = {0};
     int profile_active = 0;
+    int reuse_static = 0;
+    int static_hit = 0;
+    int fused_shadows = 0;   /* widen_coords_kernel wrote d_xf, d_yf, d_zf */
+    int drain_fill = 0;
+    int points_uploaded = 0;
+    int derived_mode = 0;
+    const void *static_key[6];
     if (status != FASTSASA_SUCCESS) return status;
     if (context == NULL) return FASTSASA_INVALID_ARGUMENT;
+    /* the float upload, its box and a deferred frame belong to one call, whatever its
+     * outcome; nothing of them may reach a later call (the host buffers can be gone by then) */
+    const float *coord_f = context->h_coord_f;
+    const int bbox_valid = context->h_bbox_valid;
+    context->h_coord_f = NULL;
+    context->h_bbox_valid = 0;
+    context->deferred_ready = 0;
     if (sasa == NULL && total_sasa == NULL &&
         input->residue_sasa == NULL && input->selection_sasa == NULL) {
         return FASTSASA_INVALID_ARGUMENT;
@@ -4087,8 +4361,18 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
     double max_y = min_y;
     double max_z = min_z;
     double max_radius = input->radii[0];
+    /* the float upload brings its bounding box, and constant radii keep their maximum */
+    const int constant_inputs = (input->reuse_test_points & 2) != 0;
+    const int have_bbox = use_soa_coords && coord_f != NULL && bbox_valid;
+    const int have_max_radius = constant_inputs && context->max_radius_key == input->radii &&
+                                context->max_radius_n == input->n_atoms;
 
-    for (int i = 1; i < input->n_atoms; ++i) {
+    if (have_bbox) {
+        min_x = context->h_bbox[0]; min_y = context->h_bbox[1]; min_z = context->h_bbox[2];
+        max_x = context->h_bbox[3]; max_y = context->h_bbox[4]; max_z = context->h_bbox[5];
+    }
+    if (have_max_radius) max_radius = context->max_radius_cached;
+    for (int i = 1; !have_bbox && i < input->n_atoms; ++i) {
         const double x = input_coord_x(input, i);
         const double y = input_coord_y(input, i);
         const double z = input_coord_z(input, i);
@@ -4099,9 +4383,18 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
         if (x > max_x) max_x = x;
         if (y > max_y) max_y = y;
         if (z > max_z) max_z = z;
+    }
+    for (int i = 1; !have_max_radius && i < input->n_atoms; ++i) {
         if (input->radii[i] > max_radius) max_radius = input->radii[i];
     }
     if (max_radius <= 0.0) return FASTSASA_INVALID_ARGUMENT;
+    if (!constant_inputs) {
+        context->max_radius_key = NULL;   /* the radii may change under the same pointer */
+    } else if (!have_max_radius) {
+        context->max_radius_key = input->radii;
+        context->max_radius_n = input->n_atoms;
+        context->max_radius_cached = max_radius;
+    }
 
     const double cell_size = 2.0 * max_radius;
     min_x -= cell_size;
@@ -4157,14 +4450,14 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
     const int sr_center_count = compact_active_centers
                                     ? input->n_active_centers
                                     : input->n_atoms;
-    /* Mask kernel: up to 255 points. One lane per centre, so it needs
+    /* Mask kernel: up to 1,024 points (16 words). One lane per centre, so it needs
      * enough centres in flight to hide its serial per-lane neighbour walk;
      * below ~2k centres the point-parallel reference kernel is faster
      * (measured crossover ~3k centres on an RTX 4060 Ti). */
     const char *mask_env = getenv("FASTSASA_CUDA_SR_KERNEL");
     const int mask_forced = mask_env != NULL && strcmp(mask_env, "mask") == 0;
-    int mask_sr = use_mask_sr() && input->n_points <= 255 &&
-                  (mask_forced || sr_center_count >= mask_min_centers());
+    int mask_sr = use_mask_sr() && input->n_points <= 64 * FASTSASA_CUDA_MASK_MAX_WORDS &&
+                  (mask_forced || context->defer_sr || sr_center_count >= mask_min_centers());
     /* Keep reusable points in context-owned global memory for stream isolation. */
     const int use_const_test_points = 0;
     const int sort_cell_list = dispatch.sort_cell_list;
@@ -4272,14 +4565,38 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
                                               sizeof(int) * (size_t)input->n_active_centers);
         if (status != FASTSASA_SUCCESS) goto status_fail;
     }
-    if (use_soa_coords) {
+    if (use_soa_coords && coord_f != NULL) {
+        /* 3 n floats (x, y, z blocks) equal to x, y, z exactly; consumed by this call */
+        const size_t fbytes = sizeof(float) * 3u * (size_t)input->n_atoms;
+        status = ensure_device_capacity((void **)&context->d_coord_f, &context->coord_f_capacity, fbytes);
+        if (status != FASTSASA_SUCCESS) goto status_fail;
+        if (cuda_status(cudaMemcpyAsync(context->d_coord_f, coord_f, fbytes, cudaMemcpyHostToDevice, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
+        fused_shadows = float_sr || hybrid_sr || mask_sr;
+        widen_coords_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_coord_f,
+                                                                              context->d_x, context->d_y, context->d_z,
+                                                                              min_x, min_y, min_z,
+                                                                              fused_shadows ? context->d_xf : NULL,
+                                                                              context->d_yf, context->d_zf);
+        if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
+    } else if (use_soa_coords) {
         if (cuda_status(cudaMemcpyAsync(context->d_x, input->x, coord_bytes, cudaMemcpyHostToDevice, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
         if (cuda_status(cudaMemcpyAsync(context->d_y, input->y, coord_bytes, cudaMemcpyHostToDevice, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
         if (cuda_status(cudaMemcpyAsync(context->d_z, input->z, coord_bytes, cudaMemcpyHostToDevice, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
     } else if (cuda_status(cudaMemcpyAsync(context->d_xyz, input->xyz, xyz_bytes, cudaMemcpyHostToDevice, context->stream)) != FASTSASA_SUCCESS) {
         goto cuda_fail;
     }
-    if (cuda_status(cudaMemcpyAsync(context->d_radii, input->radii, radii_bytes, cudaMemcpyHostToDevice, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
+    /* skip re-uploading inputs that are constant over a trajectory. */
+    reuse_static = (input->reuse_test_points & 2) != 0;
+    static_key[0] = input->radii;
+    static_key[1] = input->selection_masks;
+    static_key[2] = input->active_center_indices;
+    static_key[3] = context->d_radii;
+    static_key[4] = context->d_selection_masks;
+    static_key[5] = context->d_active_center_indices;
+    static_hit = reuse_static && context->static_n == input->n_atoms &&
+                 memcmp(static_key, context->static_key, sizeof(static_key)) == 0;
+    if (!static_hit &&
+        cuda_status(cudaMemcpyAsync(context->d_radii, input->radii, radii_bytes, cudaMemcpyHostToDevice, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
     if (use_const_test_points) {
         if (context->reusable_const_test_points_n != input->n_points) {
             if (cuda_status(cudaMemcpyToSymbolAsync(const_test_points, input->test_points, test_point_bytes, 0, cudaMemcpyHostToDevice, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
@@ -4288,6 +4605,7 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
         context->reusable_test_points_n = -1;
     } else if (!input->reuse_test_points || context->reusable_test_points_n != input->n_points) {
         if (cuda_status(cudaMemcpyAsync(context->d_test_points, input->test_points, test_point_bytes, cudaMemcpyHostToDevice, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
+        points_uploaded = 1;
         context->reusable_test_points_n = input->reuse_test_points ? input->n_points : -1;
         context->reusable_const_test_points_n = -1;
     }
@@ -4307,21 +4625,16 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
         }
     }
     if (aggregate_selections) {
-        if (cuda_status(cudaMemcpyAsync(context->d_selection_masks,
+        if (!static_hit && cuda_status(cudaMemcpyAsync(context->d_selection_masks,
                                         input->selection_masks,
                                         sizeof(unsigned int) * (size_t)input->n_atoms,
                                         cudaMemcpyHostToDevice,
                                         context->stream)) != FASTSASA_SUCCESS) {
             goto cuda_fail;
         }
-        if (cuda_status(cudaMemsetAsync(context->d_selection_sasa,
-                                        0,
-                                        sizeof(double) * (size_t)input->n_selections,
-                                        context->stream)) != FASTSASA_SUCCESS) {
-            goto cuda_fail;
-        }
+        /* d_selection_sasa is not read on this path (host aggregation) */
     }
-    if (compact_active_centers &&
+    if (compact_active_centers && !static_hit &&
         cuda_status(cudaMemcpyAsync(context->d_active_center_indices,
                                     input->active_center_indices,
                                     sizeof(int) * (size_t)input->n_active_centers,
@@ -4335,6 +4648,13 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
                                     sizeof(double),
                                     context->stream)) != FASTSASA_SUCCESS) {
         goto cuda_fail;
+    }
+    if (reuse_static) {
+        memcpy(context->static_key, static_key, sizeof(static_key));
+        context->static_n = input->n_atoms;
+    } else {
+        context->static_n = -1;
+        context->derived_mode = 0;
     }
     if (!use_soa_coords) {
         split_xyz_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(
@@ -4350,48 +4670,66 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
         goto cuda_fail;
     }
 
-    if ((active_center || aggregate_host) &&
-        cuda_status(cudaMemsetAsync(context->d_sasa, 0, sasa_bytes, context->stream)) != FASTSASA_SUCCESS) {
-        goto cuda_fail;
+    /* the mask kernel stores every centre's area, so a gathered read-back of the
+     * centres never sees the cleared entries. */
+    {
+        const int skip_sasa_clear = mask_sr && !aggregate_total &&
+                                    !aggregate_residues && sasa == NULL && compact_active_centers &&
+                                    input->active_center_indices != NULL;
+        if ((active_center || aggregate_host) && !skip_sasa_clear &&
+            cuda_status(cudaMemsetAsync(context->d_sasa, 0, sasa_bytes, context->stream)) != FASTSASA_SUCCESS) {
+            goto cuda_fail;
+        }
     }
 
-    if (float_sr) {
-        const int point_values = 3 * input->n_points;
-        const int point_blocks = (point_values + prep_threads - 1) / prep_threads;
-
-        double_to_shifted_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_x, min_x, context->d_xf);
-        if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
-        double_to_shifted_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_y, min_y, context->d_yf);
-        if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
-        double_to_shifted_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_z, min_z, context->d_zf);
-        if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
-        double_to_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii, context->d_radii_f);
-        if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
-        double_to_float_kernel<<<point_blocks, prep_threads, 0, context->stream>>>(point_values, context->d_test_points, context->d_test_points_f);
-        if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
-        square_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii_f, context->d_radii2_f);
-        if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
-        if (mask_sr) {
-            /* the mask kernel forms its cap thresholds from the double radii^2 */
-            square_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii, context->d_radii2);
-            if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
-        }
-    } else {
-        square_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii, context->d_radii2);
-        if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
-        if (hybrid_sr || mask_sr) {
-            /* Box-local float shadows feed the hybrid kernel's prefilter and
-             * the mask kernel's candidate scan. */
+    /* radii- and point-derived arrays are kept while those inputs are constant */
+    derived_mode = 1 + (float_sr ? 4 : 0) + (mask_sr ? 2 : 0) + (hybrid_sr || mask_sr ? 1 : 0);
+    {
+        const void *derived_key[4] = {context->d_radii_f, context->d_radii2_f, context->d_radii2, context->d_test_points_f};
+        const int keep_derived = static_hit && !points_uploaded && context->derived_mode == derived_mode &&
+                                 memcmp(derived_key, context->derived_key, sizeof(derived_key)) == 0;
+        const int shadows = !fused_shadows && (float_sr || hybrid_sr || mask_sr);
+        context->derived_mode = 0;
+        if (shadows) {
             double_to_shifted_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_x, min_x, context->d_xf);
             if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
             double_to_shifted_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_y, min_y, context->d_yf);
             if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
             double_to_shifted_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_z, min_z, context->d_zf);
             if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
-            double_to_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii2, context->d_radii2_f);
-            if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
+        }
+        if (keep_derived) {
+            /* d_radii_f, d_radii2_f, d_radii2 and d_test_points_f are as the last call left them */
+        } else if (float_sr) {
+            const int point_values = 3 * input->n_points;
+            const int point_blocks = (point_values + prep_threads - 1) / prep_threads;
+
             double_to_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii, context->d_radii_f);
             if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
+            double_to_float_kernel<<<point_blocks, prep_threads, 0, context->stream>>>(point_values, context->d_test_points, context->d_test_points_f);
+            if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
+            square_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii_f, context->d_radii2_f);
+            if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
+            if (mask_sr) {
+                /* the mask kernel forms its cap thresholds from the double radii^2 */
+                square_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii, context->d_radii2);
+                if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
+            }
+        } else {
+            square_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii, context->d_radii2);
+            if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
+            if (hybrid_sr || mask_sr) {
+                /* Box-local float shadows (above) feed the hybrid kernel's prefilter and
+                 * the mask kernel's candidate scan. */
+                double_to_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii2, context->d_radii2_f);
+                if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
+                double_to_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_radii, context->d_radii_f);
+                if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
+            }
+        }
+        if (reuse_static) {
+            context->derived_mode = derived_mode;
+            memcpy(context->derived_key, derived_key, sizeof(derived_key));
         }
     }
     if (profile_active &&
@@ -4399,7 +4737,15 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
         goto cuda_fail;
     }
 
-    if (cuda_status(cudaMemsetAsync(context->d_cell_counts, 0, cell_count_bytes, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
+    /* the mask kernel's result does not depend on the order of atoms within a cell */
+    drain_fill = mask_sr && !sort_cell_list;
+    if (context->counts_zero_ptr != context->d_cell_counts ||
+        context->counts_zero_capacity != context->cell_counts_capacity) {
+        context->counts_zero_cells = 0;
+    }
+    if ((!drain_fill || context->counts_zero_cells < n_cells) &&
+        cuda_status(cudaMemsetAsync(context->d_cell_counts, 0, cell_count_bytes, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
+    context->counts_zero_ptr = NULL;   /* set again once a drain fill has emptied the counts */
     cell_count_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(
         input->n_atoms,
         context->d_x,
@@ -4420,12 +4766,16 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
         goto cuda_fail;
     }
 
-    if (cuda_status(cudaMemsetAsync(context->d_cell_offsets,
+    if (!(drain_fill && context->offsets_zero_ptr == context->d_cell_offsets &&
+          context->offsets_zero_capacity == context->cell_offsets_capacity) &&
+        cuda_status(cudaMemsetAsync(context->d_cell_offsets,
                                     0,
                                     sizeof(int),
                                     context->stream)) != FASTSASA_SUCCESS) {
         goto cuda_fail;
     }
+    context->offsets_zero_ptr = context->d_cell_offsets;
+    context->offsets_zero_capacity = context->cell_offsets_capacity;
     if (cuda_status(cub::DeviceScan::InclusiveSum(context->d_cell_scan_storage,
                                                   context->cell_scan_storage_capacity,
                                                   context->d_cell_counts,
@@ -4456,6 +4806,18 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
                                                         context->stream)) != FASTSASA_SUCCESS) {
             goto cuda_fail;
         }
+    } else if (drain_fill) {
+        const int counted = context->counts_zero_cells > n_cells ? context->counts_zero_cells : n_cells;
+        cell_drain_fill_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(
+            input->n_atoms,
+            context->d_atom_cells,
+            context->d_cell_offsets,
+            context->d_cell_counts,
+            context->d_cell_atoms);
+        if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
+        context->counts_zero_ptr = context->d_cell_counts;
+        context->counts_zero_capacity = context->cell_counts_capacity;
+        context->counts_zero_cells = counted;
     } else {
         if (cuda_status(cudaMemcpyAsync(context->d_cell_fill,
                                         context->d_cell_offsets,
@@ -4476,6 +4838,39 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
         goto cuda_fail;
     }
 
+    if (context->defer_sr && mask_sr) {
+        MaskFrameArgs a = {input->n_atoms, input->n_points, context->d_x, context->d_y, context->d_z,
+                           context->d_radii, context->d_radii2, context->d_test_points,
+                           context->d_xf, context->d_yf, context->d_zf, context->d_radii_f,
+                           context->d_radii2_f, context->d_test_points_f,
+                           context->d_mask_table, context->mask_table_res, context->mask_table_tbins,
+                           context->mask_table_max_delta, context->mask_table_dot_pad, nx, ny, nz,
+                           context->d_atom_cells, context->d_cell_offsets, context->d_cell_atoms,
+                           compact_active_centers ? context->d_active_center_indices : NULL, sr_center_count,
+                           active_center ? context->d_selection_masks : NULL,
+                           active_center ? input->active_center_mask : 0u,
+                           context->d_mask_pending, context->d_mask_pending_slot,
+                           sasa != NULL || aggregate_host ? context->d_sasa : NULL, NULL};
+        static_assert(sizeof(MaskFrameArgs) <= sizeof(context->deferred_args), "deferred args");
+        memcpy(context->deferred_args, &a, sizeof(a));
+        context->deferred_words = (input->n_points + 63) / 64;
+        context->deferred_float = float_sr;
+        context->deferred_input = *input;
+        context->deferred_sasa = sasa;
+        context->deferred_total = total_sasa;
+        context->deferred_aggregate_host = aggregate_host;
+        context->deferred_aggregate_total = aggregate_total;
+        context->deferred_aggregate_residues = aggregate_residues;
+        context->deferred_compact = compact_active_centers;
+        if (context->deferred_event == NULL &&
+            cuda_status(cudaEventCreateWithFlags(&context->deferred_event, cudaEventDisableTiming)) != FASTSASA_SUCCESS) {
+            goto cuda_fail;
+        }
+        if (cuda_status(cudaEventRecord(context->deferred_event, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
+        context->deferred_ready = 1;
+        if (profile_active) destroy_profile_events(profile_events, PROFILE_EVENT_COUNT);
+        return FASTSASA_SUCCESS;
+    }
     if (mask_sr) {
         const int mask_threads = 128;
         const int mask_blocks = (sr_center_count + mask_threads - 1) / mask_threads;
@@ -4499,7 +4894,19 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
         case 1: FASTSASA_LAUNCH_MASK(1); break;
         case 2: FASTSASA_LAUNCH_MASK(2); break;
         case 3: FASTSASA_LAUNCH_MASK(3); break;
-        default: FASTSASA_LAUNCH_MASK(4); break;
+        case 4: FASTSASA_LAUNCH_MASK(4); break;
+        case 5: FASTSASA_LAUNCH_MASK(5); break;
+        case 6: FASTSASA_LAUNCH_MASK(6); break;
+        case 7: FASTSASA_LAUNCH_MASK(7); break;
+        case 8: FASTSASA_LAUNCH_MASK(8); break;
+        case 9: FASTSASA_LAUNCH_MASK(9); break;
+        case 10: FASTSASA_LAUNCH_MASK(10); break;
+        case 11: FASTSASA_LAUNCH_MASK(11); break;
+        case 12: FASTSASA_LAUNCH_MASK(12); break;
+        case 13: FASTSASA_LAUNCH_MASK(13); break;
+        case 14: FASTSASA_LAUNCH_MASK(14); break;
+        case 15: FASTSASA_LAUNCH_MASK(15); break;
+        default: FASTSASA_LAUNCH_MASK(16); break;
         }
 #undef FASTSASA_LAUNCH_MASK
 #undef FASTSASA_LAUNCH_MASK_P
@@ -4720,20 +5127,10 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
         goto cuda_fail;
     }
 
-    if (sasa != NULL &&
-        cuda_status(cudaMemcpyAsync(sasa, context->d_sasa, sasa_bytes, cudaMemcpyDeviceToHost, context->stream)) != FASTSASA_SUCCESS) {
-        goto cuda_fail;
-    }
-    if (aggregate_host) {
-        fastsasa_pending_aggregate *entry = NULL;
-
-        status = pending_aggregate_push(context, input, total_sasa, &entry);
-        if (status != FASTSASA_SUCCESS) goto status_fail;
-        if (cuda_status(cudaMemcpyAsync(entry->h_sasa, context->d_sasa, sasa_bytes,
-                                        cudaMemcpyDeviceToHost, context->stream)) != FASTSASA_SUCCESS) {
-            goto cuda_fail;
-        }
-    }
+    status = enqueue_sr_readback(context, input, sasa, total_sasa, aggregate_host, aggregate_total,
+                                 aggregate_residues, compact_active_centers);
+    if (status == FASTSASA_CUDA_ERROR) goto cuda_fail;
+    if (status != FASTSASA_SUCCESS) goto status_fail;
     if (profile_active &&
         cuda_status(cudaEventRecord(profile_events[PROFILE_AFTER_D2H], context->stream)) != FASTSASA_SUCCESS) {
         goto cuda_fail;
@@ -4767,10 +5164,12 @@ context_shrake_rupley_cell_list_impl(fastsasa_device_context *context,
     return FASTSASA_SUCCESS;
 
 status_fail:
+    forget_kept_state(context);
     if (profile_active) destroy_profile_events(profile_events, PROFILE_EVENT_COUNT);
     return status;
 
 cuda_fail:
+    forget_kept_state(context);
     if (profile_active) destroy_profile_events(profile_events, PROFILE_EVENT_COUNT);
     return FASTSASA_CUDA_ERROR;
 }
@@ -4989,6 +5388,9 @@ fastsasa_device_context_lee_richards(fastsasa_device_context *context,
             context->d_z);
         if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) goto cuda_fail;
     }
+    context->static_n = -1;
+    context->derived_mode = 0;
+    context->counts_zero_ptr = NULL;
     if (cuda_status(cudaMemcpyAsync(context->d_radii, input->radii, radii_bytes, cudaMemcpyHostToDevice, context->stream)) != FASTSASA_SUCCESS) goto cuda_fail;
     if (float_lr || use_lr_fp64_hybrid()) {
         double_to_shifted_float_kernel<<<prep_blocks, prep_threads, 0, context->stream>>>(input->n_atoms, context->d_x, min_x, context->d_xf);
@@ -5249,5 +5651,109 @@ fastsasa_device_context_shrake_rupley_csr_batch(fastsasa_device_context *context
         if (status != FASTSASA_SUCCESS) return status;
     }
 
+    return FASTSASA_SUCCESS;
+}
+
+
+/* Deferred SR for the batched mask launch (fastsasa_device_contexts_batched_sr). */
+int
+fastsasa_device_context_set_defer_sr(fastsasa_device_context *context, int on)
+{
+    if (context == NULL) return FASTSASA_INVALID_ARGUMENT;
+    context->defer_sr = on != 0;
+    return FASTSASA_SUCCESS;
+}
+
+/* One mask launch (on the first context's stream) for the deferred frames of n contexts, then each
+ * context's read-back on its own stream. All frames share the point count and precision. */
+int
+fastsasa_device_contexts_batched_sr(fastsasa_device_context *const *contexts, int n)
+{
+    if (contexts == NULL || n <= 0 || n > FASTSASA_MASK_BATCH_MAX) return FASTSASA_INVALID_ARGUMENT;
+    /* contexts that did not defer (no mask kernel for this call) already ran their SR */
+    fastsasa_device_context *ready[FASTSASA_MASK_BATCH_MAX];
+    int n_ready = 0;
+    for (int f = 0; f < n; ++f) if (contexts[f] != NULL && contexts[f]->deferred_ready) ready[n_ready++] = contexts[f];
+    if (n_ready == 0) return FASTSASA_SUCCESS;
+    contexts = ready;
+    n = n_ready;
+    fastsasa_device_context *lead = contexts[0];
+    MaskBatch batch;   /* kernel parameter, copied at launch */
+    int max_centers = 0;
+    for (int f = 0; f < n; ++f) {
+        fastsasa_device_context *c = contexts[f];
+        if (!c->deferred_ready || c->deferred_words != lead->deferred_words || c->deferred_float != lead->deferred_float) {
+            return FASTSASA_INVALID_ARGUMENT;
+        }
+        memcpy(&batch.f[f], c->deferred_args, sizeof(MaskFrameArgs));
+        if (batch.f[f].n_centers > max_centers) max_centers = batch.f[f].n_centers;
+        if (c != lead && cuda_status(cudaStreamWaitEvent(lead->stream, c->deferred_event, 0)) != FASTSASA_SUCCESS) {
+            return FASTSASA_CUDA_ERROR;
+        }
+    }
+    const int threads = 128;
+    const dim3 grid((unsigned)((max_centers + threads - 1) / threads), (unsigned)n);
+#define FASTSASA_LAUNCH_BATCH_P(WW, FL) \
+    shrake_rupley_cell_mask_batch_kernel<WW, FL><<<grid, threads, 0, lead->stream>>>(batch)
+#define FASTSASA_LAUNCH_BATCH(WW) do { if (lead->deferred_float) FASTSASA_LAUNCH_BATCH_P(WW, true); \
+                                       else FASTSASA_LAUNCH_BATCH_P(WW, false); } while (0)
+    switch (lead->deferred_words) {
+    case 1: FASTSASA_LAUNCH_BATCH(1); break;
+    case 2: FASTSASA_LAUNCH_BATCH(2); break;
+    case 3: FASTSASA_LAUNCH_BATCH(3); break;
+    case 4: FASTSASA_LAUNCH_BATCH(4); break;
+    case 5: FASTSASA_LAUNCH_BATCH(5); break;
+    case 6: FASTSASA_LAUNCH_BATCH(6); break;
+    case 7: FASTSASA_LAUNCH_BATCH(7); break;
+    case 8: FASTSASA_LAUNCH_BATCH(8); break;
+    case 9: FASTSASA_LAUNCH_BATCH(9); break;
+    case 10: FASTSASA_LAUNCH_BATCH(10); break;
+    case 11: FASTSASA_LAUNCH_BATCH(11); break;
+    case 12: FASTSASA_LAUNCH_BATCH(12); break;
+    case 13: FASTSASA_LAUNCH_BATCH(13); break;
+    case 14: FASTSASA_LAUNCH_BATCH(14); break;
+    case 15: FASTSASA_LAUNCH_BATCH(15); break;
+    default: FASTSASA_LAUNCH_BATCH(16); break;
+    }
+#undef FASTSASA_LAUNCH_BATCH
+#undef FASTSASA_LAUNCH_BATCH_P
+    if (cuda_status(cudaGetLastError()) != FASTSASA_SUCCESS) return FASTSASA_CUDA_ERROR;
+    if (lead->batch_done_event == NULL &&
+        cuda_status(cudaEventCreateWithFlags(&lead->batch_done_event, cudaEventDisableTiming)) != FASTSASA_SUCCESS) {
+        return FASTSASA_CUDA_ERROR;
+    }
+    if (cuda_status(cudaEventRecord(lead->batch_done_event, lead->stream)) != FASTSASA_SUCCESS) return FASTSASA_CUDA_ERROR;
+    for (int f = 0; f < n; ++f) {
+        fastsasa_device_context *c = contexts[f];
+        if (c != lead && cuda_status(cudaStreamWaitEvent(c->stream, lead->batch_done_event, 0)) != FASTSASA_SUCCESS) {
+            return FASTSASA_CUDA_ERROR;
+        }
+        const int status = enqueue_sr_readback(c, &c->deferred_input, c->deferred_sasa, c->deferred_total,
+                                               c->deferred_aggregate_host, c->deferred_aggregate_total,
+                                               c->deferred_aggregate_residues, c->deferred_compact);
+        c->deferred_ready = 0;
+        if (status != FASTSASA_SUCCESS) return status;
+    }
+    return FASTSASA_SUCCESS;
+}
+
+int
+fastsasa_device_context_set_f32_coords(fastsasa_device_context *context, const float *xyz_blocks, const double *bbox)
+{
+    if (context == NULL) return FASTSASA_INVALID_ARGUMENT;
+    context->h_coord_f = xyz_blocks;
+    context->h_bbox_valid = xyz_blocks != NULL && bbox != NULL;
+    if (context->h_bbox_valid) memcpy(context->h_bbox, bbox, sizeof(context->h_bbox));
+    return FASTSASA_SUCCESS;
+}
+
+int
+fastsasa_device_context_reset_static(fastsasa_device_context *context)
+{
+    if (context == NULL) return FASTSASA_INVALID_ARGUMENT;
+    /* host arrays of a new call can reuse the addresses of the last call's */
+    forget_kept_state(context);
+    context->h_coord_f = NULL;
+    context->h_bbox_valid = 0;
     return FASTSASA_SUCCESS;
 }

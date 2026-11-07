@@ -217,3 +217,35 @@ fastsasa_device_last_error(void)
 {
     return fastsasa_no_device_error;
 }
+
+int
+fastsasa_device_context_set_defer_sr(fastsasa_device_context *context, int on)
+{
+    (void)context;
+    (void)on;
+    return FASTSASA_NO_DEVICE;
+}
+
+int
+fastsasa_device_contexts_batched_sr(fastsasa_device_context *const *contexts, int n)
+{
+    (void)contexts;
+    (void)n;
+    return FASTSASA_NO_DEVICE;
+}
+
+int
+fastsasa_device_context_set_f32_coords(fastsasa_device_context *context, const float *xyz_blocks, const double *bbox)
+{
+    (void)context;
+    (void)xyz_blocks;
+    (void)bbox;
+    return FASTSASA_NO_DEVICE;
+}
+
+int
+fastsasa_device_context_reset_static(fastsasa_device_context *context)
+{
+    (void)context;
+    return FASTSASA_NO_DEVICE;
+}

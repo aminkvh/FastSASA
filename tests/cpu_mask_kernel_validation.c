@@ -233,7 +233,7 @@ static void
 structure_cases(const char *path)
 {
     fastsasa_owned_topology topology;
-    const int n_points_list[] = {1, 2, 7, 63, 64, 65, 100, 128, 129, 200, 255};
+    const int n_points_list[] = {1, 2, 7, 63, 64, 65, 100, 128, 129, 200, 255, 256, 257, 320, 500, 512, 513, 960, 1000, 1024};
     char name[256];
 
     /* the reader returns 1 on success */
@@ -344,14 +344,14 @@ synthetic_cases(void)
     {
         /* unsupported point count: mask kernel declines, reference works */
         const double x[2] = {0, 3.0}, y[2] = {0, 0}, z[2] = {0, 0}, r[2] = {3.0, 3.0};
-        double *points = fibonacci_points(256);
+        double *points = fibonacci_points(1025);
         double out[2];
-        const int st = fastsasa_cpu_shrake_rupley_mask(2, 256, x, y, z, r, points, 1, out);
-        if (st != -100) { printf("FAIL 256 points: mask kernel returned %d, expected -100\n", st); ++failures; }
-        else printf("ok   256 points declined by the mask kernel (-100)\n");
-        if (fastsasa_cpu_mask_policy(2, 256, points, 1) != 0) { printf("FAIL policy accepted 256 points\n"); ++failures; }
-        if (fastsasa_cpu_shrake_rupley(2, 256, x, y, z, r, points, 1, out) != FASTSASA_SUCCESS) {
-            printf("FAIL reference path failed at 256 points\n"); ++failures;
+        const int st = fastsasa_cpu_shrake_rupley_mask(2, 1025, x, y, z, r, points, 1, out);
+        if (st != -100) { printf("FAIL 1025 points: mask kernel returned %d, expected -100\n", st); ++failures; }
+        else printf("ok   1025 points declined by the mask kernel (-100)\n");
+        if (fastsasa_cpu_mask_policy(2, 1025, points, 1) != 0) { printf("FAIL policy accepted 1025 points\n"); ++failures; }
+        if (fastsasa_cpu_shrake_rupley(2, 1025, x, y, z, r, points, 1, out) != FASTSASA_SUCCESS) {
+            printf("FAIL reference path failed at 1025 points\n"); ++failures;
         }
         free(points);
     }

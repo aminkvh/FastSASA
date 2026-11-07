@@ -67,8 +67,11 @@ static inline int fastsasa_popcount64(std::uint64_t v) { return __builtin_popcou
 
 namespace {
 
-constexpr int kMaxWords = 4;                 /* up to 256 test points */
-constexpr int kMaxPoints = 255;              /* largest supported point count */
+#ifndef FASTSASA_MASK_MAX_WORDS
+#define FASTSASA_MASK_MAX_WORDS 16
+#endif
+constexpr int kMaxWords = FASTSASA_MASK_MAX_WORDS;   /* 64 test points per word */
+constexpr int kMaxPoints = 64 * kMaxWords;           /* largest supported point count */
 constexpr int kUnsupported = -100;
 #ifndef FASTSASA_MASK_TBINS
 #define FASTSASA_MASK_TBINS 64
@@ -1112,10 +1115,13 @@ mask_kernel(int n_atoms, int n_points, const double *x, const double *y, const d
 
     fastsasa_cpu::WorkerPool::run(count, [&](int tid) {
         switch (words) {
-        case 1: worker_impl<1>(args, tid); break;
-        case 2: worker_impl<2>(args, tid); break;
-        case 3: worker_impl<3>(args, tid); break;
-        default: worker_impl<4>(args, tid); break;
+#define FASTSASA_MASK_CASE(n) case n: if (n <= kMaxWords) worker_impl<(n <= kMaxWords ? n : 1)>(args, tid); break;
+        FASTSASA_MASK_CASE(1) FASTSASA_MASK_CASE(2) FASTSASA_MASK_CASE(3) FASTSASA_MASK_CASE(4)
+        FASTSASA_MASK_CASE(5) FASTSASA_MASK_CASE(6) FASTSASA_MASK_CASE(7) FASTSASA_MASK_CASE(8)
+        FASTSASA_MASK_CASE(9) FASTSASA_MASK_CASE(10) FASTSASA_MASK_CASE(11) FASTSASA_MASK_CASE(12)
+        FASTSASA_MASK_CASE(13) FASTSASA_MASK_CASE(14) FASTSASA_MASK_CASE(15) FASTSASA_MASK_CASE(16)
+#undef FASTSASA_MASK_CASE
+        default: break;
         }
     });
     if (want_stats) {

@@ -22,6 +22,12 @@ int fastsasa_device_context_last_cell_profile(fastsasa_device_context *context,
 int fastsasa_device_host_alloc(void **ptr,
                              size_t bytes);
 void fastsasa_device_host_free(void *ptr);
+/* Deferred SR and one mask launch over several contexts' frames; float coordinate upload. */
+int fastsasa_device_context_set_defer_sr(fastsasa_device_context *context, int on);
+int fastsasa_device_contexts_batched_sr(fastsasa_device_context *const *contexts, int n);
+int fastsasa_device_context_set_f32_coords(fastsasa_device_context *context, const float *xyz_blocks, const double *bbox);
+/* Forget inputs kept from earlier calls (they are matched by host pointer). */
+int fastsasa_device_context_reset_static(fastsasa_device_context *context);
 
 int fastsasa_device_shrake_rupley_csr(const fastsasa_device_sr_input *input,
                                     double *sasa);

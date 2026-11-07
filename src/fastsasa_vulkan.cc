@@ -47,6 +47,47 @@ namespace {
 #include "fastsasa_vk_sr_mask_fp32_w3_spv.h"
 #include "fastsasa_vk_sr_mask_fp64_w4_spv.h"
 #include "fastsasa_vk_sr_mask_fp32_w4_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w5_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w5_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w6_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w6_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w7_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w7_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w8_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w8_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w9_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w9_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w10_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w10_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w11_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w11_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w12_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w12_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w13_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w13_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w14_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w14_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w15_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w15_spv.h"
+#include "fastsasa_vk_sr_mask_fp64_w16_spv.h"
+#include "fastsasa_vk_sr_mask_fp32_w16_spv.h"
+
+/* mask SR shaders by 64-point word count (up to 1,024 points) */
+constexpr int kVkMaskMaxWords = 16;
+#define FASTSASA_VK_MASK_BLOBS(p) \
+    {fastsasa_vk_sr_mask_##p##_w1_spv, fastsasa_vk_sr_mask_##p##_w2_spv, fastsasa_vk_sr_mask_##p##_w3_spv, \
+     fastsasa_vk_sr_mask_##p##_w4_spv, fastsasa_vk_sr_mask_##p##_w5_spv, fastsasa_vk_sr_mask_##p##_w6_spv, \
+     fastsasa_vk_sr_mask_##p##_w7_spv, fastsasa_vk_sr_mask_##p##_w8_spv, fastsasa_vk_sr_mask_##p##_w9_spv, \
+     fastsasa_vk_sr_mask_##p##_w10_spv, fastsasa_vk_sr_mask_##p##_w11_spv, fastsasa_vk_sr_mask_##p##_w12_spv, \
+     fastsasa_vk_sr_mask_##p##_w13_spv, fastsasa_vk_sr_mask_##p##_w14_spv, fastsasa_vk_sr_mask_##p##_w15_spv, \
+     fastsasa_vk_sr_mask_##p##_w16_spv}
+#define FASTSASA_VK_MASK_LENS(p) \
+    {fastsasa_vk_sr_mask_##p##_w1_spv_len, fastsasa_vk_sr_mask_##p##_w2_spv_len, fastsasa_vk_sr_mask_##p##_w3_spv_len, \
+     fastsasa_vk_sr_mask_##p##_w4_spv_len, fastsasa_vk_sr_mask_##p##_w5_spv_len, fastsasa_vk_sr_mask_##p##_w6_spv_len, \
+     fastsasa_vk_sr_mask_##p##_w7_spv_len, fastsasa_vk_sr_mask_##p##_w8_spv_len, fastsasa_vk_sr_mask_##p##_w9_spv_len, \
+     fastsasa_vk_sr_mask_##p##_w10_spv_len, fastsasa_vk_sr_mask_##p##_w11_spv_len, fastsasa_vk_sr_mask_##p##_w12_spv_len, \
+     fastsasa_vk_sr_mask_##p##_w13_spv_len, fastsasa_vk_sr_mask_##p##_w14_spv_len, fastsasa_vk_sr_mask_##p##_w15_spv_len, \
+     fastsasa_vk_sr_mask_##p##_w16_spv_len}
 
 constexpr uint32_t kBinThreads = 128;
 constexpr uint32_t kSrThreads = 64;
@@ -295,8 +336,8 @@ struct fastsasa_vk_context {
     VkShaderModule lr_reduce_fp64_shader = VK_NULL_HANDLE;
     VkShaderModule sr_exposed_points_fp64_shader = VK_NULL_HANDLE;
     /* mask-accelerated SR: [fp32/fp64][words-1] */
-    VkShaderModule sr_mask_shader[2][4]{};
-    VkPipeline sr_mask_pipeline[2][4]{};
+    VkShaderModule sr_mask_shader[2][kVkMaskMaxWords]{};
+    VkPipeline sr_mask_pipeline[2][kVkMaskMaxWords]{};
     bool mask_sr = false;                 /* device can run the mask shaders */
     bool mask_sr_active = false;          /* the current dispatch uses one */
     bool mask_sr_ready = false;           /* prepared for the current dispatch */
@@ -732,11 +773,9 @@ void initialize(fastsasa_vk_context *context, int device_index)
     context->sr32_pipeline = make_pipeline(context, context->sr32_shader);
     context->sr64_pipeline = make_pipeline(context, context->sr64_shader);
     if (context->mask_sr) {
-        const unsigned char *fp32_blobs[4] = {fastsasa_vk_sr_mask_fp32_w1_spv, fastsasa_vk_sr_mask_fp32_w2_spv,
-                                              fastsasa_vk_sr_mask_fp32_w3_spv, fastsasa_vk_sr_mask_fp32_w4_spv};
-        const unsigned int fp32_lens[4] = {fastsasa_vk_sr_mask_fp32_w1_spv_len, fastsasa_vk_sr_mask_fp32_w2_spv_len,
-                                           fastsasa_vk_sr_mask_fp32_w3_spv_len, fastsasa_vk_sr_mask_fp32_w4_spv_len};
-        for (int w = 0; w < 4; ++w) {
+        const unsigned char *fp32_blobs[kVkMaskMaxWords] = FASTSASA_VK_MASK_BLOBS(fp32);
+        const unsigned int fp32_lens[kVkMaskMaxWords] = FASTSASA_VK_MASK_LENS(fp32);
+        for (int w = 0; w < kVkMaskMaxWords; ++w) {
             context->sr_mask_shader[0][w] = make_shader(context, fp32_blobs[w], fp32_lens[w]);
             context->sr_mask_pipeline[0][w] = make_pipeline(context, context->sr_mask_shader[0][w]);
         }
@@ -784,11 +823,9 @@ void initialize(fastsasa_vk_context *context, int device_index)
             context, fastsasa_vk_sr_exposed_points_fp64_64_spv,
             fastsasa_vk_sr_exposed_points_fp64_64_spv_len);
         if (context->mask_sr) {
-            const unsigned char *fp64_blobs[4] = {fastsasa_vk_sr_mask_fp64_w1_spv, fastsasa_vk_sr_mask_fp64_w2_spv,
-                                                  fastsasa_vk_sr_mask_fp64_w3_spv, fastsasa_vk_sr_mask_fp64_w4_spv};
-            const unsigned int fp64_lens[4] = {fastsasa_vk_sr_mask_fp64_w1_spv_len, fastsasa_vk_sr_mask_fp64_w2_spv_len,
-                                               fastsasa_vk_sr_mask_fp64_w3_spv_len, fastsasa_vk_sr_mask_fp64_w4_spv_len};
-            for (int w = 0; w < 4; ++w) {
+            const unsigned char *fp64_blobs[kVkMaskMaxWords] = FASTSASA_VK_MASK_BLOBS(fp64);
+            const unsigned int fp64_lens[kVkMaskMaxWords] = FASTSASA_VK_MASK_LENS(fp64);
+            for (int w = 0; w < kVkMaskMaxWords; ++w) {
                 context->sr_mask_shader[1][w] = make_shader(context, fp64_blobs[w], fp64_lens[w]);
                 context->sr_mask_pipeline[1][w] = make_pipeline(context, context->sr_mask_shader[1][w]);
             }
@@ -932,7 +969,7 @@ bool prepare_mask_resources(fastsasa_vk_context *context,
 {
     context->mask_sr_ready = false;
     context->mask_trial = -1;
-    if (!context->mask_sr || point_count == 0u || point_count > 255u || sphere_xyz == nullptr) return false;
+    if (!context->mask_sr || point_count == 0u || point_count > 64u * kVkMaskMaxWords || sphere_xyz == nullptr) return false;
     const bool same_points =
         context->mask_table.handle != VK_NULL_HANDLE &&
         context->mask_table_n_points == static_cast<int>(point_count) &&
@@ -2122,7 +2159,7 @@ extern "C" void fastsasa_vk_context_free(fastsasa_vk_context *context)
     destroy_buffer(context, &context->mask_pending_slot);
     destroy_buffer(context, &context->placeholder);
     if (context->profile_pool != VK_NULL_HANDLE) vkDestroyQueryPool(context->device, context->profile_pool, nullptr);
-    for (int pr = 0; pr < 2; ++pr) for (int w = 0; w < 4; ++w) {
+    for (int pr = 0; pr < 2; ++pr) for (int w = 0; w < kVkMaskMaxWords; ++w) {
         if (context->sr_mask_pipeline[pr][w] != VK_NULL_HANDLE) vkDestroyPipeline(context->device, context->sr_mask_pipeline[pr][w], nullptr);
         if (context->sr_mask_shader[pr][w] != VK_NULL_HANDLE) vkDestroyShaderModule(context->device, context->sr_mask_shader[pr][w], nullptr);
     }
