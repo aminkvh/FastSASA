@@ -1,0 +1,68 @@
+#version 450
+
+// Frames uploaded as float x, y, z (exact: they were read from float
+// trajectory files): widen them into the atom records the other shaders read,
+// with the radii kept on the device, so each frame moves 12 bytes per atom
+// over the bus instead of a full record. FP32 builds also write the
+// grid-local FP32 shadow, exactly as the host computes it.
+
+#ifdef FASTSASA_FP64
+#extension GL_ARB_gpu_shader_fp64 : require
+#define REAL double
+#define REAL3 dvec3
+#define REAL4 dvec4
+#else
+#define REAL float
+#define REAL3 vec3
+#define REAL4 vec4
+#endif
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std430) writeonly buffer Atoms {
+    REAL4 values[];
+} atoms;
+
+layout(set = 0, binding = 6, std430) writeonly buffer Shadow {
+    vec4 values[];
+} shadow;
+
+layout(set = 0, binding = 13, std430) readonly buffer Coords {
+    float values[];
+} coords;
+
+layout(set = 0, binding = 14, std430) readonly buffer Radii {
+    REAL values[];
+} radii;
+
+layout(set = 0, binding = 15, std430) readonly buffer ShadowRadii {
+    float values[];
+} shadow_r2;
+
+layout(push_constant) uniform Parameters {
+    uint atom_count;
+    uint point_count;
+    uint center_count;
+    uint base_index;
+    uint dim_x;
+    uint dim_y;
+    uint dim_z;
+    REAL probe_radius;
+    REAL cell_size;
+    REAL min_x;
+    REAL min_y;
+    REAL min_z;
+    REAL margin;
+} params;
+
+void main()
+{
+    const uint atom = gl_GlobalInvocationID.x + params.base_index;
+    if (atom >= params.atom_count) return;
+    const REAL3 p = REAL3(coords.values[3u * atom], coords.values[3u * atom + 1u], coords.values[3u * atom + 2u]);
+    atoms.values[atom] = REAL4(p, radii.values[atom]);
+#ifndef FASTSASA_FP64
+    precise vec3 local = p - vec3(params.min_x, params.min_y, params.min_z);
+    shadow.values[atom] = vec4(local, shadow_r2.values[atom]);
+#endif
+}

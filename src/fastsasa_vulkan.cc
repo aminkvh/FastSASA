@@ -25,6 +25,8 @@ namespace {
 #include "fastsasa_vk_cell_scan_spv.h"
 #include "fastsasa_vk_cell_fill_spv.h"
 #include "fastsasa_vk_cell_gather_spv.h"
+#include "fastsasa_vk_widen_spv.h"
+#include "fastsasa_vk_widen_fp64_spv.h"
 #include "fastsasa_vk_sr_cell_list_32_spv.h"
 #include "fastsasa_vk_sr_cell_list_64_spv.h"
 #include "fastsasa_vk_sr_cell_list_sg_spv.h"
@@ -91,6 +93,16 @@ constexpr int kVkMaskMaxWords = 16;
 
 constexpr uint32_t kBinThreads = 128;
 constexpr uint32_t kSrThreads = 64;
+/* Frames of a batch in flight on the device at once (calculate_frames): each
+ * has its own atom, grid and area buffers, and every stage is recorded for
+ * all of them before the barrier that orders it, so one frame's short
+ * dispatches overlap the others' instead of draining the device between
+ * stages. */
+constexpr uint32_t kVkFrameSlots = 8;
+constexpr VkDeviceSize kVkFrameSlotBytes = 512ull * 1024ull * 1024ull;   /* cap on the extra slots */
+/* Storage-buffer bindings of the shared descriptor layout (13-15: float frame
+ * upload, see widen.comp). */
+constexpr uint32_t kVkBindings = 16;
 /* Below this many centres per dispatch the point-parallel reference shaders
  * win (FASTSASA_MASK_MIN_CENTERS overrides it); below this many centre-frames
  * per context the table setup does not pay for itself. Both measured on an
@@ -322,6 +334,8 @@ struct fastsasa_vk_context {
     VkShaderModule fill_shader = VK_NULL_HANDLE;
     VkShaderModule gather_shader = VK_NULL_HANDLE;
     VkShaderModule gather_fp64_shader = VK_NULL_HANDLE;
+    VkShaderModule widen_shader[2]{};     /* [fp32/fp64] */
+    VkPipeline widen_pipeline[2]{};
     VkShaderModule sr32_shader = VK_NULL_HANDLE;
     VkShaderModule sr64_shader = VK_NULL_HANDLE;
     VkShaderModule sr_sg_shader = VK_NULL_HANDLE;
@@ -406,6 +420,19 @@ struct fastsasa_vk_context {
     Buffer staging_exposed_points;
     Buffer atoms_shadow;
     Buffer staging_atoms_shadow;
+    /* float frame upload (widen.comp): staged x, y, z per frame, and the radii (and FP32 shadow r^2) */
+    Buffer staging_coords;
+    Buffer coords;
+    Buffer atom_radii;
+    Buffer shadow_r2;
+    Buffer staging_constants;
+    /* Frame slots 1.. (slot 0 is the buffers above); see kVkFrameSlots. */
+    struct FrameSlot {
+        Buffer atoms, atoms_shadow, heads, next, cell_counts, atoms_shadow_sorted, areas;
+        Buffer mask_pending, mask_pending_slot, coords;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+    };
+    FrameSlot frame_slots[kVkFrameSlots - 1];
     std::string error;
 };
 
@@ -720,8 +747,8 @@ void initialize(fastsasa_vk_context *context, int device_index)
           "vkCreateDevice");
     vkGetDeviceQueue(context->device, context->queue_family, 0, &context->queue);
 
-    VkDescriptorSetLayoutBinding bindings[13]{};
-    for (uint32_t i = 0; i < 13; ++i) {
+    VkDescriptorSetLayoutBinding bindings[kVkBindings]{};
+    for (uint32_t i = 0; i < kVkBindings; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
@@ -729,7 +756,7 @@ void initialize(fastsasa_vk_context *context, int device_index)
     }
     VkDescriptorSetLayoutCreateInfo descriptor_info{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    descriptor_info.bindingCount = 13;
+    descriptor_info.bindingCount = kVkBindings;
     descriptor_info.pBindings = bindings;
     check(vkCreateDescriptorSetLayout(context->device, &descriptor_info, nullptr,
                                       &context->descriptor_layout),
@@ -770,6 +797,8 @@ void initialize(fastsasa_vk_context *context, int device_index)
     context->scan_pipeline = make_pipeline(context, context->scan_shader);
     context->fill_pipeline = make_pipeline(context, context->fill_shader);
     context->gather_pipeline = make_pipeline(context, context->gather_shader);
+    context->widen_shader[0] = make_shader(context, fastsasa_vk_widen_spv, fastsasa_vk_widen_spv_len);
+    context->widen_pipeline[0] = make_pipeline(context, context->widen_shader[0]);
     context->sr32_pipeline = make_pipeline(context, context->sr32_shader);
     context->sr64_pipeline = make_pipeline(context, context->sr64_shader);
     if (context->mask_sr) {
@@ -813,6 +842,8 @@ void initialize(fastsasa_vk_context *context, int device_index)
         context->count_fp64_pipeline = make_pipeline(context, context->count_fp64_shader);
         context->fill_fp64_pipeline = make_pipeline(context, context->fill_fp64_shader);
         context->gather_fp64_pipeline = make_pipeline(context, context->gather_fp64_shader);
+        context->widen_shader[1] = make_shader(context, fastsasa_vk_widen_fp64_spv, fastsasa_vk_widen_fp64_spv_len);
+        context->widen_pipeline[1] = make_pipeline(context, context->widen_shader[1]);
         context->sr_fp64_32_pipeline = make_pipeline(context, context->sr_fp64_32_shader);
         context->sr_fp64_64_pipeline = make_pipeline(context, context->sr_fp64_64_shader);
         if (context->subgroup_sr) context->sr_fp64_sg_pipeline = make_pipeline(context, context->sr_fp64_sg_shader);
@@ -834,9 +865,9 @@ void initialize(fastsasa_vk_context *context, int device_index)
             context, context->sr_exposed_points_fp64_shader);
     }
 
-    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 13};
+    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kVkBindings * kVkFrameSlots};
     VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pool_info.maxSets = 1;
+    pool_info.maxSets = kVkFrameSlots;
     pool_info.poolSizeCount = 1;
     pool_info.pPoolSizes = &pool_size;
     check(vkCreateDescriptorPool(context->device, &pool_info, nullptr,
@@ -849,6 +880,11 @@ void initialize(fastsasa_vk_context *context, int device_index)
     check(vkAllocateDescriptorSets(context->device, &set_info,
                                    &context->descriptor_set),
           "vkAllocateDescriptorSets");
+    for (uint32_t slot = 1; slot < kVkFrameSlots; ++slot) {
+        check(vkAllocateDescriptorSets(context->device, &set_info,
+                                       &context->frame_slots[slot - 1].set),
+              "vkAllocateDescriptorSets");
+    }
 
     VkCommandPoolCreateInfo command_pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     command_pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -864,18 +900,47 @@ void initialize(fastsasa_vk_context *context, int device_index)
           "vkAllocateCommandBuffers");
 }
 
+/* The buffers one frame's dispatches use: frame slot 0 is the context's own,
+ * slots 1.. are frame_slots[slot - 1]. Points, centres and the mask table
+ * and parameters are shared by every slot. */
+struct SlotBuffers {
+    Buffer *atoms, *atoms_shadow, *heads, *next, *cell_counts, *atoms_shadow_sorted, *areas;
+    Buffer *mask_pending, *mask_pending_slot, *coords;
+    VkDescriptorSet set;
+};
+
+SlotBuffers slot_buffers(fastsasa_vk_context *context, uint32_t slot)
+{
+    if (slot == 0) {
+        return {&context->atoms, &context->atoms_shadow, &context->heads, &context->next,
+                &context->cell_counts, &context->atoms_shadow_sorted, &context->areas,
+                &context->mask_pending, &context->mask_pending_slot, &context->coords, context->descriptor_set};
+    }
+    fastsasa_vk_context::FrameSlot &f = context->frame_slots[slot - 1];
+    return {&f.atoms, &f.atoms_shadow, &f.heads, &f.next, &f.cell_counts, &f.atoms_shadow_sorted,
+            &f.areas, &f.mask_pending, &f.mask_pending_slot, &f.coords, f.set};
+}
+
+void write_descriptor_set(fastsasa_vk_context *context, const SlotBuffers &b);
+
 void update_descriptors(fastsasa_vk_context *context)
 {
-    Buffer *buffers[13] = {&context->atoms, &context->points, &context->heads,
-                           &context->next, &context->centers, &context->areas,
-                           &context->atoms_shadow, &context->cell_counts,
-                           &context->atoms_shadow_sorted,
-                           &context->mask_params, &context->mask_table,
-                           &context->mask_pending, &context->mask_pending_slot};
-    /* The mask buffers exist only once a mask dispatch has needed them;
+    write_descriptor_set(context, slot_buffers(context, 0));
+}
+
+void write_descriptor_set(fastsasa_vk_context *context, const SlotBuffers &b)
+{
+    Buffer *buffers[kVkBindings] = {b.atoms, &context->points, b.heads,
+                                    b.next, &context->centers, b.areas,
+                                    b.atoms_shadow, b.cell_counts,
+                                    b.atoms_shadow_sorted,
+                                    &context->mask_params, &context->mask_table,
+                                    b.mask_pending, b.mask_pending_slot,
+                                    b.coords, &context->atom_radii, &context->shadow_r2};
+    /* The mask and float-upload buffers exist only once a dispatch has needed them;
      * bind a shared placeholder until then (the real buffers are created
      * with their own memory types later, so they must not be pre-made here). */
-    for (uint32_t i = 9; i < 13; ++i) {
+    for (uint32_t i = 9; i < kVkBindings; ++i) {
         if (buffers[i]->handle == VK_NULL_HANDLE) {
             ensure_buffer(context, &context->placeholder, 16,
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -883,18 +948,18 @@ void update_descriptors(fastsasa_vk_context *context)
             buffers[i] = &context->placeholder;
         }
     }
-    VkDescriptorBufferInfo infos[13]{};
-    VkWriteDescriptorSet writes[13]{};
-    for (uint32_t i = 0; i < 13; ++i) {
+    VkDescriptorBufferInfo infos[kVkBindings]{};
+    VkWriteDescriptorSet writes[kVkBindings]{};
+    for (uint32_t i = 0; i < kVkBindings; ++i) {
         infos[i] = {buffers[i]->handle, 0, buffers[i]->capacity};
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = context->descriptor_set;
+        writes[i].dstSet = b.set;
         writes[i].dstBinding = i;
         writes[i].descriptorCount = 1;
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &infos[i];
     }
-    vkUpdateDescriptorSets(context->device, 13, writes, 0, nullptr);
+    vkUpdateDescriptorSets(context->device, kVkBindings, writes, 0, nullptr);
 }
 
 
@@ -1566,14 +1631,18 @@ int calculate_frames(fastsasa_vk_context *context,
         /* The FP64 gather shader derives the shadow on the device. */
         const bool host_shadow = sr_hybrid && !use_fp64;
         const size_t shadow_count = host_shadow ? record_count : 1u;
-        ensure_buffer(context, &context->staging_atoms,
-                      sizeof(Vec4T<Real>) * record_count,
-                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT, readback_memory_flags(context->physical));
-        ensure_buffer(context, &context->staging_atoms_shadow,
-                      host_shadow ? sizeof(Vec4T<float>) * shadow_count : 4u,
-                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT, readback_memory_flags(context->physical));
-        Vec4T<Real> *const atoms = static_cast<Vec4T<Real> *>(context->staging_atoms.mapped);
-        Vec4T<float> *const shadow = static_cast<Vec4T<float> *>(context->staging_atoms_shadow.mapped);
+        /* Frames that are exactly representable as floats (read from float
+         * trajectory files) are staged as float x, y, z and widened on the
+         * device (widen.comp): 12 bytes per atom cross the bus instead of a
+         * record. Staging is write-combined: the host only writes it. */
+        const VkMemoryPropertyFlags staging_memory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        bool f32_upload = !lee_richards;
+        if (f32_upload) {
+            ensure_buffer(context, &context->staging_coords, sizeof(float) * 3u * record_count,
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging_memory);
+        }
+        float *const coords_out = f32_upload ? static_cast<float *>(context->staging_coords.mapped) : nullptr;
         std::vector<Vec4T<Real>> points(lee_richards ? 1u : resolution);
         std::vector<uint32_t> centers(center_count);
         std::vector<ParametersT<Real>> parameters(frame_count);
@@ -1605,8 +1674,17 @@ int calculate_frames(fastsasa_vk_context *context,
                 if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
                     throw std::runtime_error("frame coordinates must be finite");
                 }
-                atoms[static_cast<size_t>(frame) * atom_count + atom] =
-                    {x, y, z, static_cast<Real>(radii[atom])};
+                if (f32_upload) {
+                    const float fx = static_cast<float>(frame_xyz[input]);
+                    const float fy = static_cast<float>(frame_xyz[input + 1u]);
+                    const float fz = static_cast<float>(frame_xyz[input + 2u]);
+                    coords_out[input] = fx;
+                    coords_out[input + 1u] = fy;
+                    coords_out[input + 2u] = fz;
+                    f32_upload = static_cast<double>(fx) == frame_xyz[input] &&
+                                 static_cast<double>(fy) == frame_xyz[input + 1u] &&
+                                 static_cast<double>(fz) == frame_xyz[input + 2u];
+                }
                 min_x = std::min(min_x, x);
                 min_y = std::min(min_y, y);
                 min_z = std::min(min_z, z);
@@ -1614,24 +1692,7 @@ int calculate_frames(fastsasa_vk_context *context,
                 max_y = std::max(max_y, y);
                 max_z = std::max(max_z, z);
             }
-            const auto tp1 = std::chrono::steady_clock::now();
-            if (host_shadow) {
-                /* Grid-local FP32 shadow; see calculate(). */
-                /* Read the source coordinates again rather than the staging
-                 * records: staging memory may be uncached for the host. */
-                for (uint32_t atom = 0; atom < atom_count; ++atom) {
-                    const size_t slot = static_cast<size_t>(frame) * atom_count + atom;
-                    const size_t input = 3ull * slot;
-                    const double expanded = radii[atom] + probe_radius;
-                    shadow[slot] = {(float)(static_cast<Real>(frame_xyz[input]) - min_x),
-                                    (float)(static_cast<Real>(frame_xyz[input + 1u]) - min_y),
-                                    (float)(static_cast<Real>(frame_xyz[input + 2u]) - min_z),
-                                    (float)(expanded * expanded)};
-                }
-            }
-            const auto tp2 = std::chrono::steady_clock::now();
-            t_pack += std::chrono::duration<double, std::milli>(tp1 - tp0).count();
-            t_shadow += std::chrono::duration<double, std::milli>(tp2 - tp1).count();
+            t_pack += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
             auto dimension = [cell_size](Real minimum, Real maximum) {
                 const double value = std::floor((static_cast<double>(maximum) - minimum) /
                                                 cell_size) + 1.0;
@@ -1657,6 +1718,51 @@ int calculate_frames(fastsasa_vk_context *context,
                                            static_cast<double>(cell_size),
                                            dim_x, dim_y, dim_z)
                                      : 0.0)};
+        }
+        if (!f32_upload) {
+            /* full records (and the FP32 path's grid-local shadow, see calculate()) */
+            const auto tr0 = std::chrono::steady_clock::now();
+            ensure_buffer(context, &context->staging_atoms, sizeof(Vec4T<Real>) * record_count,
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging_memory);
+            ensure_buffer(context, &context->staging_atoms_shadow,
+                          host_shadow ? sizeof(Vec4T<float>) * shadow_count : 4u,
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging_memory);
+            Vec4T<Real> *const atoms = static_cast<Vec4T<Real> *>(context->staging_atoms.mapped);
+            Vec4T<float> *const shadow = static_cast<Vec4T<float> *>(context->staging_atoms_shadow.mapped);
+            for (uint32_t frame = 0; frame < frame_count; ++frame) {
+                const ParametersT<Real> &fp = parameters[frame];
+                for (uint32_t atom = 0; atom < atom_count; ++atom) {
+                    const size_t slot = static_cast<size_t>(frame) * atom_count + atom;
+                    const size_t input = 3ull * slot;
+                    const Real x = static_cast<Real>(frame_xyz[input]);
+                    const Real y = static_cast<Real>(frame_xyz[input + 1u]);
+                    const Real z = static_cast<Real>(frame_xyz[input + 2u]);
+                    atoms[slot] = {x, y, z, static_cast<Real>(radii[atom])};
+                    if (host_shadow) {
+                        const double expanded = radii[atom] + probe_radius;
+                        shadow[slot] = {(float)(x - fp.min_x), (float)(y - fp.min_y), (float)(z - fp.min_z),
+                                        (float)(expanded * expanded)};
+                    }
+                }
+            }
+            t_shadow += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tr0).count();
+        } else {
+            /* per-atom constants for widen.comp */
+            ensure_buffer(context, &context->staging_constants, (sizeof(Real) + sizeof(float)) * atom_count,
+                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging_memory);
+            ensure_buffer(context, &context->atom_radii, sizeof(Real) * atom_count,
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            ensure_buffer(context, &context->shadow_r2, sizeof(float) * atom_count,
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            Real *const radii_out = static_cast<Real *>(context->staging_constants.mapped);
+            float *const r2_out = reinterpret_cast<float *>(radii_out + atom_count);
+            for (uint32_t atom = 0; atom < atom_count; ++atom) {
+                const double expanded = radii[atom] + probe_radius;
+                radii_out[atom] = static_cast<Real>(radii[atom]);
+                r2_out[atom] = (float)(expanded * expanded);
+            }
         }
         if (lee_richards) {
             points[0] = {};
@@ -1737,7 +1843,45 @@ int calculate_frames(fastsasa_vk_context *context,
             prepare_mask_resources(context, resolution, sphere_xyz, center_count, frame_count,
                                    requested_centers == nullptr && center_count == atom_count, use_fp64);
         }
+        if (f32_upload) {
+            ensure_buffer(context, &context->coords, sizeof(float) * 3u * atom_count,
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, device_memory);
+        }
         update_descriptors(context);
+        /* Extra frame slots, the same sizes as slot 0's buffers. */
+        const SlotBuffers base = slot_buffers(context, 0);
+        Buffer *const base_owned[] = {base.atoms, base.atoms_shadow, base.heads, base.next, base.cell_counts,
+                                      base.atoms_shadow_sorted, base.areas, base.mask_pending,
+                                      base.mask_pending_slot, base.coords};
+        VkDeviceSize slot_bytes = 0;
+        for (Buffer *buffer : base_owned) slot_bytes += buffer->capacity;
+        uint32_t slot_count = std::min<uint32_t>(kVkFrameSlots, frame_count);
+        if (slot_bytes > 0) {
+            slot_count = static_cast<uint32_t>(std::min<VkDeviceSize>(slot_count, 1u + kVkFrameSlotBytes / slot_bytes));
+        }
+        for (uint32_t slot = 1; slot < slot_count; ++slot) {
+            const SlotBuffers b = slot_buffers(context, slot);
+            Buffer *const owned[] = {b.atoms, b.atoms_shadow, b.heads, b.next, b.cell_counts,
+                                     b.atoms_shadow_sorted, b.areas, b.mask_pending, b.mask_pending_slot,
+                                     b.coords};
+            const VkBufferUsageFlags usage[] = {
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+            for (size_t i = 0; i < sizeof(owned) / sizeof(owned[0]); ++i) {
+                /* a mask buffer slot 0 does not have yet stays absent (placeholder) */
+                if (base_owned[i]->handle == VK_NULL_HANDLE) continue;
+                ensure_buffer(context, owned[i], base_owned[i]->capacity, usage[i], device_memory);
+            }
+            write_descriptor_set(context, b);
+        }
 
         const auto profile_t1 = std::chrono::steady_clock::now();
         check(vkResetCommandBuffer(context->command, 0), "vkResetCommandBuffer");
@@ -1755,65 +1899,141 @@ int calculate_frames(fastsasa_vk_context *context,
         }
         vkCmdCopyBuffer(context->command, context->staging_centers.handle,
                         context->centers.handle, 1, &center_copy);
+        if (f32_upload) {
+            VkBufferCopy radii_copy{0, 0, sizeof(Real) * atom_count};
+            VkBufferCopy r2_copy{sizeof(Real) * atom_count, 0, sizeof(float) * atom_count};
+            vkCmdCopyBuffer(context->command, context->staging_constants.handle, context->atom_radii.handle,
+                            1, &radii_copy);
+            vkCmdCopyBuffer(context->command, context->staging_constants.handle, context->shadow_r2.handle,
+                            1, &r2_copy);
+        }
 
-        for (uint32_t frame = 0; frame < frame_count; ++frame) {
-            const uint64_t cell_count = static_cast<uint64_t>(parameters[frame].dim_x) *
-                                        parameters[frame].dim_y * parameters[frame].dim_z;
-            VkBufferCopy atom_copy{
-                sizeof(Vec4T<Real>) * static_cast<uint64_t>(frame) * atom_count,
-                0, sizeof(Vec4T<Real>) * atom_count};
-            vkCmdCopyBuffer(context->command, context->staging_atoms.handle,
-                            context->atoms.handle, 1, &atom_copy);
-            if (host_shadow) {
-                VkBufferCopy shadow_copy{
-                    sizeof(Vec4T<float>) * static_cast<uint64_t>(frame) * atom_count,
-                    0, sizeof(Vec4T<float>) * atom_count};
-                vkCmdCopyBuffer(context->command,
-                                context->staging_atoms_shadow.handle,
-                                context->atoms_shadow.handle, 1, &shadow_copy);
+        VkMemoryBarrier compute_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        compute_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        compute_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        const auto compute_to_compute = [&]() {
+            vkCmdPipelineBarrier(context->command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                                 &compute_barrier, 0, nullptr, 0, nullptr);
+        };
+        /* One stage for every frame of the chunk, each on its slot's buffers. */
+        const auto stage = [&](uint32_t first, uint32_t count, VkPipeline pipeline, uint64_t groups,
+                               uint32_t indices_per_group) {
+            vkCmdBindPipeline(context->command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+            for (uint32_t slot = 0; slot < count; ++slot) {
+                const VkDescriptorSet set = slot_buffers(context, slot).set;
+                vkCmdBindDescriptorSets(context->command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                        context->pipeline_layout, 0, 1, &set, 0, nullptr);
+                dispatch_chunked(context, parameters[first + slot], groups, indices_per_group);
             }
-            record_cell_list_build(context, parameters[frame], atom_count, cell_count, use_fp64, sr_hybrid);
-            if (lee_richards) {
-                vkCmdBindPipeline(context->command, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                  use_fp64 ? context->lr_fp64_pipeline
-                                           : context->lr_pipeline);
-                const uint64_t slices = static_cast<uint64_t>(center_count) * resolution;
-                dispatch_chunked(context, parameters[frame],
-                                 (slices + kSrThreads - 1u) / kSrThreads,
-                                 kSrThreads);
-                VkMemoryBarrier slice_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                slice_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                slice_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        };
+        const VkPipeline sr_pipeline = select_sr_pipeline(context, resolution, use_fp64);
+        const uint64_t bin_groups = (atom_count + kBinThreads - 1u) / kBinThreads;
+        /* FASTSASA_VK_PROFILE: GPU timestamps around the first chunk's stages and the whole batch */
+        const bool gpu_profile = std::getenv("FASTSASA_VK_PROFILE") != nullptr &&
+                                 context->properties.limits.timestampComputeAndGraphics;
+        if (gpu_profile && context->profile_pool == VK_NULL_HANDLE) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = 8;
+            check(vkCreateQueryPool(context->device, &qi, nullptr, &context->profile_pool), "vkCreateQueryPool");
+        }
+        if (gpu_profile) vkCmdResetQueryPool(context->command, context->profile_pool, 0, 8);
+        const auto stamp = [&](uint32_t first, uint32_t i) {
+            if (gpu_profile && (first == 0 || i == 7)) {
+                vkCmdWriteTimestamp(context->command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, context->profile_pool, i);
+            }
+        };
+        stamp(0, 0);
+        for (uint32_t first = 0; first < frame_count; first += slot_count) {
+            const uint32_t count = std::min(slot_count, frame_count - first);
+            if (first > 0) {
+                /* the previous chunk's dispatches and read-back are done with the slots */
+                VkMemoryBarrier reuse{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                reuse.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+                reuse.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                                      VK_ACCESS_SHADER_WRITE_BIT;
                 vkCmdPipelineBarrier(context->command,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
-                                     &slice_barrier, 0, nullptr, 0, nullptr);
-                vkCmdBindPipeline(context->command, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                  use_fp64 ? context->lr_reduce_fp64_pipeline
-                                           : context->lr_reduce_pipeline);
-                dispatch_chunked(context, parameters[frame],
-                                 (center_count + kSrThreads - 1u) / kSrThreads,
-                                 kSrThreads);
-            } else {
-                vkCmdBindPipeline(context->command, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                  select_sr_pipeline(context, resolution, use_fp64));
-                dispatch_chunked(context, parameters[frame],
-                                 (center_count + context->sr_atoms_per_group - 1u) /
-                                     context->sr_atoms_per_group,
-                                 context->sr_atoms_per_group);
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     0, 1, &reuse, 0, nullptr, 0, nullptr);
             }
+            for (uint32_t slot = 0; slot < count; ++slot) {
+                const uint32_t frame = first + slot;
+                const SlotBuffers b = slot_buffers(context, slot);
+                const uint64_t cell_count = static_cast<uint64_t>(parameters[frame].dim_x) *
+                                            parameters[frame].dim_y * parameters[frame].dim_z;
+                if (f32_upload) {
+                    VkBufferCopy coord_copy{sizeof(float) * 3u * static_cast<uint64_t>(frame) * atom_count,
+                                            0, sizeof(float) * 3u * atom_count};
+                    vkCmdCopyBuffer(context->command, context->staging_coords.handle,
+                                    b.coords->handle, 1, &coord_copy);
+                } else {
+                    VkBufferCopy atom_copy{
+                        sizeof(Vec4T<Real>) * static_cast<uint64_t>(frame) * atom_count,
+                        0, sizeof(Vec4T<Real>) * atom_count};
+                    vkCmdCopyBuffer(context->command, context->staging_atoms.handle,
+                                    b.atoms->handle, 1, &atom_copy);
+                }
+                if (host_shadow && !f32_upload) {
+                    VkBufferCopy shadow_copy{
+                        sizeof(Vec4T<float>) * static_cast<uint64_t>(frame) * atom_count,
+                        0, sizeof(Vec4T<float>) * atom_count};
+                    vkCmdCopyBuffer(context->command,
+                                    context->staging_atoms_shadow.handle,
+                                    b.atoms_shadow->handle, 1, &shadow_copy);
+                }
+                vkCmdFillBuffer(context->command, b.cell_counts->handle, 0,
+                                sizeof(int32_t) * cell_count, 0u);
+            }
+            VkMemoryBarrier transfer_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            transfer_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+            transfer_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(context->command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                                 &transfer_barrier, 0, nullptr, 0, nullptr);
+            if (f32_upload) {
+                stage(first, count, context->widen_pipeline[use_fp64 ? 1 : 0], bin_groups, kBinThreads);
+                compute_to_compute();
+            }
+            stamp(first, 1);
+            /* the cell-list build of record_cell_list_build, stage by stage */
+            stage(first, count, use_fp64 ? context->count_fp64_pipeline : context->count_pipeline,
+                  bin_groups, kBinThreads);
+            compute_to_compute();
+            stamp(first, 2);
+            stage(first, count, context->scan_pipeline, 1u, 1u);
+            compute_to_compute();
+            stamp(first, 3);
+            stage(first, count, use_fp64 ? context->fill_fp64_pipeline : context->fill_pipeline,
+                  bin_groups, kBinThreads);
+            compute_to_compute();
+            stamp(first, 4);
+            if (sr_hybrid) {
+                stage(first, count, use_fp64 ? context->gather_fp64_pipeline : context->gather_pipeline,
+                      bin_groups, kBinThreads);
+                compute_to_compute();
+            }
+            stamp(first, 5);
+            stage(first, count, sr_pipeline,
+                  (center_count + context->sr_atoms_per_group - 1u) / context->sr_atoms_per_group,
+                  context->sr_atoms_per_group);
+            stamp(first, 6);
             VkMemoryBarrier compute_to_transfer{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             compute_to_transfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             compute_to_transfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             vkCmdPipelineBarrier(context->command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
                                  &compute_to_transfer, 0, nullptr, 0, nullptr);
-            VkBufferCopy area_copy{0,
-                sizeof(Real) * static_cast<uint64_t>(frame) * center_count,
-                sizeof(Real) * center_count};
-            vkCmdCopyBuffer(context->command, context->areas.handle,
-                            context->staging_areas.handle, 1, &area_copy);
+            for (uint32_t slot = 0; slot < count; ++slot) {
+                VkBufferCopy area_copy{0,
+                    sizeof(Real) * static_cast<uint64_t>(first + slot) * center_count,
+                    sizeof(Real) * center_count};
+                vkCmdCopyBuffer(context->command, slot_buffers(context, slot).areas->handle,
+                                context->staging_areas.handle, 1, &area_copy);
+            }
         }
+        stamp(0, 7);
         VkMemoryBarrier host_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         host_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         host_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -1848,6 +2068,19 @@ int calculate_frames(fastsasa_vk_context *context,
                     radii, atom_count, resolution, probe_radius,
                     centers.data(), center_count,
                     frame_sasa + static_cast<size_t>(frame) * center_count);
+            }
+        }
+        if (gpu_profile) {
+            uint64_t ticks[8]{};
+            if (vkGetQueryPoolResults(context->device, context->profile_pool, 0, 8, sizeof(ticks), ticks,
+                                      sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+                const double ms = context->properties.limits.timestampPeriod * 1e-6;
+                std::fprintf(stderr,
+                             "vk gpu first %u frames: upload %.3f count %.3f scan %.3f fill %.3f gather %.3f sr %.3f ms;"
+                             " batch of %u: %.3f ms\n", slot_count,
+                             (ticks[1] - ticks[0]) * ms, (ticks[2] - ticks[1]) * ms, (ticks[3] - ticks[2]) * ms,
+                             (ticks[4] - ticks[3]) * ms, (ticks[5] - ticks[4]) * ms, (ticks[6] - ticks[5]) * ms,
+                             frame_count, (ticks[7] - ticks[0]) * ms);
             }
         }
         if (std::getenv("FASTSASA_VK_PROFILE") != nullptr) {
@@ -2178,6 +2411,21 @@ extern "C" void fastsasa_vk_context_free(fastsasa_vk_context *context)
     destroy_buffer(context, &context->atoms_shadow_sorted);
     destroy_buffer(context, &context->points);
     destroy_buffer(context, &context->atoms);
+    destroy_buffer(context, &context->staging_coords);
+    destroy_buffer(context, &context->coords);
+    destroy_buffer(context, &context->atom_radii);
+    destroy_buffer(context, &context->shadow_r2);
+    destroy_buffer(context, &context->staging_constants);
+    for (int pr = 0; pr < 2; ++pr) {
+        if (context->widen_pipeline[pr] != VK_NULL_HANDLE) vkDestroyPipeline(context->device, context->widen_pipeline[pr], nullptr);
+        if (context->widen_shader[pr] != VK_NULL_HANDLE) vkDestroyShaderModule(context->device, context->widen_shader[pr], nullptr);
+    }
+    for (uint32_t slot = 1; slot < kVkFrameSlots; ++slot) {
+        const SlotBuffers b = slot_buffers(context, slot);
+        Buffer *owned[] = {b.atoms, b.atoms_shadow, b.heads, b.next, b.cell_counts, b.atoms_shadow_sorted,
+                           b.areas, b.mask_pending, b.mask_pending_slot, b.coords};
+        for (Buffer *buffer : owned) destroy_buffer(context, buffer);
+    }
     if (context->command_pool != VK_NULL_HANDLE)
         vkDestroyCommandPool(context->device, context->command_pool, nullptr);
     if (context->sr64_pipeline != VK_NULL_HANDLE)
