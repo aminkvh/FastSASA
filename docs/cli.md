@@ -154,6 +154,30 @@ the thread count.
 | `--output FILE`, `-o FILE` | write output to file |
 | `--surface-points FILE` | also write the accessible surface points as `x y z atom_index` lines |
 
+## Many Structures
+
+The CLI computes one structure per call. For a batch of small structures,
+run several files at once with one CPU thread each rather than one file at
+a time with all threads: a small structure has little work to split across
+threads, and start-up and parsing are paid once per file either way.
+
+```sh
+# 8 files at a time, one thread each, one JSON result per input
+ls structures/*.pdb | xargs -P 8 -I{} fastsasa --threads 1 --format json --output {}.json {}
+```
+
+The same in Python, which also works on Windows and collects the totals into
+one CSV ([`examples/many_structures.py`](https://github.com/aminkvh/fastsasa/blob/main/examples/many_structures.py)):
+
+```sh
+python examples/many_structures.py structures/*.pdb --jobs 8 > sasa.csv
+python examples/many_structures.py structures/*.cif --jobs 8 -- --resolution 500
+```
+
+Keep `--threads` x the number of parallel jobs at or below the CPU thread
+count. For one large structure (tens of thousands of atoms or more), a single
+process with the default thread count is the better choice.
+
 ## Radius Assignment
 
 FastSASA assigns atom radii from a user-provided `--config-file`, then

@@ -167,7 +167,7 @@ usage(const char *program,
                  "         --cif --join-models --classes --select 'expression|name, expression'\n"
                  "         --format log|res|seq|rsa|pdb|cif|json|xml --output FILE\n"
                  "         --surface-points FILE\n"
-                 "trajectory-options: --frames SPEC --batch-size N --probe-radius N --resolution N --output FILE --summary --residue\n"
+                 "trajectory-options: --frames SPEC --batch-size N --probe-radius N --resolution N --output FILE --summary --residue --atoms\n"
                  "                    --backend auto|vulkan|cuda|cpu --cpu --threads N --precision fp64|fp32\n"
                  "                    --shrake-rupley --lee-richards --exact --config-file FILE --hetatm --hydrogen --filter COMMAND\n"
                  "                    --select COMMAND --classes --help --version\n",
