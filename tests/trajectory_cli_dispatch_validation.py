@@ -230,6 +230,39 @@ def _validate_surface_resolution(fastsasa: Path, tmp_path: Path) -> None:
         raise SystemExit(f"--surface-resolution 8 produced more than 8 points for an atom: {counts}")
 
 
+def _validate_atom_output(fastsasa: Path) -> None:
+    # --atoms prints one row per calculated atom and frame; the atom column is
+    # the topology index (waters filtered out leave no gaps here since they
+    # follow the protein), and each frame's areas sum to its total and to the
+    # --residue sums.
+    base = ("trajectory", "tests/data/1ubq.pdb", "tests/data/1ubq_5frames.dcd",
+            "--cpu", "--threads", "2", "--filter", "protein")
+    atoms = _frame_rows(_run(fastsasa, *base, "--atoms"))
+    residues = _frame_rows(_run(fastsasa, *base, "--residue"))
+    if not atoms or list(atoms[0]) != ["frame", "atom", "total_sasa", "atom_sasa", "seconds"]:
+        raise SystemExit(f"unexpected --atoms header: {list(atoms[0]) if atoms else None}")
+    sums: dict[str, float] = {}
+    totals: dict[str, float] = {}
+    ids: dict[str, list[int]] = {}
+    for row in atoms:
+        sums[row["frame"]] = sums.get(row["frame"], 0.0) + float(row["atom_sasa"])
+        totals[row["frame"]] = float(row["total_sasa"])
+        ids.setdefault(row["frame"], []).append(int(row["atom"]))
+    residue_sums: dict[str, float] = {}
+    for row in residues:
+        residue_sums[row["frame"]] = residue_sums.get(row["frame"], 0.0) + float(row["residue_sasa"])
+    if len(sums) != 5 or len(set(totals.values())) != 5:
+        raise SystemExit(f"--atoms frames not distinct: {totals}")
+    for frame, total in totals.items():
+        if ids[frame] != list(range(len(ids[frame]))):
+            raise SystemExit(f"--atoms frame {frame}: atom ids are not 0..n-1")
+        if abs(sums[frame] - total) > 1e-8 or abs(residue_sums[frame] - total) > 1e-8:
+            raise SystemExit(f"--atoms frame {frame}: sum {sums[frame]} / residues "
+                             f"{residue_sums[frame]} != total {total}")
+    proc = _run(fastsasa, *base, "--atoms", "--select", "a, resid 1 to 5")
+    _require_failure_with(proc, "--atoms cannot be combined with --select")
+
+
 def _validate_cpu_precision(fastsasa: Path, tmp_path: Path) -> None:
     # --precision fp32 on --backend cpu must actually change the Shrake-Rupley
     # result (not be silently ignored), stay close to the fp64 reference, and
@@ -624,7 +657,17 @@ def main() -> int:
         "--summary",
         "--residue",
     )
-    _require_failure_with(proc, "trajectory mode accepts only one of --summary and --residue")
+    _require_failure_with(proc, "trajectory mode accepts only one of --summary, --residue and --atoms")
+
+    proc = _run(
+        args.fastsasa,
+        "trajectory",
+        missing_topology,
+        missing_trajectory,
+        "--residue",
+        "--atoms",
+    )
+    _require_failure_with(proc, "trajectory mode accepts only one of --summary, --residue and --atoms")
 
     proc = _run(
         args.fastsasa,
@@ -716,6 +759,7 @@ def main() -> int:
         _validate_surface_points(args.fastsasa, tmp_path)
         _validate_surface_resolution(args.fastsasa, tmp_path)
         _validate_cpu_precision(args.fastsasa, tmp_path)
+        _validate_atom_output(args.fastsasa)
         _validate_residue_aliases(args.fastsasa, tmp_path)
         _validate_charmm_psf(args.fastsasa, tmp_path)
         _validate_cpu_selected_centers(args.fastsasa, tmp_path)

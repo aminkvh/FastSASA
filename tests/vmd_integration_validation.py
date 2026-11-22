@@ -2,7 +2,8 @@
 """Headless VMD checks for integration/vmd/fastsasa/fastsasa.tcl.
 
 Covers: fp64 default precision (fp32 still selectable), and
-"-restrict SEL2 -frames all" matching "-restrict SEL2" per frame.
+"-restrict SEL2 -frames all" matching "-restrict SEL2" per frame, and
+"-peratom"/"-points" with "-frames all" matching "-frames now" per frame.
 Skips (exit 0) when VMD is not installed.
 """
 from __future__ import annotations
@@ -46,8 +47,32 @@ puts "UNRESTRICTED [fastsasa -sel $sel -frames all]"
 puts "SAME_AS_SEL [fastsasa -sel $sel -restrict $sel -frames all]"
 puts "EMPTY_RESTRICT [fastsasa -sel $sel -restrict $outside -frames all]"
 puts "FP32 [fastsasa -sel $sel -precision fp32]"
-if {{[catch {{fastsasa -sel $sel -peratom pa -frames all}} msg]}} {{puts "PERATOM_ERR $msg"}}
-if {{[catch {{fastsasa -sel $sel -points pp -frames all}} msg]}} {{puts "POINTS_ERR $msg"}}
+set totals [fastsasa -sel $sel -frames all -peratom pa]
+puts "PERATOM_SHAPE [llength $pa] [llength [lindex $pa 0]] [$sel num]"
+set i 0
+foreach areas $pa total $totals {{
+    set sum 0.0
+    foreach a $areas {{set sum [expr {{$sum + $a}}]}}
+    $sel frame $i
+    fastsasa -sel $sel -peratom now
+    set diff 0.0
+    foreach a $areas n $now {{
+        if {{abs($a - $n) > $diff}} {{set diff [expr {{abs($a - $n)}}]}}
+    }}
+    puts "PERATOM_FRAME $i $diff [expr {{abs($sum - $total)}}]"
+    incr i
+}}
+$sel frame 0
+puts "PERATOM_RESTRICT [fastsasa -sel $sel -restrict $part -frames all -peratom pr]"
+fastsasa -sel $sel -frames all -points pp
+puts "POINTS_FRAMES [llength $pp]"
+for {{set i 0}} {{$i < 4}} {{incr i}} {{
+    $sel frame $i
+    fastsasa -sel $sel -points pn
+    puts "POINTS_COUNT $i [llength [lindex $pp $i]] [llength $pn] [llength [lindex $pp $i 0]]"
+}}
+$sel frame 0
+if {{[catch {{fastsasa -sel $sel -points pp -frames all -visualize 1}} msg]}} {{puts "POINTS_TRACK_ERR $msg"}}
 quit
 """
 
@@ -122,10 +147,32 @@ def main() -> int:
     # one CLI process for the restricted -frames all call
     if sum(1 for c in trajectory_calls if "--select" in c) != 2:
         return fail("expected exactly one --select trajectory run per restricted -frames all call (two calls made)")
-    for key in ("PERATOM_ERR", "POINTS_ERR"):
-        message = out.get(key, [""])[0]
-        if "-restrict" in message or "support -frames now only" not in message:
-            return fail(f"{key} message unexpected: {message!r}")
+    # -frames all -peratom: one full-precision list per frame, matching
+    # -frames now per atom (B-factor resolution) and summing to the totals.
+    shape = out.get("PERATOM_SHAPE", [""])[0].split()
+    if len(shape) != 3 or shape[0] != "4" or shape[1] != shape[2]:
+        return fail(f"-frames all -peratom shape unexpected: {shape}")
+    per_frame = [row.split() for row in out.get("PERATOM_FRAME", [])]
+    if len(per_frame) != 4:
+        return fail(f"expected 4 PERATOM_FRAME rows, got {len(per_frame)}")
+    for frame, diff, sum_diff in per_frame:
+        if float(diff) > 0.0051 or float(sum_diff) > 1e-6:
+            return fail(f"frame {frame}: per-atom diff {diff}, sum vs total {sum_diff}")
+    restricted = [float(v) for v in out.get("PERATOM_RESTRICT", [""])[0].split()]
+    if len(restricted) != 4 or any(abs(r - a) > 1e-6 for r, a in zip(restricted, all_frames)):
+        return fail(f"-restrict with -peratom {restricted} != -restrict {all_frames}")
+    # -frames all -points: one {x y z} list per frame, same size as -frames now
+    # (PDB vs DCD coordinate rounding may flip a few boundary points).
+    if out.get("POINTS_FRAMES", [""])[0] != "4":
+        return fail(f"-frames all -points frame count: {out.get('POINTS_FRAMES')}")
+    for row in out.get("POINTS_COUNT", []):
+        frame, n_all, n_now, width = (int(v) for v in row.split())
+        if width != 3 or n_all == 0 or abs(n_all - n_now) > max(5, n_now // 200):
+            return fail(f"frame {frame}: {n_all} points (all) vs {n_now} (now), width {width}")
+    if "-track" not in out.get("POINTS_TRACK_ERR", [""])[0]:
+        return fail("-points -frames all -visualize 1 should be rejected")
+    if not any("--atoms" in c for c in trajectory_calls):
+        return fail("-peratom -frames all did not use trajectory --atoms")
     print("fastsasa_vmd_integration_validation,status,pass")
     return 0
 

@@ -994,7 +994,7 @@ struct Cap {
  *                                  kernel saves, times the thread count the
  *                                  reference would have used), or
  *                                  immediately if the table already exists.
- * Point counts above 255 are always the reference kernel. */
+ * Point counts above kMaxPoints (1,024) are always the reference kernel. */
 extern "C" int
 fastsasa_cpu_mask_policy(int n_atoms, int n_points, const double *test_points, int n_threads)
 {

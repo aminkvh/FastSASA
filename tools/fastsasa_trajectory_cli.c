@@ -1321,7 +1321,7 @@ print_usage(const char *program,
             "usage: %s trajectory --topology FILE --trajectory FILE [options]\n"
             "       %s topology.pdb|topology.cif|topology.psf trajectory.dcd|trajectory.xtc [options]\n"
             "options: --frames spec --batch-size n --probe-radius n --resolution n --precision fp64|fp32 --output file\n"
-            "         --residue|--summary --config-file file --hydrogen --hetatm --threads n\n"
+            "         --residue|--atoms|--summary --config-file file --hydrogen --hetatm --threads n\n"
             "         --backend auto|vulkan|cuda|cpu --cpu --surface-points file --surface-resolution n\n"
             "         --shrake-rupley|--lee-richards|--exact --classes --filter expression\n"
             "         --select 'expression|name, expression' --help --version\n",
@@ -1374,6 +1374,7 @@ run_topology_trajectory(const char *topology_path,
                         double probe_radius,
                         int resolution,
                         int residue_output,
+                        int atom_output,
                         int summary_output,
                         int class_output,
                         radius_config *config,
@@ -1418,6 +1419,7 @@ run_topology_trajectory(const char *topology_path,
     double *z_full = NULL;
     double *total_sasa = NULL;
     double *residue_sasa = NULL;
+    double *atom_sasa = NULL;
     double *selection_sasa = NULL;
     double *selection_sasa_sum = NULL;
     double *selection_sasa_sum_compensation = NULL;
@@ -1476,6 +1478,13 @@ run_topology_trajectory(const char *topology_path,
     }
     if (n_selections > 0 && residue_output) {
         fprintf(stderr, "selection and residue output modes are separate CSV modes\n");
+        trajectory_reader_close(&reader);
+        fastsasa_topology_free(&topology);
+        if (out != stdout) fclose(out);
+        return 1;
+    }
+    if (atom_output && (n_selections > 0 || class_output || residue_output)) {
+        fprintf(stderr, "trajectory --atoms cannot be combined with --select, --classes or --residue\n");
         trajectory_reader_close(&reader);
         fastsasa_topology_free(&topology);
         if (out != stdout) fclose(out);
@@ -1706,6 +1715,12 @@ run_topology_trajectory(const char *topology_path,
         status = FASTSASA_MEMORY_ERROR;
         goto cleanup;
     }
+    if (atom_output &&
+        trajectory_host_alloc((void **)&atom_sasa, sizeof(double) * (size_t)n_calc_atoms * (size_t)batch_size, pageable_host) != FASTSASA_SUCCESS) {
+        fprintf(stderr, "failed to allocate per-atom trajectory batch\n");
+        status = FASTSASA_MEMORY_ERROR;
+        goto cleanup;
+    }
 
     parameters.algorithm = algorithm;
     parameters.n_points = resolution;
@@ -1721,6 +1736,7 @@ run_topology_trajectory(const char *topology_path,
     else if (!summary_output && class_output) fprintf(out, "frame,total_sasa,polar_sasa,apolar_sasa,unknown_sasa,seconds\n");
     else if (!summary_output && n_selections > 0) fprintf(out, "frame,selection,selection_sasa,seconds\n");
     else if (!summary_output && residue_output) fprintf(out, "frame,residue,total_sasa,residue_sasa,seconds\n");
+    else if (!summary_output && atom_output) fprintf(out, "frame,atom,total_sasa,atom_sasa,seconds\n");
     else if (!summary_output) fprintf(out, "frame,total_sasa,seconds\n");
 
     if (surface_points_path != NULL) {
@@ -1856,7 +1872,7 @@ run_topology_trajectory(const char *topology_path,
                                                         &parameters,
                                                         n_threads,
                                                         total_sasa,
-                                                        NULL,
+                                                        atom_sasa,
                                                         residue_output ? residue_sasa : NULL);
             } else {
                 status = fastsasa_context_calc_trajectory_soa(context,
@@ -1864,7 +1880,7 @@ run_topology_trajectory(const char *topology_path,
                                                             &frames,
                                                             &parameters,
                                                             total_sasa,
-                                                            NULL,
+                                                            atom_sasa,
                                                             residue_output ? residue_sasa : NULL);
             }
         }
@@ -1942,6 +1958,18 @@ run_topology_trajectory(const char *topology_path,
                             residue,
                             total_sasa[i],
                             residue_sasa[(size_t)i * (size_t)topology.n_residues + (size_t)residue],
+                            seconds_per_frame);
+                }
+            } else if (atom_output) {
+                /* atom is the 0-based index into the topology file, so
+                 * filtered-out atoms leave gaps rather than shifting ids. */
+                for (int atom = 0; atom < n_calc_atoms; ++atom) {
+                    fprintf(out,
+                            "%d,%d,%.12f,%.12f,%.9f\n",
+                            frame_ids[i],
+                            filter_indices != NULL ? filter_indices[atom] : atom,
+                            total_sasa[i],
+                            atom_sasa[(size_t)i * (size_t)n_calc_atoms + (size_t)atom],
                             seconds_per_frame);
                 }
             } else {
@@ -2164,6 +2192,7 @@ cleanup:
     trajectory_host_free(total_sasa, pageable_host);
     trajectory_host_free(selection_sasa, pageable_host);
     trajectory_host_free(residue_sasa, pageable_host);
+    trajectory_host_free(atom_sasa, pageable_host);
     free(batch_frame_indices);
     free(selection_sasa_sum);
     free(selection_sasa_sum_compensation);
@@ -2202,6 +2231,7 @@ fastsasa_trajectory_cli_main(int argc,
     int resolution = 100;
     int resolution_set = 0;
     int residue_output = 0;
+    int atom_output = 0;
     int summary_output = 0;
     int class_output = 0;
     int positional = 0;
@@ -2319,6 +2349,8 @@ fastsasa_trajectory_cli_main(int argc,
             if (++i >= argc || !parse_int_strict(argv[i], &n_threads) || n_threads <= 0) goto usage_fail;
         } else if (strcmp(argv[i], "residue") == 0 || strcmp(argv[i], "--residue") == 0) {
             residue_output = 1;
+        } else if (strcmp(argv[i], "--atoms") == 0) {
+            atom_output = 1;
         } else if (strcmp(argv[i], "summary") == 0 || strcmp(argv[i], "--summary") == 0) {
             summary_output = 1;
         } else if (argv[i][0] == '-') {
@@ -2334,8 +2366,8 @@ fastsasa_trajectory_cli_main(int argc,
             goto usage_fail;
         }
     }
-    if (summary_output && residue_output) {
-        fprintf(stderr, "trajectory mode accepts only one of --summary and --residue\n");
+    if (summary_output + residue_output + atom_output > 1) {
+        fprintf(stderr, "trajectory mode accepts only one of --summary, --residue and --atoms\n");
         goto usage_fail;
     }
     if (filter_command == NULL) {
@@ -2363,6 +2395,7 @@ fastsasa_trajectory_cli_main(int argc,
                                   probe_radius,
                                   resolution,
                                   residue_output,
+                                  atom_output,
                                   summary_output,
                                   class_output,
                                   &config,

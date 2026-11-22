@@ -281,6 +281,7 @@ Options:
 | `--output FILE`, `-o FILE` | write trajectory CSV output to a file instead of stdout |
 | `--summary` | output total SASA summary |
 | `--residue` | output SASA per frame for each residue that has calculated atoms |
+| `--atoms` | output SASA per frame for each calculated atom (`atom` is the 0-based topology index) |
 | `--config-file FILE`, `-c FILE` | load a radius configuration |
 | `--hydrogen`, `-Y` | include hydrogen atoms in the calculation |
 | `--hetatm`, `-H` | include PDB/mmCIF HETATM records in the calculation |

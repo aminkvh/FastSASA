@@ -43,6 +43,11 @@ set chainA_areas [fastsasa -sel $all -restrict [atomselect top "chain A"] -frame
 fastsasa -sel $sel -peratom areas
 $sel set user $areas
 
+# Per-atom SASA for every frame in one run (one list per frame):
+fastsasa -sel $sel -frames all -peratom frame_areas
+$sel frame 10
+$sel set user [lindex $frame_areas 10]
+
 # Accessible surface points (measure sasa -points equivalent):
 fastsasa -sel $sel -points pts
 
@@ -65,9 +70,11 @@ set areas [fastsasa -topfile sys.psf -trajfile run.dcd -filter protein]
   list.
 - `-restrict $sel2` — report only these atoms; everything in `-sel` still
   occludes. With `-frames all` it returns the per-frame list for those atoms.
-- `-peratom var` — store the per-atom SASA list. `-frames now` only.
-- `-points var` — store accessible surface points as `{x y z}` lists.
-  `-frames now` only.
+- `-peratom var` — store the per-atom SASA list. With `-frames all`, one
+  list per frame (`lindex $var $frame`).
+- `-points var` — store accessible surface points as `{x y z}` lists. With
+  `-frames all`, one point list per frame; not combinable with the animated
+  track (`-track`/`-visualize 1`).
 - `-visualize 0|1` — default off; the one switch for all visuals. With
   `-frames now` it draws the current frame's point cloud, with
   `-frames all` it loads the animated surface track; both show the counter.
